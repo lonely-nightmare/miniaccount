@@ -23,7 +23,7 @@ import (
 // 因此这条链路必须能一键跑通：
 //
 //	import  读对账单 → 去重入库
-//	match   按「规则 → 历史 → AI」三层匹配，写回对方科目提议
+//	match   按「规则 → 历史」两层匹配，写回对方科目提议
 //	list    看看匹配成了什么样
 //	post    确认后批量生成凭证
 func cmdBank(ctx context.Context, args []string) error {
@@ -189,7 +189,7 @@ func bankMatch(ctx context.Context, args []string) error {
 	if len(res.ByLayer) > 0 {
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(w, "命中来源\t条数\t说明")
-		for _, l := range []bank.Layer{bank.LayerRule, bank.LayerHistory, bank.LayerAI} {
+		for _, l := range []bank.Layer{bank.LayerRule, bank.LayerHistory} {
 			if n := res.ByLayer[l]; n > 0 {
 				fmt.Fprintf(w, "%s\t%d\t%s\n", l.Label(), n, layerHint(l))
 			}
@@ -211,7 +211,7 @@ func layerHint(l bank.Layer) string {
 	case bank.LayerHistory:
 		return "历史上同一对手方的记法 —— 性价比最高的一层"
 	default:
-		return "模型推理"
+		return "人工指定"
 	}
 }
 

@@ -370,3 +370,39 @@ stdout 只出协议消息（诊断走 stderr）；`--readonly` 用
 ## 已确认的决策
 
 Settings 模型卡 → MCP 服务卡；写工具全开；HTTP 本次实施。
+
+---
+
+## 批 1 实施记录（AI 模块删除）
+
+**范围**：AI 助手/供应商/提示词/会计 agent/AI 建议全链路与测试全部移除；
+**保留**：`voucher.source='ai'`、`created_by_ai`、`audit.source='ai'`、
+`bank_flow.match_layer='ai'`（历史行可显示）、`ai_*` 表结构与迁移、
+备份的 API Key 剥离逻辑、`DeleteDraft` 对 `ai_suggestion` 的 unlink
+（`UnlinkedAISuggest`）。
+
+**顺手切除的隐藏 AI 件**（文档清单外、按规约「永远不会成立的分支就删」）：
+
+- `bank.Matcher` 第 3 层 `AISuggester` 接口与 `AI` 字段 —— 实现者
+  （aiprovider）已删，生产链路本就不接线；`LayerAI` 常量保留供历史行显示。
+- `domain/ai`（提示词配置 + 建议提案）、`internal/ai/aiprovider` 整包、
+  `sqlite/ai_repo.go`、`sqlite/ai_ledger.go` 中 AI 专属部分；
+  `AIRepo.LedgerContext` 的共享职责由 `VoucherRepo.LedgerContext`
+  （非 tx 版）承接，`validationContext` 事务版不变。
+- Service：`ai_wire.go`、`accountant.go`、AI 配置/建议/提示词方法与
+  `AuditDocBrief`/`TaxReturnBrief`/`EvidenceBrief` 三个仅服务 AI 的适配器；
+  `Service.AI()` 访问器与 `AIConfigInfo`。
+- Desktop：`accountant.go`、全部 AI 绑定（AISuggest/AIConfig/
+  SaveAIProvider/AISuggestions/Accept/RejectAISuggestion/
+  AIPromptConfig/Save/Reset/PreviewAIPrompt/PreviewAccountantPrompt/
+  AccountantSend/Session/Reset）。
+- CLI：`ai`/`ai-config` 命令及帮助中的 AI 段。
+- 前端：`AIAssistant.vue`、`/ai` 路由（导航自动消失）、api.js 的
+  AI 调用封装与 mock 块、Settings 的「AI 记账助手」卡（模型服务商
+  表单 + AI 表现统计，含 providerForm/aiCfg/stats 等全部 JS）、
+  gui.test.mjs 的 5 条 AI 用例。
+- wailsjs 已 `wails generate module` 重生成。
+
+**验证**：`go build ./...` + `go vet` 干净；`go test ./...` 全绿
+（desktop 105s 全过）；前端 `npm run test` 18/18；`vite build` 通过；
+GUI 套件 39 项全过（AI 相关 5 条已删，路由数断言从 ≥15 维持成立）。

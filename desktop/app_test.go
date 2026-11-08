@@ -151,8 +151,6 @@ func TestMethodsWithoutBook(t *testing.T) {
 		{"Report", faultOf(a.Report(ReportRequest{Kind: "bs", Year: 2025, Month: 1}))},
 		{"LedgerDetail", faultOf(a.LedgerDetail(LedgerRequest{AccountPrefix: "1002"}))},
 		{"FilesDir", faultOf(a.FilesDir())},
-		{"AIConfig", faultOf(a.AIConfig())},
-		{"AISuggestions", faultOf(a.AISuggestions(10))},
 	}
 	for _, c := range checks {
 		if c.f == nil {
@@ -661,75 +659,6 @@ func TestBackupRoundTrip(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// AI
-// ---------------------------------------------------------------------------
-
-// 未配置模型服务时，AISuggest 必须返回一个「看起来就是失败」的结果，
-// 而不是 panic、也不是一个空的成功。
-func TestAISuggestWithoutProvider(t *testing.T) {
-	a, path := newApp(t)
-	a.OpenBook(path)
-	a.CreateBook(service.CreateBookInput{
-		CompanyName: "X", StartYear: 2025, StartMonth: 1,
-		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
-	})
-
-	res, aerr := a.AISuggest(AISuggestRequest{
-		Task: "bank_flow", Text: "收到货款", AmountYuan: "106000.00", Date: "2025-01-15",
-	})
-	if f := faultOf(res, aerr); f != nil {
-		t.Fatalf("未配置服务不该让调用本身失败: %v", f)
-	}
-	if res.OK {
-		t.Fatal("未配置服务时 OK 必须为假")
-	}
-	if res.Error == "" {
-		t.Fatal("必须说明失败原因")
-	}
-
-	// 金额格式错误要被挡在调用之前
-	if _, e := a.AISuggest(AISuggestRequest{Text: "x", AmountYuan: "1.234"}); faultOf[any](nil, e) == nil ||
-		faultOf[any](nil, e).Kind != FaultInvalid {
-		t.Errorf("非法金额应报 FaultInvalid，实际 %v", e)
-	}
-}
-
-func TestAIConfigAndStats(t *testing.T) {
-	a, path := newApp(t)
-	a.OpenBook(path)
-	a.CreateBook(service.CreateBookInput{
-		CompanyName: "X", StartYear: 2025, StartMonth: 1,
-		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
-	})
-
-	cfg, cerr := a.AIConfig()
-	if f := faultOf(cfg, cerr); f != nil {
-		t.Fatal(f)
-	}
-	if cfg.HasDefault {
-		t.Error("新账套不该有可用的 AI 服务")
-	}
-
-	id, serr := a.SaveAIProvider(sqlite.AIProviderConfig{
-		Name: "本地 Ollama", Kind: "local",
-		BaseURL: "http://127.0.0.1:11434/v1", Model: "qwen2.5:7b",
-		Enabled: true, IsDefault: true,
-	})
-	if f := faultOf(id, serr); f != nil {
-		t.Fatalf("保存服务失败: %v", f)
-	}
-	if id == 0 {
-		t.Fatal("应返回 id")
-	}
-
-	cfg, _ = a.AIConfig()
-	_ = cfg
-	if !cfg.HasDefault || len(cfg.Providers) != 1 {
-		t.Errorf("配置读回不一致: %+v", cfg)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // 其余绑定
 // ---------------------------------------------------------------------------
 
@@ -877,10 +806,6 @@ func TestSuccessfulCallsReturnNilInterface(t *testing.T) {
 	add("LedgerDetail", e)
 	_, e = a.FilesDir()
 	add("FilesDir", e)
-	_, e = a.AIConfig()
-	add("AIConfig", e)
-	_, e = a.AISuggestions(10)
-	add("AISuggestions", e)
 	_, e = a.Backup(BackupRequest{Dest: filepath.Join(filepath.Dir(path), "b.mabak"), IncludeFiles: true})
 	add("Backup", e)
 

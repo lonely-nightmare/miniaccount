@@ -105,8 +105,6 @@ func checkNoNullArrays(t *testing.T, a *App) {
 		{"ContactUsageOf", func() any { v, _ := a.ContactUsageOf(1); return v }},
 		{"DepartmentUsageOf", func() any { v, _ := a.DepartmentUsageOf(1); return v }},
 		{"Attachments", func() any { v, _ := a.Attachments(AttachmentQueryRequest{}); return v }},
-		{"AISuggestions", func() any { v, _ := a.AISuggestions(20); return v }},
-		{"AIConfig", func() any { v, _ := a.AIConfig(); return v }},
 		{"Report(资产负债表)", func() any {
 			v, _ := a.Report(ReportRequest{Kind: "balance_sheet"})
 			return v

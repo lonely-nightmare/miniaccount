@@ -393,18 +393,6 @@ export const api = {
   restoreBackup: (req) => call(A().RestoreBackup, req),
   auditAttachments: (y, m) => call(A().AuditAttachments, y, m),
 
-  aiSuggest: (req) => call(A().AISuggest, req),
-  aiConfig: () => call(A().AIConfig),
-  saveAIProvider: (cfg) => call(A().SaveAIProvider, cfg),
-  aiSuggestions: (limit) => call(A().AISuggestions, limit),
-  acceptAISuggestion: (req) => call(A().AcceptAISuggestion, req),
-  // 会计（对话式记账）：只有一个业务描述输入框，缺什么由会计问。
-  // 会话存在服务端内存里，重启会清空 —— 它是操作过程的中间状态，
-  // 不是账务数据（账务数据是那张凭证草稿，一落库就有完整轨迹）。
-  accountantSend: (req) => call(A().AccountantSend, req),
-  accountantSession: (id) => call(A().AccountantSession, id ?? ''),
-  accountantReset: (id) => call(A().AccountantReset, id ?? ''),
-  rejectAISuggestion: (req) => call(A().RejectAISuggestion, req),
   auditLog: (q) => call(A().AuditLog, q),
   bookkeeper: () => call(A().Bookkeeper),
   saveBookkeeper: (name) => call(A().SaveBookkeeper, name),
@@ -412,13 +400,6 @@ export const api = {
   saveAuditSettings: (s) => call(A().SaveAuditSettings, s),
   verifyAuditLog: () => call(A().VerifyAuditLog),
   exportAuditLog: (q, dest) => call(A().ExportAuditLog, q, dest),
-  aiPromptConfig: () => call(A().AIPromptConfig),
-  saveAIPromptConfig: (input) => call(A().SaveAIPromptConfig, input),
-  resetAIPromptConfig: () => call(A().ResetAIPromptConfig),
-  previewAIPrompt: (task) => call(A().PreviewAIPrompt, task),
-  // 会计版提示词预览：AI 记账助手页面上用的就是这一份，
-  // 预览必须与它一致（多一节「与用户对话」）。
-  previewAccountantPrompt: () => call(A().PreviewAccountantPrompt),
 
   today: () => call(A().Today),
   appVersion: () => call(A().AppVersion),
@@ -1032,121 +1013,5 @@ export const mockApp = {
   RestoreBackup: async () => ({ dbPath: '/tmp/x.db', filesDir: '/tmp/.files', restored: 3, stashed: '', companyName: '演示' }),
   AuditAttachments: async () => ({ posted: 16, withAttach: 3, without: 13, orphanFiles: 0 }),
   InspectBackup: async () => ({ path: '', companyName: '演示', dbSize: 120000, fileCount: 3, fileBytes: 40000, voucherCount: 16, accountCount: 190 }),
-  AISuggest: async () => ({
-    ok: true, summary: 'AI 建议（置信度 0.91）：收回应收账款', suggestionId: 1, layer: 'ai',
-    confidence: 0.91, model: 'qwen2.5:7b', latencyMs: 4200, tokensIn: 1120, tokensOut: 168,
-    voucher: {
-      word: '记', bizDate: '2025-03-11', remark: '收到货款', total: 10600000,
-      entries: [
-        { accountCode: '1002', summary: '收到货款', debit: 10600000, credit: 0, auxDesc: '' },
-        { accountCode: '1122', summary: '收到货款', debit: 0, credit: 10600000, auxDesc: '往来#2' },
-      ],
-    },
-    failures: [], warnings: [],
-  }),
-  AcceptAISuggestion: async () => ({ voucherId: 9, voucherNo: '记-2025-03-0009', summary: '已生成草稿凭证' }),
-  AccountantSend: async () => ({
-    id: 'dev', asks: 1, busy: false, updated: '',
-    turns: [
-      { role: 'user', text: '昨天买了台打印机', at: '' },
-      { role: 'accountant', text: '这台打印机的付款方式和发票情况是什么？', at: '',
-        question: {
-          id: 'payment',
-          header: '付款与发票',
-          question: '这台打印机的付款方式和发票情况是什么？',
-          multiSelect: false,
-          options: [
-            { label: '银行转账，取得增值税专用发票（推荐）', description: '可抵扣进项税，挂应付账款或直接冲银行', recommended: true },
-            { label: '现金支付，只有收据', description: '无进项税可抵，全额计入管理费用', recommended: false },
-          ],
-        } },
-      // 审计依据提议：模型只能提议，落库要用户按确认
-      { role: 'accountant', text: '建议为审计调整挂一份依据：记-2025-03-0007 计提本月折旧。', at: '',
-        evidence: {
-          ownerType: 'adjustment', ownerTypeLabel: '审计调整', ownerId: 1,
-          ownerTitle: 'ADJ-202503-001 补提 2025 年折旧 3,000.00',
-          refKind: 'voucher', refKindLabel: '凭证', refId: 7,
-          refLabel: '记-2025-03-0007 计提本月折旧 1,000.00',
-          note: '这张凭证上的折旧额就是少提的那部分',
-          reason: '补提折旧的依据就在这张凭证上', problems: [],
-        } },
-      // 审计调整提议：模型只能提议，落库要用户按确认
-      { role: 'accountant', text: '建议登记调整 2025-03：补提 2025 年折旧，金额 3,000.00。', at: '',
-        adjustment: {
-          period: '2025-03', year: 2025, month: 3,
-          kind: 'adjust', kindLabel: '调整',
-          summary: '补提 2025 年折旧',
-          reason: '折旧计算表显示少提 3,000.00，按平均年限法补提',
-          evidence: '折旧计算表（底稿索引 F-3）',
-          amount: 300000, problems: [],
-          lines: [
-            { lineNo: 1, accountCode: '560205', accountName: '管理费用—折旧费', summary: '补提折旧', debit: 300000, credit: 0, contactId: null, employeeId: null, deptId: 1, projectId: null, auxDesc: '生产部' },
-            { lineNo: 2, accountCode: '1602', accountName: '累计折旧', summary: '补提折旧', debit: 0, credit: 300000, contactId: null, employeeId: null, deptId: null, projectId: null, auxDesc: '' },
-          ],
-        } },
-    ],
-  }),
-  AccountantSession: async () => ({ id: 'dev', asks: 0, busy: false, updated: '', turns: [] }),
-  AccountantReset: async () => ({ id: '', asks: 0, busy: false, updated: '', turns: [] }),
-  RejectAISuggestion: async () => null,
-  Bookkeeper: async () => '李会计',
-  SaveBookkeeper: async () => null,
-  AuditSettings: async () => ({ recordViews: false, viewIntervalSeconds: 60 }),
-  SaveAuditSettings: async () => null,
-  AuditLog: async () => ({
-    categories: ['business', 'read', 'system'],
-    dir: '/Users/you/.mini-account/logs',
-    actions: [
-      { value: 'voucher.create', label: '录入凭证' },
-      { value: 'voucher.post', label: '凭证过账' },
-      { value: 'period.close', label: '结账' },
-      { value: 'system.failed', label: '操作失败' },
-    ],
-    page: {
-      total: 2, segments: 1, bytes: 40960, truncated: false,
-      entries: [
-        { seq: 2, at: '2026-09-12 10:20:31+08:00', operator: '李会计', source: 'gui',
-          action: 'voucher.post', summary: '凭证过账 记-2025-03-0001', entity: 'voucher',
-          entityId: '1', result: 'ok', message: '', book: '/Users/you/.mini-account/dataDB/demo.db',
-          company: '杭州云帆软件有限公司', appVersion: '0.2.0-rc2', hash: 'a'.repeat(64),
-          prevHash: 'b'.repeat(64), detail: { 借方合计: '106,000.00', 记账人: '王主管' } },
-        { seq: 1, at: '2026-09-12 10:20:29+08:00', operator: '李会计', source: 'gui',
-          action: 'voucher.create', summary: '录入凭证草稿', entity: 'voucher', entityId: '1',
-          result: 'ok', message: '', book: '/Users/you/.mini-account/dataDB/demo.db',
-          company: '杭州云帆软件有限公司', appVersion: '0.2.0-rc2', hash: 'b'.repeat(64),
-          prevHash: 'genesis', detail: { 摘要: '收到货款' } },
-      ],
-    },
-  }),
-  VerifyAuditLog: async () => ({ ok: true, checked: 2, files: 1, head: 'a'.repeat(64), issues: [] }),
-  ExportAuditLog: async () => 2,
-  AIPromptConfig: async () => ({
-    instructions: '# 记账的基本原则\n\n- 权责发生制。\n- 银行流水判断对方科目。',
-    custom: false,
-    default: '# 记账的基本原则\n\n- 权责发生制。\n- 银行流水判断对方科目。',
-    taskNotes: { bank_flow: '', invoice: '', expense: '', freeform: '' },
-    tasks: [
-      { value: 'bank_flow', label: '银行流水', note: '' },
-      { value: 'invoice', label: '发票', note: '' },
-      { value: 'expense', label: '报销单', note: '' },
-      { value: 'freeform', label: '自然语言', note: '' },
-    ],
-    updatedAt: '', maxInstructions: 8000, maxTaskNote: 2000,
-    locked: ['工作边界（只能用列出的科目编码、借贷必须相等）'],
-  }),
-  SaveAIPromptConfig: async () => null,
-  ResetAIPromptConfig: async () => null,
-  PreviewAccountantPrompt: async () => ({
-    system: '你是一名中国小微企业的资深会计……\n# 与用户对话\n用 ask_user 工具 —— 不要用一段文字提问。',
-    user: '业务描述：收到杭州某某科技有限公司货款',
-    digest: 'dev', chars: 8000, task: 'freeform',
-  }),
-  PreviewAIPrompt: async () => ({
-    system: '（预览）你是一名中国小微企业的资深会计……', user: '（预览）请为下列业务编制记账凭证',
-    digest: '0'.repeat(64), chars: 4000, task: 'bank_flow',
-  }),
-  AIConfig: async () => ({ providers: [{ id: 1, name: '本地 Ollama', kind: 'local', baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen2.5:7b', enabled: true, isDefault: true }], stats: { total: 12, proposed: 10, valid: 8, accepted: 5, modified: 2, rejected: 1, tokensIn: 12000, tokensOut: 1800 }, hasDefault: true }),
-  SaveAIProvider: async () => 1,
-  AISuggestions: async () => [],
   Today: async () => '2025-03-11',
   AppVersion: async () => '0.1.0-dev',}

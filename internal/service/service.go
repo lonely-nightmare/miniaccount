@@ -35,7 +35,6 @@ import (
 
 	"miniaccount/internal/attachment"
 	"miniaccount/internal/backup"
-	"miniaccount/internal/domain/ai"
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/calendar"
 	"miniaccount/internal/domain/ledger"
@@ -760,138 +759,6 @@ func (s *Service) Reopen(ctx context.Context, k period.Key, postingBy string) (*
 // ---------------------------------------------------------------------------
 // AI
 // ---------------------------------------------------------------------------
-
-// AISuggestInput 是请求 AI 建议的参数。
-type AISuggestInput struct {
-	Task         string
-	Text         string
-	Amount       money.Money
-	Date         string
-	Counterparty string
-	Direction    string
-	Extra        map[string]string
-	TargetType   string
-	TargetID     *int64
-}
-
-// AISuggestResult 是 AI 建议的结果，形状与界面所需一致。
-type AISuggestResult struct {
-	OK           bool    `json:"ok"`
-	Summary      string  `json:"summary"`
-	Error        string  `json:"error"`
-	SuggestionID int64   `json:"suggestionId"`
-	Layer        string  `json:"layer"`
-	Confidence   float64 `json:"confidence"`
-	// Voucher 是建议的凭证；未通过护栏时 Entries 为空。
-	Voucher *VoucherDraft `json:"voucher"`
-	// Failures / Warnings 是护栏结论，界面要**摊开展示**。
-	Failures []HealthItemInfo `json:"failures"`
-	Warnings []HealthItemInfo `json:"warnings"`
-	// Model / LatencyMS 便于用户判断「这个模型快不快」。
-	Model     string `json:"model"`
-	LatencyMS int64  `json:"latencyMs"`
-	TokensIn  int    `json:"tokensIn"`
-	TokensOut int    `json:"tokensOut"`
-}
-
-// VoucherDraft 是待确认的凭证草稿。
-type VoucherDraft struct {
-	Word    string         `json:"word"`
-	BizDate string         `json:"bizDate"`
-	Remark  string         `json:"remark"`
-	Entries []ClosingEntry `json:"entries"`
-	Total   money.Money    `json:"total"`
-}
-
-// AIConfig 返回当前的 AI 配置概览。
-type AIConfig struct {
-	Providers []sqlite.AIProviderConfig `json:"providers"`
-	Stats     sqlite.AIStats            `json:"stats"`
-	// HasDefault 为假表示尚未配置任何可用服务，界面应引导用户去设置。
-	HasDefault bool `json:"hasDefault"`
-}
-
-// AIConfigInfo 汇总 AI 配置与使用情况。
-func (s *Service) AIConfigInfo(ctx context.Context) (*AIConfig, error) {
-	provs, err := s.db.AI().Providers(ctx)
-	if err == nil {
-		// ★ 密钥不下发：Wails 桥另一头是 WebView，明文 key 经
-		// JSON 发给前端后，谁打开 DevTools 都能读走。界面只需要
-		// 知道「有没有」，不需要知道「是什么」。
-		for i := range provs {
-			provs[i].HasKey = provs[i].APIKey != ""
-			provs[i].APIKey = ""
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	st, err := s.db.AI().Stats(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := &AIConfig{Providers: nonNilSlice(provs), Stats: *st}
-	for _, p := range provs {
-		if p.Enabled {
-			out.HasDefault = true
-			break
-		}
-	}
-	return out, nil
-}
-
-// AISuggest 请求 AI 生成记账建议。
-func (s *Service) AISuggest(ctx context.Context, in AISuggestInput) (*AISuggestResult, error) {
-	prov, err := s.db.AI().DefaultProvider(ctx)
-	if err != nil {
-		return nil, err
-	}
-	prompt, err := s.db.AI().PromptConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-	sg := aiSuggester(s, prov)
-	res := sg.Suggest(ctx, suggestInput(in, prompt), in.TargetType, in.TargetID)
-	out := &AISuggestResult{
-		OK: res.OK(), Summary: res.Summary(), SuggestionID: res.SuggestionID,
-		Layer: string(res.Layer),
-	}
-	if res.Err != nil {
-		out.Error = res.Err.Error()
-	}
-	if res.Response != nil {
-		out.Model = res.Response.Model
-		out.LatencyMS = res.Response.Latency.Milliseconds()
-		out.TokensIn, out.TokensOut = res.Response.TokensIn, res.Response.TokensOut
-	}
-	if res.Proposal != nil {
-		out.Confidence = res.Proposal.Confidence
-		out.Voucher = s.voucherDraftOf(ctx, res.Proposal)
-	}
-	if res.Report != nil {
-		out.Failures = checkInfos(res.Report.Failures())
-		out.Warnings = checkInfos(res.Report.Warnings())
-	}
-	return out, nil
-}
-
-// AI 暴露 AI 仓储，供需要直接查审计记录的界面使用。
-//
-// 与 DB() 同样属于「高级用法」出口；常规的 AI 交互请走
-// AISuggest / AIConfigInfo / SaveAIProvider。
-func (s *Service) AI() *sqlite.AIRepo { return s.db.AI() }
-
-// SaveAIProvider 保存模型服务配置。
-func (s *Service) SaveAIProvider(ctx context.Context, c *sqlite.AIProviderConfig) (int64, error) {
-	return s.db.AI().SaveProvider(ctx, c)
-}
-
-// AISuggestions 返回最近的 AI 建议记录。
-func (s *Service) AISuggestions(ctx context.Context, limit int) ([]sqlite.SuggestionRow, error) {
-	return s.db.AI().Suggestions(ctx, limit)
-}
-
-// ---------------------------------------------------------------------------
 // 附件与备份
 // ---------------------------------------------------------------------------
 
@@ -1114,18 +981,6 @@ func auxDesc(a ledger.Aux) string {
 	return out
 }
 
-func checkInfos(cs []ai.Check) []HealthItemInfo {
-	out := make([]HealthItemInfo, 0, len(cs))
-	for _, c := range cs {
-		out = append(out, HealthItemInfo{
-			Key: c.Key, Title: c.Title, Level: string(c.Level), Detail: c.Detail,
-		})
-	}
-	return out
-}
-
-// nonNilSlice 把 nil 切片换成空切片。
-//
 // ★ 见 desktop/guard.go 里同名函数的说明：Go 编 JSON 时 nil 切片是
 // `null`，而界面把列表字段当数组用（`data.rows.length`），拿到 null
 // 直接抛异常。这个差别**只在没有数据时出现** —— 开发时账套里都是

@@ -25,7 +25,6 @@ import Spinner from '@/components/ui/Spinner.vue'
 const book = ref(null)
 const filesDir = ref('')
 const version = ref('')
-const aiCfg = ref(null)
 const backupResult = ref(null)
 const attachAudit = ref(null)
 const orphans = ref([])
@@ -42,36 +41,14 @@ const includeFiles = ref(true)
 const emit = defineEmits(['book-changed'])
 const busy = ref(false)
 
-// ★ 表单必须带 `enabled`，而且新建时默认 true。
-//
-// 这里原来没有这个字段，保存时后端收到的是 Go 的零值 false ——
-// 于是「在设置里配好了模型」和「AI 说所有模型服务都已停用」同时成立，
-// 而界面上**没有任何开关**能把它打开（列表里只有一个灰色小徽标）。
-// 用户完全没有出路。
-//
-// 新建的服务默认启用：加一个服务本来就是想用它；
-// 真要停用，存下来再点一下「停用」。
-function emptyProviderForm() {
-  return {
-    id: 0,
-    name: '本地 Ollama', kind: 'local',
-    baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen2.5:7b',
-    apiKey: '', isDefault: true,
-    enabled: true,
-    timeoutMs: 0, remark: '',
-  }
-}
-const providerForm = ref(emptyProviderForm())
-
 async function load() {
-  const [b, f, v, a, au, or] = await Promise.all([
-    api.periods(), api.filesDir(), api.appVersion(), api.aiConfig(),
+  const [b, f, v, au, or] = await Promise.all([
+    api.periods(), api.filesDir(), api.appVersion(),
     api.auditAttachments(0, 0), api.orphanAttachments(),
   ])
   if (b.ok) book.value = b.data
   if (f.ok) filesDir.value = f.data
   if (v.ok) version.value = v.data
-  if (a.ok) aiCfg.value = a.data
   if (au.ok) attachAudit.value = au.data
   if (or.ok) orphans.value = or.data ?? []
 }
@@ -95,47 +72,6 @@ onMounted(async () => {
   await loadBookkeeper()
   bookkeeperDraft.value = bookkeeper.value
 })
-
-const stats = computed(() => aiCfg.value?.stats ?? null)
-
-async function saveProvider() {
-  if (!providerForm.value.name.trim() || !providerForm.value.baseUrl.trim() ||
-      !providerForm.value.model.trim()) {
-    notify('服务名、服务地址、模型名都不能为空', 'warn')
-    return
-  }
-  busy.value = true
-  const editing = providerForm.value.id !== 0
-  const r = await api.saveAIProvider(providerForm.value)
-  busy.value = false
-  if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
-  notify(editing ? '模型服务已更新' : '模型服务已保存并启用', 'success')
-  providerForm.value = emptyProviderForm()
-  await load()
-}
-
-/** 把一行配置读回表单（含启用状态、超时、备注 —— 漏一个就会在保存时被清掉）。 */
-function editProvider(p) {
-  providerForm.value = {
-    id: p.id, name: p.name, kind: p.kind, baseUrl: p.baseUrl,
-    model: p.model, apiKey: p.apiKey ?? '', isDefault: p.isDefault,
-    enabled: p.enabled, timeoutMs: p.timeoutMs, remark: p.remark ?? '',
-  }
-}
-
-function cancelEdit() {
-  providerForm.value = emptyProviderForm()
-}
-
-/** 就地启用 / 停用 —— 光有徽标没有开关，等于配了也用不上。 */
-async function toggleProvider(p) {
-  busy.value = true
-  const r = await api.saveAIProvider({ ...p, enabled: !p.enabled })
-  busy.value = false
-  if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
-  notify(p.enabled ? `已停用「${p.name}」` : `已启用「${p.name}」`, 'success')
-  await load()
-}
 
 async function doBackup() {
   if (!backupPath.value.trim()) {
@@ -209,16 +145,6 @@ function suggestPath() {
   backupPath.value = `${stamp}-小账本备份.mabak`
 }
 
-const passRate = computed(() => {
-  const s = stats.value
-  if (!s || !s.proposed) return null
-  return Math.round((s.valid / s.proposed) * 100)
-})
-const acceptRate = computed(() => {
-  const s = stats.value
-  if (!s || !s.total) return null
-  return Math.round(((s.accepted + s.modified) / s.total) * 100)
-})
 </script>
 
 <template>
@@ -409,167 +335,6 @@ const acceptRate = computed(() => {
       </CardContent>
     </Card>
 
-    <!-- AI -->
-    <Card>
-      <CardHeader>
-        <CardTitle class="flex items-center gap-2">
-          <Cpu class="size-4" /> AI 记账助手
-        </CardTitle>
-        <CardDescription>
-          默认推荐本地模型 —— 银行流水、工资、客户名单不该离开你的电脑。
-          <br />
-          保存之后是<b>启用</b>状态；停用了的服务不会被 AI 使用，
-          列表里可以随时启用回来。
-        </CardDescription>
-      </CardHeader>
-      <CardContent class="flex flex-col gap-4">
-        <div v-if="aiCfg?.providers?.length">
-          <p class="mb-2 text-sm font-medium">已配置的服务</p>
-          <div class="rounded-lg border">
-            <Table>
-              <thead>
-                <tr class="border-b bg-muted/40">
-                  <Th>名称</Th><Th>形态</Th><Th>模型</Th><Th>地址</Th>
-                  <Th>状态</Th><Th>操作</Th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="p in aiCfg.providers" :key="p.id" class="border-b last:border-0">
-                  <Td>{{ p.name }}</Td>
-                  <Td>
-                    <Badge :variant="p.kind === 'local' ? 'profit' : 'warn'">
-                      <component :is="p.kind === 'local' ? Cpu : Cloud" class="mr-1 size-3" />
-                      {{ p.kind === 'local' ? '本地' : '云端' }}
-                    </Badge>
-                  </Td>
-                  <Td class="font-mono text-xs">{{ p.model }}</Td>
-                  <Td class="font-mono text-xs text-muted-foreground">{{ p.baseUrl }}</Td>
-                  <Td>
-                    <!-- ★ 启用状态要和「默认」分开显示。
-                         原来两者挤在同一个单元格里、还用 else-if 串起来，
-                         结果「默认」的徽标把「已停用」挡掉了 ——
-                         一个默认但停用的服务，看上去完全正常。 -->
-                    <div class="flex gap-1">
-                      <Badge v-if="p.enabled" variant="profit">已启用</Badge>
-                      <Badge v-else variant="muted">已停用</Badge>
-                      <Badge v-if="p.isDefault" variant="default">默认</Badge>
-                    </div>
-                  </Td>
-                  <Td>
-                    <div class="flex gap-1">
-                      <Button size="sm" variant="ghost" @click="editProvider(p)">编辑</Button>
-                      <Button size="sm" variant="outline" :disabled="busy" @click="toggleProvider(p)">
-                        {{ p.enabled ? '停用' : '启用' }}
-                      </Button>
-                    </div>
-                  </Td>
-                </tr>
-              </tbody>
-            </Table>
-          </div>
-        </div>
-
-        <Separator />
-
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <Label>服务名</Label>
-            <Input v-model="providerForm.name" class="mt-1.5" />
-          </div>
-          <div>
-            <Label>部署形态</Label>
-            <div class="mt-1.5 flex gap-1.5">
-              <Button
-                v-for="k in [{ v: 'local', n: '本地（数据不出机器）' }, { v: 'cloud', n: '云端 API' }]"
-                :key="k.v"
-                :variant="providerForm.kind === k.v ? 'default' : 'outline'"
-                size="sm"
-                @click="providerForm.kind = k.v"
-              >{{ k.n }}</Button>
-            </div>
-          </div>
-          <div>
-            <Label>服务地址</Label>
-            <Input v-model="providerForm.baseUrl" class="mt-1.5" placeholder="http://127.0.0.1:11434/v1" />
-          </div>
-          <div>
-            <Label>模型名</Label>
-            <Input v-model="providerForm.model" class="mt-1.5" placeholder="qwen2.5:7b" />
-          </div>
-          <div v-if="providerForm.kind === 'cloud'" class="col-span-2">
-            <Label>API Key</Label>
-            <Input v-model="providerForm.apiKey" class="mt-1.5" type="password" placeholder="sk-…" />
-          </div>
-        </div>
-
-        <div
-          v-if="providerForm.kind === 'cloud'"
-          class="flex items-start gap-2 rounded-md border border-[var(--warn)]/50 bg-[var(--warn)]/10 p-3 text-xs"
-        >
-          <Info class="mt-0.5 size-3.5 shrink-0" />
-          <span>
-            开启云端后，银行流水摘要、对方户名、金额会发送到该服务商。
-            账号与统一社会信用代码会自动打码；金额与户名默认保留，
-            因为它们是判断科目的核心依据。如需数据完全不出本机，请配置本地 Ollama。
-          </span>
-        </div>
-
-        <div class="flex flex-wrap items-center gap-3">
-          <Button :disabled="busy" @click="saveProvider">
-            <Save /> {{ providerForm.id ? '保存修改' : '保存并启用' }}
-          </Button>
-          <Button v-if="providerForm.id" variant="ghost" size="sm" @click="cancelEdit">
-            取消编辑
-          </Button>
-          <span class="text-xs text-muted-foreground">
-            <template v-if="providerForm.id">正在编辑「{{ providerForm.name }}」</template>
-            <template v-else>
-              本地模型示例：先装 Ollama，执行
-              <code class="rounded bg-muted px-1">ollama pull qwen2.5:7b</code>
-            </template>
-          </span>
-        </div>
-
-        <!-- AI 表现 -->
-        <template v-if="stats && stats.total > 0">
-          <Separator />
-          <div>
-            <p class="mb-2 text-sm font-medium">AI 表现</p>
-            <div class="grid grid-cols-4 gap-3">
-              <div class="rounded-lg border p-3">
-                <p class="text-xs text-muted-foreground">调用总数</p>
-                <p class="num mt-1 text-lg font-semibold">{{ stats.total }}</p>
-              </div>
-              <div class="rounded-lg border p-3">
-                <p class="text-xs text-muted-foreground">护栏通过率</p>
-                <p class="num mt-1 text-lg font-semibold">
-                  {{ passRate === null ? '—' : passRate + '%' }}
-                </p>
-                <p class="text-[11px] text-muted-foreground">{{ stats.valid }} / {{ stats.proposed }}</p>
-              </div>
-              <div class="rounded-lg border p-3">
-                <p class="text-xs text-muted-foreground">采纳率</p>
-                <p class="num mt-1 text-lg font-semibold">
-                  {{ acceptRate === null ? '—' : acceptRate + '%' }}
-                </p>
-                <p class="text-[11px] text-muted-foreground">
-                  原样 {{ stats.accepted }} · 改后 {{ stats.modified }} · 拒绝 {{ stats.rejected }}
-                </p>
-              </div>
-              <div class="rounded-lg border p-3">
-                <p class="text-xs text-muted-foreground">服务不可用</p>
-                <p class="num mt-1 text-lg font-semibold">{{ stats.total - stats.proposed }}</p>
-                <p class="text-[11px] text-muted-foreground">不计入护栏通过率</p>
-              </div>
-            </div>
-            <p class="mt-2 text-xs text-muted-foreground">
-              护栏通过率是判断「这个模型能不能用」最直接的指标 ——
-              通过率 40% 的模型，用户点三次才中一次，还不如手录。
-            </p>
-          </div>
-        </template>
-      </CardContent>
-    </Card>
 
     <!-- 恢复成功后的常驻提示：原账套去哪了 -->
     <Card v-if="restoreStash" class="border-[var(--debit)]/40">

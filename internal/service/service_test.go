@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
 	"miniaccount/internal/service"
-	"miniaccount/internal/store/sqlite"
 )
 
 // newSvc 建一个干净的账套。
@@ -313,85 +311,6 @@ func TestFilesDirAndBackup(t *testing.T) {
 	}
 	if info.CompanyName != "备份测试" {
 		t.Errorf("恢复后单位名称 = %s", info.CompanyName)
-	}
-}
-
-// AI 未配置时必须优雅降级：返回 Disabled 而不是崩溃或 nil
-func TestAISuggestWithoutProvider(t *testing.T) {
-	ctx := context.Background()
-	svc := newSvc(t, 3)
-
-	cfg, err := svc.AIConfigInfo(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.HasDefault {
-		t.Error("新账套不该有 AI 服务")
-	}
-	if cfg.Stats.Total != 0 {
-		t.Errorf("新账套的 AI 统计应为空，实际 %+v", cfg.Stats)
-	}
-
-	res, err := svc.AISuggest(ctx, service.AISuggestInput{
-		Text: "收到货款", Amount: money.Money(100000), Date: "2025-01-15",
-		TargetType: "freeform",
-	})
-	if err != nil {
-		t.Fatalf("未配置服务不该让调用本身失败: %v", err)
-	}
-	// ★ 失败通过结果对象表达，而不是 panic 或返回一个「看起来成功」的空建议。
-	// 界面据此在建议面板里显示一条错误提示，而不是弹全局错误框。
-	if res.OK {
-		t.Fatal("未配置模型服务时 OK 必须为假")
-	}
-	if res.Error == "" {
-		t.Fatal("必须说明失败原因")
-	}
-	// ★ 断言「这条消息有没有用」，而不是它的字面。
-	//
-	// 它会原样出现在界面的建议面板里（前面再加「生成失败：」），
-	// 用户要能从中读出**下一步做什么**。只说「未启用」等于让他
-	// 自己去猜在哪儿开 —— 而这一条正是用户报回来的问题：
-	// 配了模型却被告知「还没有配置」。
-	//
-	// 注意这里**不能**写死要求「尚未配置」之类的字样：
-	// 「没配置」和「配了但停用」是两件事，原因由存储层按实际情况给，
-	// 写死哪一种都会把另一种判成失败。
-	if !strings.Contains(res.Error, "设置") {
-		t.Errorf("错误信息要告诉用户去哪儿处理，实际 %q", res.Error)
-	}
-	if strings.Contains(res.Error, "ai: ") {
-		t.Errorf("错误信息里不该带包的报错前缀，实际 %q", res.Error)
-	}
-	if res.Voucher != nil {
-		t.Error("失败时不该带出凭证内容")
-	}
-}
-
-func TestAIConfigRoundTrip(t *testing.T) {
-	ctx := context.Background()
-	svc := newSvc(t, 3)
-
-	id, err := svc.SaveAIProvider(ctx, &sqlite.AIProviderConfig{
-		Name: "本地 Ollama", Kind: "local",
-		BaseURL: "http://127.0.0.1:11434/v1", Model: "qwen2.5:7b",
-		Enabled: true, IsDefault: true,
-	})
-	if err != nil {
-		t.Fatalf("保存 AI 服务失败: %v", err)
-	}
-	if id == 0 {
-		t.Fatal("应返回 id")
-	}
-	cfg, err := svc.AIConfigInfo(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.HasDefault {
-		t.Error("已保存启用的服务，应视为可用")
-	}
-	if len(cfg.Providers) != 1 || cfg.Providers[0].Model != "qwen2.5:7b" {
-		t.Errorf("配置读回不一致: %+v", cfg.Providers)
 	}
 }
 

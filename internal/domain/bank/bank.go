@@ -1,16 +1,14 @@
 // Package bank 实现银行流水导入与匹配。
 //
-// # 三层降级匹配
+// # 两层降级匹配
 //
 // 小微企业 70~90% 的银行流水是重复模式（同一供应商货款、同一股东往来、
-// 每月工资、每月房租）。这些用规则和历史就能 100% 准确命中，
-// **不该花 AI token，也不该引入不确定性**。AI 只处理剩下的长尾。
+// 每月工资、每月房租）。这些用规则和历史就能 100% 准确命中。
 //
 //	第 1 层  规则引擎    用户配置的 bank_rule，零成本、确定性
 //	第 2 层  历史相似度  从用户自己的历史凭证里检索相似分录
-//	第 3 层  AI Agent    前两层都没命中时才调用（后续阶段实现）
 //
-// 预期覆盖率：规则 + 历史 ≥ 80%，AI 处理 < 20%。
+// 两层都没命中时返回未匹配，由人工指定。
 //
 // # 记账方向
 //
@@ -85,15 +83,15 @@ func (s Status) Label() string {
 	}
 }
 
-// Layer 标识匹配结果的来源。记录它是为了统计「规则/历史/AI 各覆盖多少」，
-// 从而知道该扩充规则还是该调模型。
+// Layer 标识匹配结果的来源。记录它是为了统计「规则/历史各覆盖多少」，
+// 从而知道该扩充哪类规则。
 type Layer string
 
 // 匹配层。
 const (
 	LayerRule    Layer = "rule"    // 规则命中
 	LayerHistory Layer = "history" // 历史相似
-	LayerAI      Layer = "ai"      // 模型提议
+	LayerAI      Layer = "ai"      // 历史遗留标记：旧数据 match_layer 里可能有它
 	LayerManual  Layer = "manual"  // 人工指定
 )
 
@@ -610,27 +608,13 @@ func commonPrefix(a, b string) int {
 // 三层编排
 // ---------------------------------------------------------------------------
 
-// Matcher 把三层匹配串起来。
-//
-// AI 层通过 AISuggester 接口注入：默认不接入（nil），
-// 前两层已能覆盖大部分场景。这样即便用户完全不用 AI，
-// 银行流水导入功能也完整可用。
+// Matcher 把两层匹配串起来。
 type Matcher struct {
 	Rules   *RuleEngine
 	History *HistoryMatcher
-	AI      AISuggester
 }
 
-// AISuggester 是第 3 层的接口。实现见后续阶段的 AI 模块。
-//
-// 刻意把它定义成接口而不是直接依赖模型客户端：
-// AI 是**增强**不是**依赖** —— 断网、模型崩了、没配 API Key，
-// 记账功能必须完全可用。
-type AISuggester interface {
-	Suggest(f *Flow) (*Suggestion, error)
-}
-
-// Match 依次尝试三层，返回第一个可用的提议。
+// Match 依次尝试两层，返回第一个可用的提议。
 func (m *Matcher) Match(f *Flow) *Suggestion {
 	if m.Rules != nil {
 		if s := m.Rules.Match(f); s != nil {
@@ -641,13 +625,6 @@ func (m *Matcher) Match(f *Flow) *Suggestion {
 		if s := m.History.Match(f); s != nil {
 			return s
 		}
-	}
-	if m.AI != nil {
-		if s, err := m.AI.Suggest(f); err == nil && s != nil {
-			s.Layer = LayerAI
-			return s
-		}
-		// AI 失败不影响流程：降级为「未匹配，请人工填写」
 	}
 	return nil
 }

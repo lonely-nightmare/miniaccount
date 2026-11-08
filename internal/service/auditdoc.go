@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"miniaccount/internal/ai/aiprovider"
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/auditdoc"
 	"miniaccount/internal/domain/calendar"
@@ -553,36 +552,6 @@ func (s *Service) ShareholderPaid(ctx context.Context, year, month int) ([]Share
 		// 贷方净额（Closing 是借−贷，实收资本正常为贷方 → 取负号）。
 		// 异常方向原样带出去，让界面与验资报告都能看见。
 		out = append(out, ShareholderPaidView{Name: r.ContactName, Paid: r.Closing.Neg()})
-	}
-	return out, nil
-}
-
-// ---------------------------------------------------------------------------
-// 给 AI 用的紧凑形状
-// ---------------------------------------------------------------------------
-//
-// ★ 与界面读的是**同一个** AuditDoc：同一条生成路径、同一份事实。
-// 模型不能替注册会计师形成意见，所以它读到的也只能是草稿，
-// 而且渲染出来的文本里会反复说清「草稿、待签字盖章」。
-
-// AuditDocBrief 生成给 AI 看的文书草稿。
-func (s *Service) AuditDocBrief(ctx context.Context, kind string,
-	year, month int) (*aiprovider.AuditDocBrief, error) {
-
-	v, err := s.AuditDoc(ctx, AuditDocInput{Kind: kind, Year: year, Month: month})
-	if err != nil {
-		return nil, err
-	}
-	out := &aiprovider.AuditDocBrief{
-		Kind: v.Kind, KindLabel: v.KindLabel, Title: v.Title,
-		Company: v.Company, Period: v.Period, OpinionStr: v.OpinionStr,
-		Missing: v.Missing, CanIssue: v.CanIssue,
-		Signature: v.Signature, PolicyNote: v.PolicyNote, FullText: v.FullText,
-	}
-	for _, sec := range v.Sections {
-		out.Sections = append(out.Sections, aiprovider.AuditDocBriefSection{
-			No: sec.No, Title: sec.Title, Body: sec.Body, Source: sec.Source,
-		})
 	}
 	return out, nil
 }

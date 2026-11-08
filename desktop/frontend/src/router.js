@@ -19,7 +19,6 @@ const routes = [
   { path: '/summary', name: 'summary', component: () => import('./views/Summary.vue'), meta: { title: '凭证汇总表', icon: 'Sigma' } },
   { path: '/columnar', name: 'columnar', component: () => import('./views/Columnar.vue'), meta: { title: '多栏式明细账', icon: 'Columns3' } },
   { path: '/ledger', name: 'ledger', component: () => import('./views/Ledger.vue'), meta: { title: '明细账', icon: 'BookOpen' } },
-  { path: '/ai', name: 'ai', component: () => import('./views/AIAssistant.vue'), meta: { title: 'AI 记账助手', icon: 'Sparkles' } },
   { path: '/accounts', name: 'accounts', component: () => import('./views/Accounts.vue'), meta: { title: '科目管理', icon: 'ListTree' } },
   { path: '/auxiliary', name: 'auxiliary', component: () => import('./views/Auxiliary.vue'), meta: { title: '辅助核算', icon: 'Shapes' } },
   { path: '/assets', name: 'assets', component: () => import('./views/Assets.vue'), meta: { title: '固定资产', icon: 'Building2' } },

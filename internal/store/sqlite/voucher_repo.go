@@ -397,6 +397,24 @@ func (r *VoucherRepo) LoadPeriodsTx(ctx context.Context, tx *Tx) (*period.Calend
 	return period.FromRows(keys, status, closed)
 }
 
+// LedgerContext 装配只读校验上下文（科目树/期间表/往来档案）。
+// 供事务外的「检查一下」类只读路径用；事务内用 validationContext。
+func (r *VoucherRepo) LedgerContext(ctx context.Context) (*ledger.Context, error) {
+	tree, err := r.db.Accounts().Tree(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cal, err := r.db.Periods().Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	kinds, err := r.db.Contacts().Kinds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &ledger.Context{Accounts: tree, Periods: cal, ContactKinds: kinds}, nil
+}
+
 // validationContext 在同一事务内装配过账校验所需的外部事实。
 func (r *VoucherRepo) validationContext(ctx context.Context, tx *Tx) (*ledger.Context, error) {
 	tree, err := r.db.Accounts().TreeFrom(ctx, tx)

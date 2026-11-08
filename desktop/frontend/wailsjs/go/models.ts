@@ -162,42 +162,6 @@ export namespace calendar {
 
 export namespace main {
 	
-	export class AIAcceptRequest {
-	    id: number;
-	    createdBy: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIAcceptRequest(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.createdBy = source["createdBy"];
-	    }
-	}
-	export class AISuggestRequest {
-	    task: string;
-	    text: string;
-	    amountYuan: string;
-	    date: string;
-	    counterparty: string;
-	    direction: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AISuggestRequest(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.task = source["task"];
-	        this.text = source["text"];
-	        this.amountYuan = source["amountYuan"];
-	        this.date = source["date"];
-	        this.counterparty = source["counterparty"];
-	        this.direction = source["direction"];
-	    }
-	}
 	export class AccountKindOption {
 	    value: string;
 	    label: string;
@@ -245,22 +209,6 @@ export namespace main {
 		    }
 		    return a;
 		}
-	}
-	export class AccountantSendRequest {
-	    sessionId: string;
-	    text: string;
-	    selected: string[];
-	
-	    static createFrom(source: any = {}) {
-	        return new AccountantSendRequest(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.sessionId = source["sessionId"];
-	        this.text = source["text"];
-	        this.selected = source["selected"];
-	    }
 	}
 	export class AccrueRequest {
 	    year: number;
@@ -2081,284 +2029,6 @@ export namespace payroll {
 
 export namespace service {
 	
-	export class AIAcceptResult {
-	    voucherId: number;
-	    voucherNo: string;
-	    summary: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIAcceptResult(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.voucherId = source["voucherId"];
-	        this.voucherNo = source["voucherNo"];
-	        this.summary = source["summary"];
-	    }
-	}
-	export class AIConfig {
-	    providers: sqlite.AIProviderConfig[];
-	    stats: sqlite.AIStats;
-	    hasDefault: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIConfig(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.providers = this.convertValues(source["providers"], sqlite.AIProviderConfig);
-	        this.stats = this.convertValues(source["stats"], sqlite.AIStats);
-	        this.hasDefault = source["hasDefault"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	export class AIPromptInput {
-	    instructions: string;
-	    taskNotes: Record<string, string>;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIPromptInput(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.instructions = source["instructions"];
-	        this.taskNotes = source["taskNotes"];
-	    }
-	}
-	export class AIPromptPreview {
-	    system: string;
-	    user: string;
-	    digest: string;
-	    chars: number;
-	    task: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIPromptPreview(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.system = source["system"];
-	        this.user = source["user"];
-	        this.digest = source["digest"];
-	        this.chars = source["chars"];
-	        this.task = source["task"];
-	    }
-	}
-	export class AIPromptTask {
-	    value: string;
-	    label: string;
-	    note: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIPromptTask(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.value = source["value"];
-	        this.label = source["label"];
-	        this.note = source["note"];
-	    }
-	}
-	export class AIPromptView {
-	    instructions: string;
-	    custom: boolean;
-	    default: string;
-	    taskNotes: Record<string, string>;
-	    tasks: AIPromptTask[];
-	    updatedAt: string;
-	    maxInstructions: number;
-	    maxTaskNote: number;
-	    locked: string[];
-	
-	    static createFrom(source: any = {}) {
-	        return new AIPromptView(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.instructions = source["instructions"];
-	        this.custom = source["custom"];
-	        this.default = source["default"];
-	        this.taskNotes = source["taskNotes"];
-	        this.tasks = this.convertValues(source["tasks"], AIPromptTask);
-	        this.updatedAt = source["updatedAt"];
-	        this.maxInstructions = source["maxInstructions"];
-	        this.maxTaskNote = source["maxTaskNote"];
-	        this.locked = source["locked"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	export class HealthItemInfo {
-	    key: string;
-	    title: string;
-	    level: string;
-	    detail: string;
-	    count: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new HealthItemInfo(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.key = source["key"];
-	        this.title = source["title"];
-	        this.level = source["level"];
-	        this.detail = source["detail"];
-	        this.count = source["count"];
-	    }
-	}
-	export class ClosingEntry {
-	    accountCode: string;
-	    summary: string;
-	    debit: number;
-	    credit: number;
-	    auxDesc: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new ClosingEntry(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.accountCode = source["accountCode"];
-	        this.summary = source["summary"];
-	        this.debit = source["debit"];
-	        this.credit = source["credit"];
-	        this.auxDesc = source["auxDesc"];
-	    }
-	}
-	export class VoucherDraft {
-	    word: string;
-	    bizDate: string;
-	    remark: string;
-	    entries: ClosingEntry[];
-	    total: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new VoucherDraft(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.word = source["word"];
-	        this.bizDate = source["bizDate"];
-	        this.remark = source["remark"];
-	        this.entries = this.convertValues(source["entries"], ClosingEntry);
-	        this.total = source["total"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	export class AISuggestResult {
-	    ok: boolean;
-	    summary: string;
-	    error: string;
-	    suggestionId: number;
-	    layer: string;
-	    confidence: number;
-	    voucher?: VoucherDraft;
-	    failures: HealthItemInfo[];
-	    warnings: HealthItemInfo[];
-	    model: string;
-	    latencyMs: number;
-	    tokensIn: number;
-	    tokensOut: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new AISuggestResult(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.ok = source["ok"];
-	        this.summary = source["summary"];
-	        this.error = source["error"];
-	        this.suggestionId = source["suggestionId"];
-	        this.layer = source["layer"];
-	        this.confidence = source["confidence"];
-	        this.voucher = this.convertValues(source["voucher"], VoucherDraft);
-	        this.failures = this.convertValues(source["failures"], HealthItemInfo);
-	        this.warnings = this.convertValues(source["warnings"], HealthItemInfo);
-	        this.model = source["model"];
-	        this.latencyMs = source["latencyMs"];
-	        this.tokensIn = source["tokensIn"];
-	        this.tokensOut = source["tokensOut"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
 	export class AccountInput {
 	    code: string;
 	    name: string;
@@ -2475,377 +2145,6 @@ export namespace service {
 	        this.reason = source["reason"];
 	    }
 	}
-	export class AccountantOption {
-	    label: string;
-	    description: string;
-	    recommended: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new AccountantOption(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.label = source["label"];
-	        this.description = source["description"];
-	        this.recommended = source["recommended"];
-	    }
-	}
-	export class AccountantQuestion {
-	    id: string;
-	    header: string;
-	    question: string;
-	    options: AccountantOption[];
-	    multiSelect: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new AccountantQuestion(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.header = source["header"];
-	        this.question = source["question"];
-	        this.options = this.convertValues(source["options"], AccountantOption);
-	        this.multiSelect = source["multiSelect"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	export class CPAAnswerView {
-	    conclusion: string;
-	    basis: string[];
-	    obtained: string[];
-	    missing: string[];
-	    process: string;
-	    findings: string[];
-	    risk: string;
-	    recommendations: string[];
-	    humanReview: string[];
-	    submittable: boolean;
-	    submittableClaimed: boolean;
-	    policyNote: string;
-	    text: string;
-	    problemList: string[];
-	    escalation: string[];
-	    riskUnstated: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new CPAAnswerView(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.conclusion = source["conclusion"];
-	        this.basis = source["basis"];
-	        this.obtained = source["obtained"];
-	        this.missing = source["missing"];
-	        this.process = source["process"];
-	        this.findings = source["findings"];
-	        this.risk = source["risk"];
-	        this.recommendations = source["recommendations"];
-	        this.humanReview = source["humanReview"];
-	        this.submittable = source["submittable"];
-	        this.submittableClaimed = source["submittableClaimed"];
-	        this.policyNote = source["policyNote"];
-	        this.text = source["text"];
-	        this.problemList = source["problemList"];
-	        this.escalation = source["escalation"];
-	        this.riskUnstated = source["riskUnstated"];
-	    }
-	}
-	export class EvidenceProposalView {
-	    ownerType: string;
-	    ownerTypeLabel: string;
-	    ownerId: number;
-	    ownerTitle: string;
-	    refKind: string;
-	    refKindLabel: string;
-	    refId: number;
-	    refLabel: string;
-	    note: string;
-	    reason: string;
-	    problems: string[];
-	    detail: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new EvidenceProposalView(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.ownerType = source["ownerType"];
-	        this.ownerTypeLabel = source["ownerTypeLabel"];
-	        this.ownerId = source["ownerId"];
-	        this.ownerTitle = source["ownerTitle"];
-	        this.refKind = source["refKind"];
-	        this.refKindLabel = source["refKindLabel"];
-	        this.refId = source["refId"];
-	        this.refLabel = source["refLabel"];
-	        this.note = source["note"];
-	        this.reason = source["reason"];
-	        this.problems = source["problems"];
-	        this.detail = source["detail"];
-	    }
-	}
-	export class AdjustProposalLineView {
-	    lineNo: number;
-	    accountCode: string;
-	    accountName: string;
-	    summary: string;
-	    debit: number;
-	    credit: number;
-	    contactId?: number;
-	    employeeId?: number;
-	    deptId?: number;
-	    projectId?: number;
-	    auxDesc: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AdjustProposalLineView(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.lineNo = source["lineNo"];
-	        this.accountCode = source["accountCode"];
-	        this.accountName = source["accountName"];
-	        this.summary = source["summary"];
-	        this.debit = source["debit"];
-	        this.credit = source["credit"];
-	        this.contactId = source["contactId"];
-	        this.employeeId = source["employeeId"];
-	        this.deptId = source["deptId"];
-	        this.projectId = source["projectId"];
-	        this.auxDesc = source["auxDesc"];
-	    }
-	}
-	export class AdjustmentProposalView {
-	    period: string;
-	    year: number;
-	    month: number;
-	    kind: string;
-	    kindLabel: string;
-	    summary: string;
-	    reason: string;
-	    evidence: string;
-	    amount: number;
-	    lines: AdjustProposalLineView[];
-	    detail: string;
-	    problems: string[];
-	
-	    static createFrom(source: any = {}) {
-	        return new AdjustmentProposalView(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.period = source["period"];
-	        this.year = source["year"];
-	        this.month = source["month"];
-	        this.kind = source["kind"];
-	        this.kindLabel = source["kindLabel"];
-	        this.summary = source["summary"];
-	        this.reason = source["reason"];
-	        this.evidence = source["evidence"];
-	        this.amount = source["amount"];
-	        this.lines = this.convertValues(source["lines"], AdjustProposalLineView);
-	        this.detail = source["detail"];
-	        this.problems = source["problems"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	export class HRProposalView {
-	    kind: string;
-	    kindLabel: string;
-	    employeeId: number;
-	    employeeName: string;
-	    deptId?: number;
-	    deptName: string;
-	    leaveDate: string;
-	    baseSalary: string;
-	    siBase: string;
-	    hfbBase: string;
-	    reason: string;
-	    detail: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new HRProposalView(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.kind = source["kind"];
-	        this.kindLabel = source["kindLabel"];
-	        this.employeeId = source["employeeId"];
-	        this.employeeName = source["employeeName"];
-	        this.deptId = source["deptId"];
-	        this.deptName = source["deptName"];
-	        this.leaveDate = source["leaveDate"];
-	        this.baseSalary = source["baseSalary"];
-	        this.siBase = source["siBase"];
-	        this.hfbBase = source["hfbBase"];
-	        this.reason = source["reason"];
-	        this.detail = source["detail"];
-	    }
-	}
-	export class AuxProposalView {
-	    kind: string;
-	    kindLabel: string;
-	    name: string;
-	    code: string;
-	    deptId?: number;
-	    reason: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AuxProposalView(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.kind = source["kind"];
-	        this.kindLabel = source["kindLabel"];
-	        this.name = source["name"];
-	        this.code = source["code"];
-	        this.deptId = source["deptId"];
-	        this.reason = source["reason"];
-	    }
-	}
-	export class AccountantTurn {
-	    role: string;
-	    text: string;
-	    question?: AccountantQuestion;
-	    aux?: AuxProposalView;
-	    hr?: HRProposalView;
-	    adjustment?: AdjustmentProposalView;
-	    evidence?: EvidenceProposalView;
-	    answer?: CPAAnswerView;
-	    voucher?: VoucherDraft;
-	    failures?: string[];
-	    warnings?: string[];
-	    suggestionId?: number;
-	    passed?: boolean;
-	    model?: string;
-	    tokensIn?: number;
-	    tokensOut?: number;
-	    at: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AccountantTurn(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.role = source["role"];
-	        this.text = source["text"];
-	        this.question = this.convertValues(source["question"], AccountantQuestion);
-	        this.aux = this.convertValues(source["aux"], AuxProposalView);
-	        this.hr = this.convertValues(source["hr"], HRProposalView);
-	        this.adjustment = this.convertValues(source["adjustment"], AdjustmentProposalView);
-	        this.evidence = this.convertValues(source["evidence"], EvidenceProposalView);
-	        this.answer = this.convertValues(source["answer"], CPAAnswerView);
-	        this.voucher = this.convertValues(source["voucher"], VoucherDraft);
-	        this.failures = source["failures"];
-	        this.warnings = source["warnings"];
-	        this.suggestionId = source["suggestionId"];
-	        this.passed = source["passed"];
-	        this.model = source["model"];
-	        this.tokensIn = source["tokensIn"];
-	        this.tokensOut = source["tokensOut"];
-	        this.at = source["at"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	export class AccountantSession {
-	    id: string;
-	    turns: AccountantTurn[];
-	    asks: number;
-	    busy: boolean;
-	    updated: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AccountantSession(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.turns = this.convertValues(source["turns"], AccountantTurn);
-	        this.asks = source["asks"];
-	        this.busy = source["busy"];
-	        this.updated = source["updated"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	
 	export class AccountsView {
 	    rows: AccountRow[];
 	    total: number;
@@ -3035,8 +2334,6 @@ export namespace service {
 	        this.projectId = source["projectId"];
 	    }
 	}
-	
-	
 	export class AdjustmentView {
 	    id: number;
 	    code: string;
@@ -3601,7 +2898,6 @@ export namespace service {
 	        this.bookOnly = source["bookOnly"];
 	    }
 	}
-	
 	export class BankFlowView {
 	    id: number;
 	    date: string;
@@ -3786,6 +3082,26 @@ export namespace service {
 	        this.usable = source["usable"];
 	    }
 	}
+	export class HealthItemInfo {
+	    key: string;
+	    title: string;
+	    level: string;
+	    detail: string;
+	    count: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new HealthItemInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.key = source["key"];
+	        this.title = source["title"];
+	        this.level = source["level"];
+	        this.detail = source["detail"];
+	        this.count = source["count"];
+	    }
+	}
 	export class HealthInfo {
 	    period: string;
 	    canClose: boolean;
@@ -3930,7 +3246,6 @@ export namespace service {
 		    return a;
 		}
 	}
-	
 	export class CategoryOption {
 	    value: string;
 	    label: string;
@@ -4101,7 +3416,26 @@ export namespace service {
 		    return a;
 		}
 	}
+	export class ClosingEntry {
+	    accountCode: string;
+	    summary: string;
+	    debit: number;
+	    credit: number;
+	    auxDesc: string;
 	
+	    static createFrom(source: any = {}) {
+	        return new ClosingEntry(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.accountCode = source["accountCode"];
+	        this.summary = source["summary"];
+	        this.debit = source["debit"];
+	        this.credit = source["credit"];
+	        this.auxDesc = source["auxDesc"];
+	    }
+	}
 	export class ClosingStep {
 	    key: string;
 	    title: string;
@@ -4758,7 +4092,6 @@ export namespace service {
 		}
 	}
 	
-	
 	export class EvidenceView {
 	    period: string;
 	    chains: EvidenceChainView[];
@@ -4821,7 +4154,6 @@ export namespace service {
 	        this.issues = source["issues"];
 	    }
 	}
-	
 	
 	
 	export class InsuranceSchemeInfo {
@@ -6385,7 +5717,6 @@ export namespace service {
 		}
 	}
 	
-	
 	export class VoucherSummary {
 	    id: number;
 	    no: string;
@@ -6497,64 +5828,6 @@ export namespace service {
 
 export namespace sqlite {
 	
-	export class AIProviderConfig {
-	    id: number;
-	    name: string;
-	    kind: string;
-	    baseUrl: string;
-	    model: string;
-	    apiKey?: string;
-	    hasKey: boolean;
-	    enabled: boolean;
-	    isDefault: boolean;
-	    timeoutMs: number;
-	    remark: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIProviderConfig(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.name = source["name"];
-	        this.kind = source["kind"];
-	        this.baseUrl = source["baseUrl"];
-	        this.model = source["model"];
-	        this.apiKey = source["apiKey"];
-	        this.hasKey = source["hasKey"];
-	        this.enabled = source["enabled"];
-	        this.isDefault = source["isDefault"];
-	        this.timeoutMs = source["timeoutMs"];
-	        this.remark = source["remark"];
-	    }
-	}
-	export class AIStats {
-	    total: number;
-	    proposed: number;
-	    valid: number;
-	    accepted: number;
-	    modified: number;
-	    rejected: number;
-	    tokensIn: number;
-	    tokensOut: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new AIStats(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.total = source["total"];
-	        this.proposed = source["proposed"];
-	        this.valid = source["valid"];
-	        this.accepted = source["accepted"];
-	        this.modified = source["modified"];
-	        this.rejected = source["rejected"];
-	        this.tokensIn = source["tokensIn"];
-	        this.tokensOut = source["tokensOut"];
-	    }
-	}
 	export class BookPeek {
 	    path: string;
 	    fileName: string;
@@ -6585,48 +5858,6 @@ export namespace sqlite {
 	        this.sizeBytes = source["sizeBytes"];
 	        this.modTime = source["modTime"];
 	        this.err = source["err"];
-	    }
-	}
-	export class SuggestionRow {
-	    id: number;
-	    targetType: string;
-	    targetId?: number;
-	    providerName: string;
-	    model: string;
-	    layer: string;
-	    checksum: string;
-	    confidence: number;
-	    status: string;
-	    rejectReason: string;
-	    decision: string;
-	    finalVoucher?: number;
-	    tokensIn: number;
-	    tokensOut: number;
-	    createdAt: string;
-	    decidedAt?: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new SuggestionRow(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.targetType = source["targetType"];
-	        this.targetId = source["targetId"];
-	        this.providerName = source["providerName"];
-	        this.model = source["model"];
-	        this.layer = source["layer"];
-	        this.checksum = source["checksum"];
-	        this.confidence = source["confidence"];
-	        this.status = source["status"];
-	        this.rejectReason = source["rejectReason"];
-	        this.decision = source["decision"];
-	        this.finalVoucher = source["finalVoucher"];
-	        this.tokensIn = source["tokensIn"];
-	        this.tokensOut = source["tokensOut"];
-	        this.createdAt = source["createdAt"];
-	        this.decidedAt = source["decidedAt"];
 	    }
 	}
 

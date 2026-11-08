@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"miniaccount/internal/ai/aiprovider"
 	"miniaccount/internal/domain/period"
 	"miniaccount/internal/service"
 )
@@ -461,62 +460,6 @@ func TestAddEvidenceAllowsMultipleDescriptive(t *testing.T) {
 
 // ★ AI 读到的证据链必须与界面一致，包括「原件已找不到」。
 //
-// 发布前审计实测：AI 走的是另一份实现，报不出 Broken，
-// 于是界面上写着「另有 1 项的依据已经找不到」，而模型对同一期说
-// 「这笔调整有依据」—— 恰好把证据链存在的理由绕过去了。
-func TestEvidenceBriefReportsBroken(t *testing.T) {
-	ctx := context.Background()
-	svc := newSvc(t, 6)
-	dept := mustDepartment(t, svc, "生产部")
-	seedMateriality(t, svc, 2025, 3)
-	id, _ := addAdjustment(t, svc, depAdjustmentInput(t, svc, 2025, 3, dept, 3000))
-
-	d, err := svc.SaveVoucher(ctx, service.VoucherInput{
-		Word: "记", Date: "2025-03-31", Remark: "计提折旧", CreatedBy: "李会计",
-		Lines: []service.VoucherLineInput{
-			{AccountCode: "560205", Summary: "计提", Debit: money100(1000), DeptID: &dept},
-			{AccountCode: "1602", Summary: "计提", Credit: money100(1000)},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.AddEvidence(ctx, service.EvidenceInput{
-		OwnerType: "adjustment", OwnerID: id, RefKind: "voucher", RefID: d.ID,
-		By: "李审计",
-	}); err != nil {
-		t.Fatalf("挂凭证依据失败: %v", err)
-	}
-
-	brief, err := svc.EvidenceBrief(ctx, aiprovider.PeriodKey{Year: 2025, Month: 3})
-	if err != nil {
-		t.Fatalf("生成给 AI 的证据链失败: %v", err)
-	}
-	if brief.Broken != 0 {
-		t.Errorf("凭证还在，不该有「找不到」：%d", brief.Broken)
-	}
-
-	// 删掉那张凭证 → 依据悬空
-	if err := svc.DeleteVoucher(ctx, d.ID); err != nil {
-		t.Fatalf("删除凭证失败: %v", err)
-	}
-	brief, err = svc.EvidenceBrief(ctx, aiprovider.PeriodKey{Year: 2025, Month: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if brief.Broken != 1 {
-		t.Errorf("★ AI 也要看到「有 1 项依据已找不到」，实际 %d", brief.Broken)
-	}
-	total := 0
-	for _, c := range brief.Chains {
-		total += c.Missing
-	}
-	if total != 1 {
-		t.Errorf("链上也要标出找不到的份数，实际 %d", total)
-	}
-	// 渲染出来的文本必须明确告诉模型不要断言「有依据」
-	// （renderEvidence 在 aiprovider 内部，这里只验数据层）
-}
 
 // ★ 删掉重要性水平时，挂在它下面的证据也要一起走。
 //

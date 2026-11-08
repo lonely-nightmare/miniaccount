@@ -247,18 +247,6 @@ func TestHistoryNoMatchForUnknownCounterparty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 三层编排
-// ---------------------------------------------------------------------------
-
-type stubAI struct {
-	called bool
-	s      *Suggestion
-}
-
-func (a *stubAI) Suggest(f *Flow) (*Suggestion, error) {
-	a.called = true
-	return a.s, nil
-}
 
 func TestMatcherLayerOrder(t *testing.T) {
 	rules := NewRuleEngine([]*Rule{{
@@ -269,15 +257,10 @@ func TestMatcherLayerOrder(t *testing.T) {
 		VoucherNo: "V1", Direction: DirIn, CounterpartyName: "张三",
 		CounterAccountCode: "9999",
 	}})
-	ai := &stubAI{s: &Suggestion{CounterAccountCode: "8888", Confidence: 0.9}}
-
-	m := &Matcher{Rules: rules, History: history, AI: ai}
+	m := &Matcher{Rules: rules, History: history}
 	s := m.Match(flow("张三", "转账", DirIn, y(100)))
 	if s.Layer != LayerRule {
 		t.Errorf("应优先用规则，得到 %s", s.Layer)
-	}
-	if ai.called {
-		t.Error("规则命中时不应调用 AI（省成本、避免不确定性）")
 	}
 }
 
@@ -294,50 +277,6 @@ func TestMatcherFallsBackToHistory(t *testing.T) {
 	s := m.Match(flow("张三", "借款", DirIn, y(100)))
 	if s == nil || s.Layer != LayerHistory {
 		t.Fatalf("规则未命中时应回落到历史，得到 %+v", s)
-	}
-}
-
-func TestMatcherFallsBackToAI(t *testing.T) {
-	rules := NewRuleEngine(nil)
-	history := NewHistoryMatcher(nil)
-	ai := &stubAI{s: &Suggestion{CounterAccountCode: "5602", Confidence: 0.8}}
-	m := &Matcher{Rules: rules, History: history, AI: ai}
-	s := m.Match(flow("陌生公司", "服务费", DirOut, y(1000)))
-	if s == nil || s.Layer != LayerAI {
-		t.Fatalf("前两层未命中时应调用 AI，得到 %+v", s)
-	}
-	if !ai.called {
-		t.Error("应调用 AI")
-	}
-}
-
-// ★ AI 是增强不是依赖：AI 挂了必须不影响记账
-func TestMatcherAIFailureIsNotFatal(t *testing.T) {
-	m := &Matcher{Rules: NewRuleEngine(nil), History: NewHistoryMatcher(nil),
-		AI: &failingAI{}}
-	s := m.Match(flow("陌生公司", "服务费", DirOut, y(1000)))
-	if s != nil {
-		t.Errorf("AI 失败时应返回未匹配，得到 %+v", s)
-	}
-}
-
-type failingAI struct{}
-
-func (f *failingAI) Suggest(*Flow) (*Suggestion, error) {
-	return nil, errStub
-}
-
-var errStub = &stubErr{}
-
-type stubErr struct{}
-
-func (e *stubErr) Error() string { return "AI 服务不可用" }
-
-// AI 完全不配置时也要能用（用户没开 AI）
-func TestMatcherWithoutAI(t *testing.T) {
-	m := &Matcher{Rules: NewRuleEngine(nil), History: NewHistoryMatcher(nil)}
-	if s := m.Match(flow("X", "Y", DirIn, y(1))); s != nil {
-		t.Errorf("无 AI 时应返回未匹配，得到 %+v", s)
 	}
 }
 

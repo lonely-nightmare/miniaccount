@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	"miniaccount/internal/ai/aiprovider"
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
@@ -473,49 +472,6 @@ func yuanText(m money.Money) string {
 		return ""
 	}
 	return m.PlainString()
-}
-
-// ---------------------------------------------------------------------------
-// 给 AI 用的紧凑形状
-// ---------------------------------------------------------------------------
-//
-// ★ 与界面读的是**同一个** TaxReturn：同一条计算路径、同一份取数。
-// 让模型自己按记忆里的税率算一遍，最坏的结果不是算错一位数，
-// 而是它用了一个过期的优惠政策还说得头头是道。
-
-// TaxReturnBrief 生成给 AI 看的税务计算表。
-func (s *Service) TaxReturnBrief(ctx context.Context, kind string,
-	year, month int) (*aiprovider.TaxReturnBrief, error) {
-
-	v, err := s.TaxReturn(ctx, TaxReturnInput{
-		Kind: kind, Year: year, Month: month,
-	})
-	if err != nil {
-		return nil, err
-	}
-	out := &aiprovider.TaxReturnBrief{
-		Kind: v.Kind, KindLabel: v.KindLabel, Period: v.Period, Title: v.Title,
-		Warnings: v.Warnings, PolicyNote: v.PolicyNote, Concludes: v.Concludes,
-		FilingHint: v.FilingHint,
-	}
-	if v.Filing != nil {
-		out.FilingStatus = v.Filing.StatusLabel
-	}
-	for _, id := range v.Identities {
-		out.Identities = append(out.Identities, id.Label+"："+id.Value)
-	}
-	for _, r := range v.Rows {
-		out.Rows = append(out.Rows, aiprovider.TaxReturnBriefRow{
-			Line: r.Line, Label: r.Label, Amount: r.Amount,
-			Source: r.Source, Note: r.Note,
-		})
-	}
-	for _, k := range v.Keys {
-		out.Keys = append(out.Keys, aiprovider.TaxReturnBriefRow{
-			Label: k.Label, Amount: k.Amount, Note: k.Note,
-		})
-	}
-	return out, nil
 }
 
 // TaxReturnKindOption 是税种选项（界面标签页用）。

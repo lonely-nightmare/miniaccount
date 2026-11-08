@@ -8,7 +8,6 @@ import (
 
 	"time"
 
-	"miniaccount/internal/ai/aiprovider"
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/evidence"
 	"miniaccount/internal/domain/invoice"
@@ -495,36 +494,4 @@ func shortHash(h string) string {
 		return h[:8]
 	}
 	return h
-}
-
-// EvidenceBrief 生成给 AI 看的证据链（与界面同一个 Evidence()）。
-func (s *Service) EvidenceBrief(ctx context.Context,
-	k aiprovider.PeriodKey) (*aiprovider.EvidenceBrief, error) {
-
-	v, err := s.Evidence(ctx, period.NewKey(k.Year, k.Month))
-	if err != nil {
-		return nil, err
-	}
-	out := &aiprovider.EvidenceBrief{
-		Period: v.Period, Unsupported: v.Unsupported, Broken: v.Broken,
-		Concludes: v.Concludes, Chains: []aiprovider.EvidenceChainBrief{},
-	}
-	for _, c := range v.Chains {
-		chain := aiprovider.EvidenceChainBrief{
-			Owner: c.OwnerTypeLabel, Title: c.Title,
-			Files: c.Files, Documents: c.Documents,
-			Items: []aiprovider.EvidenceItemBrief{},
-		}
-		for _, l := range c.Links {
-			if l.Missing {
-				chain.Missing++
-			}
-			chain.Items = append(chain.Items, aiprovider.EvidenceItemBrief{
-				Kind: l.RefKindLabel, Label: l.RefLabel, Note: l.Note, By: l.LinkedBy,
-				Missing: l.Missing,
-			})
-		}
-		out.Chains = append(out.Chains, chain)
-	}
-	return out, nil
 }

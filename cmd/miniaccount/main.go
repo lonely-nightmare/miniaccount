@@ -64,7 +64,7 @@ const usage = `miniaccount —— 面向中国小微企业的记账软件
 
 银行流水：
   bank import   导入对账单 CSV（自动嗅探编码与列映射）
-  bank match    三层匹配（规则 → 历史 → AI）
+  bank match    两层匹配（规则 → 历史）
   bank list     查看流水与匹配结果
   bank post     批量生成凭证
   bank rules    查看 / 新增匹配规则
@@ -82,9 +82,6 @@ const usage = `miniaccount —— 面向中国小微企业的记账软件
   log        操作日志：查询、校验完整性、导出（会计监督用）
   bookkeeper 查看/设置本账套的记账人（录凭证、过账、结账时默认填它）
 
-AI：
-  ai         请求 AI 生成记账建议
-  ai-config  查看/设置模型服务
 
 通用参数：
   --db <路径>   账套文件（默认 miniaccount.db）
@@ -167,10 +164,6 @@ func main() {
 		err = cmdLog(ctx, args)
 	case "bookkeeper":
 		err = cmdBookkeeper(ctx, args)
-	case "ai":
-		err = cmdAI(ctx, args)
-	case "ai-config":
-		err = cmdAIConfig(ctx, args)
 	case "version", "-v", "--version":
 		cmdVersion()
 		return
@@ -1342,172 +1335,6 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
-// ---------------------------------------------------------------------------
-// AI
-// ---------------------------------------------------------------------------
-
-func cmdAI(ctx context.Context, args []string) error {
-	fs := newFlagSet("ai")
-	text := fs.String("text", "", "业务描述（必填）")
-	amount := fs.String("amount", "", "金额（元，正为收入、负为支出）")
-	date := fs.String("date", "", "业务日期 YYYY-MM-DD（默认今天）")
-	cp := fs.String("counterparty", "", "对方户名")
-	dir := fs.String("direction", "", "资金方向：收入 | 支出")
-	task := fs.String("task", "bank_flow", "任务类型：bank_flow | invoice | expense | freeform")
-	noHistory := fs.Bool("no-history", false, "不检索历史凭证")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *text == "" {
-		return errors.New("必须指定 --text")
-	}
-
-	amt, err := parseYuan(*amount)
-	if err != nil {
-		return err
-	}
-	d := *date
-	if d == "" {
-		d = calendar.Today().String()
-	}
-
-	svc, err := openBook(ctx, fs)
-	if err != nil {
-		return err
-	}
-	defer svc.Shutdown()
-
-	_ = noHistory // 历史检索的开关在编排层，这里保留参数以便将来接线
-
-	res, err := svc.AISuggest(ctx, service.AISuggestInput{
-		Task: *task, Text: *text, Amount: amt, Date: d,
-		Counterparty: *cp, Direction: *dir,
-		TargetType: "freeform",
-	})
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("AI 记账建议（%s）\n\n", service.LayerLabel(res.Layer))
-	fmt.Printf("  %s\n", res.Summary)
-	if res.Model != "" {
-		fmt.Printf("  模型：%s   耗时：%d ms   token：%d + %d\n",
-			res.Model, res.LatencyMS, res.TokensIn, res.TokensOut)
-	}
-	if res.Voucher != nil && len(res.Voucher.Entries) > 0 {
-		fmt.Printf("\n建议凭证：\n")
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "  科目\t摘要\t借方\t贷方\t辅助核算")
-		for _, e := range res.Voucher.Entries {
-			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
-				e.AccountCode, e.Summary, blankIfZero(e.Debit),
-				blankIfZero(e.Credit), e.AuxDesc)
-		}
-		_ = w.Flush()
-		fmt.Printf("  合计：%s\n", yuan(res.Voucher.Total))
-	}
-	if len(res.Failures) > 0 {
-		fmt.Printf("\n✗ 护栏拦下了这条建议（%d 项）：\n", len(res.Failures))
-		for _, f := range res.Failures {
-			fmt.Printf("  ✗ %s：%s\n", f.Title, f.Detail)
-		}
-		fmt.Printf("\n这些内容不会被写入账本。请人工核对后手工录入。\n")
-		return nil
-	}
-	if len(res.Warnings) > 0 {
-		fmt.Printf("\n提醒：\n")
-		for _, w := range res.Warnings {
-			fmt.Printf("  ! %s：%s\n", w.Title, w.Detail)
-		}
-	}
-	if res.OK {
-		fmt.Printf("\n✓ 通过全部护栏。以上内容仍是草稿，需人工确认后才过账。\n")
-	}
-	return nil
-}
-
-func cmdAIConfig(ctx context.Context, args []string) error {
-	fs := newFlagSet("ai-config")
-	name := fs.String("name", "", "服务名，如「本地 Ollama」")
-	url := fs.String("url", "", "服务地址（不含 /chat/completions），如 http://127.0.0.1:11434/v1")
-	model := fs.String("model", "", "模型名，如 qwen2.5:7b")
-	key := fs.String("key", "", "API Key（本地模型留空）")
-	kind := fs.String("kind", "", "部署形态：local | cloud（留空按地址推断）")
-	def := fs.Bool("default", false, "设为默认服务")
-	stats := fs.Bool("stats", false, "只显示使用统计")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	svc, err := openBook(ctx, fs)
-	if err != nil {
-		return err
-	}
-	defer svc.Shutdown()
-
-	if *name != "" || *url != "" {
-		if *name == "" || *url == "" || *model == "" {
-			return errors.New("配置服务需要同时给出 --name、--url、--model")
-		}
-		k := *kind
-		if k == "" {
-			k = "local"
-			if !strings.Contains(*url, "127.0.0.1") && !strings.Contains(*url, "localhost") {
-				k = "cloud"
-			}
-		}
-		id, err := svc.SaveAIProvider(ctx, &sqlite.AIProviderConfig{
-			Name: *name, Kind: k, BaseURL: *url, Model: *model,
-			APIKey: *key, Enabled: true, IsDefault: *def,
-		})
-		if err != nil {
-			return err
-		}
-		fmt.Printf("✓ 已保存模型服务（id=%d）：%s / %s\n", id, *name, *model)
-		if k == "cloud" {
-			fmt.Printf("\n⚠ 这是云端服务：银行流水摘要、对方户名、金额会发送到 %s。\n", *url)
-			fmt.Printf("  账号与统一社会信用代码会自动打码；金额与户名默认保留，\n")
-			fmt.Printf("  因为它们是判断科目的核心依据。如需完全本地，请配置 Ollama。\n")
-		}
-	}
-
-	cfg, err := svc.AIConfigInfo(ctx)
-	if err != nil {
-		return err
-	}
-	if len(cfg.Providers) > 0 {
-		fmt.Printf("\n已配置的模型服务：\n")
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "  ID\t名称\t形态\t模型\t启用\t默认")
-		for _, p := range cfg.Providers {
-			fmt.Fprintf(w, "  %d\t%s\t%s\t%s\t%s\t%s\n",
-				p.ID, p.Name, p.Kind, p.Model, yesNo(p.Enabled), yesNo(p.IsDefault))
-		}
-		_ = w.Flush()
-	} else {
-		fmt.Printf("\n尚未配置模型服务。示例（本地 Ollama）：\n")
-		fmt.Printf("  miniaccount ai-config --name '本地 Ollama' \\\n")
-		fmt.Printf("      --url http://127.0.0.1:11434/v1 --model qwen2.5:7b --default\n")
-	}
-
-	if *stats || cfg.Stats.Total > 0 {
-		s := cfg.Stats
-		fmt.Printf("\nAI 使用统计：\n")
-		fmt.Printf("  调用总数：%d\n", s.Total)
-		if n := s.TransportFailures(); n > 0 {
-			fmt.Printf("  服务不可用/返回无法解析：%d（不计入护栏通过率）\n", n)
-		}
-		fmt.Printf("  护栏通过：%d / %d（%.0f%%）\n",
-			s.Valid, s.Proposed, s.GuardrailPassRate()*100)
-		fmt.Printf("  采纳 %d / 改后采纳 %d / 拒绝 %d（采纳率 %.0f%%）\n",
-			s.Accepted, s.Modified, s.Rejected, s.AcceptanceRate()*100)
-		if s.TokensIn+s.TokensOut > 0 {
-			fmt.Printf("  token：%d 输入 + %d 输出\n", s.TokensIn, s.TokensOut)
-		}
-	}
-	return nil
 }
 
 // parseYuan 把「元」的字符串解析成「分」。

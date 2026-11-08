@@ -255,9 +255,9 @@ func (s *Service) Voucher(ctx context.Context, id int64) (*VoucherDetail, error)
 		d.Lines = append(d.Lines, VoucherLine{
 			LineNo: i + 1, AccountCode: e.AccountCode, AccountName: name,
 			Summary: e.Summary, Debit: e.Debit, Credit: e.Credit,
-			AuxDesc:    describeAux(e.Aux, names, deptNames),
-			ContactID:  e.Aux.ContactID, EmployeeID: e.Aux.EmployeeID,
-			DeptID:     e.Aux.DeptID, ProjectID: e.Aux.ProjectID,
+			AuxDesc:   describeAux(e.Aux, names, deptNames),
+			ContactID: e.Aux.ContactID, EmployeeID: e.Aux.EmployeeID,
+			DeptID: e.Aux.DeptID, ProjectID: e.Aux.ProjectID,
 		})
 	}
 
@@ -332,8 +332,8 @@ type VoucherInput struct {
 	// ★ AI 采纳路径必须传 SourceAI + CreatedByAI：
 	// 落库记成 manual 会让「哪些是 AI 起草的」查不出来，
 	// 而审计恰恰要从 created_by_ai 这条线追溯。
-	Source    voucher.Source
-	SourceID  *int64
+	Source      voucher.Source
+	SourceID    *int64
 	CreatedByAI bool
 }
 
@@ -430,7 +430,7 @@ func (s *Service) CheckVoucher(ctx context.Context, in VoucherInput) (CheckResul
 			v.TotalDebit().Sub(v.TotalCredit()))}, nil
 	}
 
-	lctx, err := s.db.AI().LedgerContext(ctx)
+	lctx, err := s.db.Vouchers().LedgerContext(ctx)
 	if err != nil {
 		return CheckResult{}, err
 	}
@@ -698,16 +698,16 @@ func (s *Service) ReverseVoucher(ctx context.Context, id int64, by, date string)
 	// 凭证上虽然留着 voided_by 的追溯关系，但「谁在什么时候
 	// 冲销了哪张凭证」是审计要单独回答的问题。
 	s.recordAudit(ctx, AuditEvent{
-		Action: audit.ActionVoucherReverse,
+		Action:  audit.ActionVoucherReverse,
 		Summary: fmt.Sprintf("冲销凭证 %s", orig.No),
-		Entity: "voucher", EntityID: fmt.Sprintf("%d", id),
+		Entity:  "voucher", EntityID: fmt.Sprintf("%d", id),
 		Operator: strings.TrimSpace(by),
 		Detail: map[string]any{
-			"原凭证号":  orig.No,
-			"原凭证ID": id,
-			"冲销凭证号": det.No,
+			"原凭证号":   orig.No,
+			"原凭证ID":  id,
+			"冲销凭证号":  det.No,
 			"冲销凭证ID": res.VoucherID,
-			"冲销日期":  det.Date,
+			"冲销日期":   det.Date,
 		},
 	})
 	return det, nil
@@ -945,10 +945,10 @@ func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 	// ★ 挂附件是凭证内容的变更，必须留痕：
 	// 审计查「这张凭证的发票是什么时候补上的」就靠这一条。
 	s.recordAudit(ctx, AuditEvent{
-		Action:   audit.ActionAttachmentUpload,
-		Summary:  fmt.Sprintf("给凭证 #%d 挂附件 %s", voucherID, blob.FileName),
-		Entity:   "voucher", EntityID: strconv.FormatInt(voucherID, 10),
-		Source:   audit.SourceGUI,
+		Action:  audit.ActionAttachmentUpload,
+		Summary: fmt.Sprintf("给凭证 #%d 挂附件 %s", voucherID, blob.FileName),
+		Entity:  "voucher", EntityID: strconv.FormatInt(voucherID, 10),
+		Source: audit.SourceGUI,
 		Detail: map[string]any{
 			"文件名": blob.FileName, "SHA256": blob.SHA256,
 			"大小": blob.Size, "凭证ID": voucherID,
