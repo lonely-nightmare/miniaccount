@@ -20,14 +20,15 @@ import (
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
+	"miniaccount/internal/domain/voucher"
 	"miniaccount/internal/service"
 	"miniaccount/internal/store/sqlite"
 )
 
 // Options 是一次 MCP 服务实例的选项。
 type Options struct {
-	// ReadOnly 为真时写工具仍注册但一律返回 readonly 错误
-	// （客户端看得见工具形状，只是不能用）。
+	// ReadOnly 为真时只注册读工具（写工具不在工具表里，
+	// 调用即协议层 tool-not-found）。
 	ReadOnly bool
 	// Operator 是审计里的操作人署名；空走服务层兜底。
 	Operator string
@@ -82,11 +83,41 @@ func NewWithSource(src bookSource, opts Options) *Server {
 	return s
 }
 
-// run 执行一次业务调用：经 bookSource 持锁 → 业务错误统一
-// 走 toolError 映射，成功输出直通 StructuredContent。
-func (s *Server) run(ctx context.Context,
+// run 执行一次业务调用：补调用方身份 → 经 bookSource 持锁 →
+// 业务错误统一走 toolError 映射，成功输出直通 StructuredContent。
+// sessionedReq 抽象两类带 MCP 会话的请求（工具调用/资源读取），
+// run 只关心它们的 GetSession()。
+type sessionedReq interface{ GetSession() mcp.Session }
+
+// sessionIDKey 是会话 ID 的调用上下文键。SDK 在会话 goroutine
+// 派发 handler，HTTP 请求 ctx 的键值根本到不了这里；但 handler
+// 的 req.Session.ID() 可用 —— 把它带进调用链，让 providerSource
+// 在账套读锁内回查中间件钉住的世代。
+type sessionIDKey struct{}
+
+func withSessionID(ctx context.Context, req sessionedReq) context.Context {
+	if req == nil {
+		return ctx
+	}
+	if sess := req.GetSession(); sess != nil {
+		if sid := sess.ID(); sid != "" {
+			return context.WithValue(ctx, sessionIDKey{}, sid)
+		}
+	}
+	return ctx
+}
+
+func (s *Server) run(ctx context.Context, req sessionedReq,
 	fn func(ctx context.Context, svc *service.Service) (any, error)) (*mcp.CallToolResult, any, error) {
-	out, err := s.src.call(ctx, fn)
+	// 读工具没走 callCtx（不需要警告 sink），但路径上的
+	// recordView/recordAudit 一样要写日志 —— 没 caller 会被
+	// 记成「界面 + 操作系统用户名」，MCP 的查看/查询全被
+	// 错记成 GUI 操作。写工具已带 sink 的 caller 不能覆盖。
+	if !service.HasCaller(ctx) {
+		ctx = service.WithCaller(ctx, service.Caller{
+			Operator: s.operator, Source: audit.SourceMCP})
+	}
+	out, err := s.src.call(withSessionID(ctx, req), fn)
 	if err != nil {
 		return toolError(err)
 	}
@@ -146,7 +177,7 @@ func toolError(err error) (*mcp.CallToolResult, any, error) {
 	code := "internal"
 	var inv *service.InvalidInput
 	switch {
-	case errors.As(err, &inv):
+	case errors.As(err, &inv), errors.Is(err, voucher.ErrBadWord):
 		code = "invalid_params"
 	case errors.Is(err, service.ErrIdempotencyConflict):
 		code = "idempotency_conflict"

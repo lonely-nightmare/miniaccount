@@ -636,11 +636,19 @@ URL:  http://127.0.0.1:<端口>/mcp
   路径闸门」复合锁直到 Release —— 恢复替换文件换 inode
   期间，身份锁只锁旧 inode，闸门不放手让同路径 opener
   整段被拒；释放顺序 i→p。共享获取维持「过闸门即放」。
-- **会话世代锁内复核**：HTTP 中间件把钉住的
-  `generation` 放进请求 ctx；`providerSource.call` 在
+- **会话世代锁内复核**：`providerSource.call` 在
   BookProvider 读锁临界区内再比一次——中间件检查与取锁
   之间的换账窗口被堵死，旧会话写不进新账套（报
-  `session_stale`，下次请求 404）。
+  `session_stale`，下次请求 404）。**通路不是请求
+  ctx**：SDK 把 POST 推进会话 chan、在会话 goroutine 里
+  派发 handler，请求 ctx 的键值到不了那里；正确通路是
+  handler 的 `req.Session.ID()`（streamable conn 的
+  SessionID 即 `Mcp-Session-Id` 头值），`run` 把它放进
+  调用 ctx，`providerSource` 按它回查注册表拿钉住的世代。
+  另一被否掉的方案是把整个 `inner.ServeHTTP` 包进
+  `Provider.Call`：handler 会再进 `Call` 嵌套 RLock，
+  写者等待时 Go `RWMutex` 挡新读者 → 三方死锁。
+  端到端回归：`TestHTTPSessionIDReachesCall`。
 
 **停止与凭据（1 项）**
 
@@ -666,3 +674,75 @@ URL:  http://127.0.0.1:<端口>/mcp
 - `auditdb.Append` 的目录锁竞争改 2 秒退避重试（25ms 步进）
   —— 临界区只有几条 SQL，短暂占用就失败会把业务操作永久
   记成 `failed`，幂等重试还回放这个结果。
+
+### 二次复查修复记录（自查 + 复核发现）
+
+**世代复核通路纠错（承上）**：初版把钉住世代放**请求 ctx**
+——复核永不触发，形同空转；改为 `req.Session.ID()` 回查
+注册表，在 `Call` 读锁内比对（见上）。配套：注册表 `check`
+命中时刷新 `at`，否则活跃超过 `sessionIdle` 的会话会被
+`put` 清扫误删，之后锁内复核永远拿不到钉值。
+
+**审计与来源（3 项）**
+
+- `run()` 注入 `Caller{Operator, Source: SourceMCP}`——此前
+  读侧（查看/报表/资源）的审计全被记成「界面 + OS 用户名」，
+  与 §2.6 外部来源口径不符；写工具自带 sink 的 caller 不覆盖。
+- `resolveIdem` 命中 `failed` 态时**补记日志**：审计内容
+  可由已落库凭证确定性重建，重试修复后状态写回
+  `recorded`（此前永久回放旧 failed，锁释放也修不好）。
+  `pending` 不补——审计可能已成功落库，再写是无法分辨的
+  重复记录，如实上报比静默重复好。
+- `VouchersPage` 补 `ActionViewVouchers` 查看记录，
+  与 GUI `Vouchers` 同口径。
+
+**入参严格化（防静默错账）**
+
+- 枚举入参统一过 `enumIn`，非法值 `invalid_params` 而非
+  静默空表：`status`（凭证/发票/流水）、`kind`（往来单位）、
+  `direction`（发票，in|out 缩写到 input|output）。
+  `list_bank_flows` 公布值改为域值 `imported|matched|
+  posted|ignored`（unmatched/booked 作别名）。
+- map 输入三工具（upsert_contact/save_department/
+  update_employee）：白名单外键拒绝、`id` 必须正整数。
+  **浮点 id 截断修复**：`{"id":5.9}` 此前 `int64(f)` 截断
+  成 5，静默改到别的记录——现非整数/非数字/非正值一律
+  `invalid_params`；`patchInt`（parentId）同样拒绝小数。
+- `upsert_contact` 的 `kind` 过 `contactKinds` 枚举——
+  saveContactTx 只验名称非空，非法值会落成脏数据。
+- `create_draft_voucher` 补 `word` 入参（记|收|付|转，
+  缺省记）——不带时 MCP 建的凭证全是「记」，付款凭证
+  凭证字就写错了；`voucher.ErrBadWord` 映射为
+  `invalid_params`。服务层 `buildVoucher` 补拒负
+  `attachCount`。
+- struct 输入的未知键由 SDK 层兜底（jsonschema-go 对
+  struct 生成 `additionalProperties:false`），无需自验。
+
+**打开与锁（2 项）**
+
+- `pathOnly` 换真实身份写者锁失败必须报错，不能降级保留
+  `w-p` 占位——经别名路径并发建账时两边各持不同 `w-` 键，
+  「保留占位」等于放行双写（`occ` 路径锁降级保留安全，
+  双方都过同一把 `p-` 闸门）。
+- `sessionTable` 有界化：`put` 时清扫 `sessionIdle`（1h）
+  未活跃项，`check` 命中刷新 `at`；上限 256+清扫窗口。
+
+**HTTP 细节（1 项）**
+
+- `injectMeta` 注入 `_meta` 后 `Content-Length` 过期——
+  `bufferWriter` flush 前 `Header().Del("Content-Length")`，
+  SSE 与裸 JSON 两种形态都覆盖。
+
+**来源保留死代码（1 项，自查复现）**
+
+- `SaveVoucher` 更新路径：repo 的「`v.Source==""` 才保留
+  旧来源」判断是**死代码**——`voucher.New` 恒置
+  `SourceManual`，`v.Source` 永不为空，任何不带 Source 的
+  更新都把 `bank/invoice/salary/mcp` 来源静默刷成
+  `manual`（GUI 与 MCP 同病，实测复现）。修复：
+  `buildVoucher` 对 `in.ID!=0 && in.Source==""` 显式置空
+  （约定「空=沿用旧值」），repo 保留条件去掉
+  `oldSource!=""` 限制——旧值是什么就保留什么，
+  不凭空编造 manual。回归：
+  `TestUpdatePreservesSource`（bank 来源凭证改摘要后
+  仍是 bank）。

@@ -139,10 +139,46 @@ func (s *Service) resolveIdem(ctx context.Context, row *sqlite.IdemRow,
 	case "recorded":
 		out.AuditState = "recorded"
 	case "failed":
-		out.AuditState, out.AuditError = "failed", row.AuditError
+		// failed 表示当时确实没落日志 —— 补写是安全的（审计
+		// 内容由已落库凭证确定性重建）。短暂锁竞争不该留
+		// 永久缺口：同键重试到这里时顺手补记一条。
+		if repairErr := s.repairCreateAudit(ctx, d, row.RequestID); repairErr != nil {
+			s.db.MCPIdem().SetAuditState(ctx, row.RequestID, "failed", repairErr.Error())
+			out.AuditState, out.AuditError = "failed", repairErr.Error()
+		} else {
+			s.db.MCPIdem().SetAuditState(ctx, row.RequestID, "recorded", "")
+			out.AuditState = "recorded"
+		}
 	default:
 		// pending：提交后崩溃，未确认已留痕 —— 如实告诉调用方。
+		// 不自动补写：审计可能已经成功落库，再写一条就是
+		// 无法分辨的重复记录，比缺口更难解释。
 		out.AuditState, out.AuditError = "pending", "上次写入后未确认审计留痕"
 	}
 	return d, out, nil
+}
+
+// repairCreateAudit 为「审计写失败」的幂等命中补记创建日志。
+// 事件内容与首次创建审计一致，数据全部取自已落库凭证；
+// 「补记」标记让日志能看出这条不是当时写的。
+func (s *Service) repairCreateAudit(ctx context.Context, d *VoucherDetail, requestID string) error {
+	lines := make([]map[string]any, 0, len(d.Lines))
+	for _, e := range d.Lines {
+		lines = append(lines, map[string]any{
+			"科目": e.AccountCode, "摘要": e.Summary,
+			"借方": e.Debit.String(), "贷方": e.Credit.String(),
+		})
+	}
+	return s.recordAudit(ctx, AuditEvent{
+		Action:  audit.ActionVoucherCreate,
+		Summary: "录入凭证草稿（MCP，幂等重试补记）",
+		Entity:  "voucher", EntityID: fmt.Sprintf("%d", d.ID),
+		Detail: map[string]any{
+			"记账日期": d.Date, "摘要": d.Remark,
+			"借方合计": d.TotalDebit.String(),
+			"贷方合计": d.TotalCredit.String(),
+			"分录":   lines, "制单人": d.CreatedBy,
+			"clientRequestId": requestID,
+		},
+	})
 }

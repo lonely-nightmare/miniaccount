@@ -11,6 +11,7 @@ import (
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
+	"miniaccount/internal/domain/voucher"
 	"miniaccount/internal/service"
 )
 
@@ -270,5 +271,41 @@ func TestReverseVoucherWritesAudit(t *testing.T) {
 	entries := findAudit(t, svc, audit.ActionVoucherReverse)
 	if len(entries) != 1 {
 		t.Fatalf("冲销的 voucher.reverse 日志 = %d 条，期望 1", len(entries))
+	}
+}
+
+// ★ 来源保留死代码（二轮自查复现）：voucher.New 恒置
+// SourceManual，repo「v.Source=="" 才保留旧来源」恒不触发 ——
+// 不带 Source 的更新把 bank/mcp 来源静默刷成 manual。
+// 约定改为「更新路径空 Source = 沿用旧值」。
+func TestUpdatePreservesSource(t *testing.T) {
+	ctx := context.Background()
+	svc := newSvc(t, 3)
+	sh := mustContact(t, svc, "shareholder", "张三")
+
+	in := basicInput()
+	in.Lines[1].ContactID = &sh
+	sid := int64(42)
+	in.Source = voucher.SourceBank
+	in.SourceID = &sid
+	d, err := svc.SaveVoucher(ctx, in)
+	if err != nil {
+		t.Fatalf("建来源凭证失败: %v", err)
+	}
+	if d.Source != "bank" {
+		t.Fatalf("创建后来源 = %q", d.Source)
+	}
+
+	upd := basicInput()
+	upd.ID = d.ID
+	upd.Remark = "改摘要"
+	upd.Lines[1].ContactID = &sh
+	upd.ExpectedUpdatedAt = d.UpdatedAt
+	d2, err := svc.SaveVoucher(ctx, upd)
+	if err != nil {
+		t.Fatalf("更新失败: %v", err)
+	}
+	if d2.Source != "bank" {
+		t.Fatalf("更新后来源 = %q，应为 bank（被刷成 manual 了）", d2.Source)
 	}
 }

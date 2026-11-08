@@ -6,6 +6,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/service"
 )
 
@@ -17,7 +18,12 @@ func (s *Server) registerResources() {
 		s.core.AddResource(&mcp.Resource{
 			URI: uri, Name: name, Description: desc,
 			MIMEType: "application/json",
-		}, func(ctx context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		}, func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			ctx = withSessionID(ctx, req)
+			if !service.HasCaller(ctx) {
+				ctx = service.WithCaller(ctx, service.Caller{
+					Operator: s.operator, Source: audit.SourceMCP})
+			}
 			v, err := f(ctx)
 			if err != nil {
 				return nil, err

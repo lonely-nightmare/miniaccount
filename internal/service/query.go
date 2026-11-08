@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/calendar"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
@@ -28,7 +29,14 @@ type VoucherPage struct {
 
 // VouchersPage 分页查凭证；供 MCP query_vouchers 用。
 // GUI 继续走 Vouchers（行为不变），这条是带 total 的对外契约。
+// 查看审计与 Vouchers 同口径（§2.6：query 走 RecordView）。
 func (s *Service) VouchersPage(ctx context.Context, q VoucherQuery) (*VoucherPage, error) {
+	s.recordView(ctx, AuditEvent{
+		Action: audit.ActionViewVouchers, Entity: "voucher",
+		EntityID: fmt.Sprintf("%04d-%02d/%s", q.Year, q.Month, q.Status),
+		Summary:  fmt.Sprintf("查看凭证列表 %04d-%02d", q.Year, q.Month),
+		Detail:   map[string]any{"期间": fmt.Sprintf("%04d-%02d", q.Year, q.Month), "状态": q.Status, "关键字": q.Keyword},
+	})
 	limit := q.Limit
 	if limit <= 0 {
 		limit = 100

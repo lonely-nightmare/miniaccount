@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -30,6 +31,10 @@ type voucherLineIn struct {
 }
 
 type createDraftVoucherIn struct {
+	// Word 是凭证字：记|收|付|转，缺省记。
+	// 不带这个字段时 MCP 建的凭证全是「记」——付款凭证
+	// 的凭证字就写错了。
+	Word            string          `json:"word,omitempty" jsonschema:"凭证字 记|收|付|转，缺省 记"`
 	Date            string          `json:"date" jsonschema:"记账日期 YYYY-MM-DD"`
 	Remark          string          `json:"remark,omitempty" jsonschema:"凭证摘要"`
 	AttachCount     int             `json:"attachCount,omitempty" jsonschema:"附单据数"`
@@ -40,6 +45,7 @@ type createDraftVoucherIn struct {
 type updateDraftVoucherIn struct {
 	ID                int64           `json:"id" jsonschema:"凭证 id"`
 	ExpectedUpdatedAt string          `json:"expectedUpdatedAt" jsonschema:"读取时看到的 updatedAt（乐观锁）"`
+	Word              *string         `json:"word,omitempty" jsonschema:"凭证字 记|收|付|转"`
 	Date              *string         `json:"date,omitempty"`
 	Remark            *string         `json:"remark,omitempty"`
 	AttachCount       *int            `json:"attachCount,omitempty"`
@@ -65,16 +71,17 @@ func (s *Server) registerWriteTools() {
 		Name: "create_draft_voucher",
 		Description: "创建凭证**草稿**（不会过账）。走与界面相同的全部校验；" +
 			"带 clientRequestId 时同键重试返回原凭证。过账请让人在界面确认后操作。",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in createDraftVoucherIn) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in createDraftVoucherIn) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
 		vin, err := buildVoucherInput(in.Lines, in.Date, in.Remark, in.AttachCount)
 		if err != nil {
 			return toolError(err)
 		}
+		vin.Word = in.Word
 		vin.CreatedBy = s.operator
 		hash := hashCreateRequest(vin)
 		var voucherID int64
-		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
 			d, outcome, err := svc.CreateDraftVoucherIdempotent(ctx, *vin, in.ClientRequestID, hash)
 			if err != nil {
 				return nil, err
@@ -94,13 +101,13 @@ func (s *Server) registerWriteTools() {
 		Name: "update_draft_voucher",
 		Description: "修改**草稿**凭证；必须带读取时的 updatedAt。" +
 			"已过账凭证不能改（要改请走红字冲销，MCP 不提供）。",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in updateDraftVoucherIn) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in updateDraftVoucherIn) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
 		if strings.TrimSpace(in.ExpectedUpdatedAt) == "" {
 			return toolError(&service.InvalidInput{
 				Msg: "expectedUpdatedAt 不能为空：先 get_voucher 取 updatedAt 再回传"})
 		}
-		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
 			d, err := svc.Voucher(ctx, in.ID)
 			if err != nil {
 				return nil, err
@@ -114,6 +121,9 @@ func (s *Server) registerWriteTools() {
 				ID: in.ID, Word: d.Word, Date: d.Date, Remark: d.Remark,
 				AttachCount: d.AttachCount, ExpectedUpdatedAt: in.ExpectedUpdatedAt,
 				CreatedBy: d.CreatedBy,
+			}
+			if in.Word != nil {
+				vin.Word = *in.Word
 			}
 			if in.Date != nil {
 				vin.Date = *in.Date
@@ -160,13 +170,13 @@ func (s *Server) registerWriteTools() {
 		Name: "delete_draft_voucher",
 		Description: "删除**草稿**凭证；必须带读取时的 updatedAt。" +
 			"已过账凭证不能删。工资单生成的凭证请从工资模块处理。",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in deleteDraftVoucherIn) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in deleteDraftVoucherIn) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
 		if strings.TrimSpace(in.ExpectedUpdatedAt) == "" {
 			return toolError(&service.InvalidInput{
 				Msg: "expectedUpdatedAt 不能为空：先 get_voucher 取 updatedAt 再回传"})
 		}
-		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
 			d, err := svc.Voucher(ctx, in.ID)
 			if err != nil {
 				return nil, err
@@ -194,12 +204,18 @@ func (s *Server) registerWriteTools() {
 		Name: "upsert_contact",
 		Description: "新建或部分更新往来单位。id 缺席=新建；字段缺席=保持原值，" +
 			"字段为 null=清空，字段有值=设置。",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
+		if err := checkPatchKeys(in, contactPatchKeys, "upsert_contact"); err != nil {
+			return toolError(err)
+		}
 		var id int64
 		if v, ok := in["id"]; ok && v != nil {
-			f, _ := v.(float64)
-			id = int64(f)
+			var ierr error
+			id, ierr = idFromJSON(v)
+			if ierr != nil {
+				return toolError(ierr)
+			}
 			delete(in, "id")
 		}
 		var pe patchErrs
@@ -219,7 +235,14 @@ func (s *Server) registerWriteTools() {
 		if err := pe.err(); err != nil {
 			return toolError(err)
 		}
-		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+		// kind 原样落库（saveContactTx 只验名称非空）——
+		// 枚举外的值会存成脏数据，在这层拦下。
+		if k := p.Kind; k.Set && !k.Null {
+			if err := enumIn(k.Value, contactKinds, "kind"); err != nil {
+				return toolError(err)
+			}
+		}
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
 			newID, err := svc.PatchContact(ctx, id, p)
 			if err != nil {
 				return nil, err
@@ -242,12 +265,18 @@ func (s *Server) registerWriteTools() {
 		Name: "save_department",
 		Description: "新建或部分更新部门。id 缺席=新建；parentId=null 表示顶层部门。" +
 			"三态规则同 upsert_contact。",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
+		if err := checkPatchKeys(in, departmentPatchKeys, "save_department"); err != nil {
+			return toolError(err)
+		}
 		var id int64
 		if v, ok := in["id"]; ok && v != nil {
-			f, _ := v.(float64)
-			id = int64(f)
+			var ierr error
+			id, ierr = idFromJSON(v)
+			if ierr != nil {
+				return toolError(ierr)
+			}
 			delete(in, "id")
 		}
 		var pe patchErrs
@@ -261,7 +290,7 @@ func (s *Server) registerWriteTools() {
 		if err := pe.err(); err != nil {
 			return toolError(err)
 		}
-		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
 			newID, err := svc.PatchDepartment(ctx, id, p)
 			if err != nil {
 				return nil, err
@@ -285,7 +314,7 @@ func (s *Server) registerWriteTools() {
 		Description: "部分更新员工档案（仅修改，不建人）。可调字段：name/phone/idCard/" +
 			"bankName/bankAccount/expenseAccountCode/companyAccountCode/remark。" +
 			"薪酬基数、部门、离职、启用各有业务动作，不在此工具内。",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
 		v, ok := in["id"]
 		if !ok || v == nil {
@@ -294,17 +323,13 @@ func (s *Server) registerWriteTools() {
 		// 白名单外的键一律拒绝 —— 传 baseSalary 被静默忽略
 		// 比报错危险：用户以为改了薪酬，实际一个字没动。
 		// 验收口径：「传 baseSalary/enabled 被拒」。
-		for k := range in {
-			if k == "id" {
-				continue
-			}
-			if _, whitelisted := employeePatchKeys[k]; !whitelisted {
-				return toolError(&service.InvalidInput{
-					Msg: fmt.Sprintf("字段 %q 不在 update_employee 白名单内"+
-						"（薪酬/部门/离职/启用各有专属业务动作）", k)})
-			}
+		if err := checkPatchKeys(in, employeePatchKeys, "update_employee"); err != nil {
+			return toolError(err)
 		}
-		f, _ := v.(float64)
+		eid, ierr := idFromJSON(v)
+		if ierr != nil {
+			return toolError(ierr)
+		}
 		var pe patchErrs
 		p := service.EmployeePatch{
 			Name:               pe.patchStr(in, "name"),
@@ -319,16 +344,16 @@ func (s *Server) registerWriteTools() {
 		if err := pe.err(); err != nil {
 			return toolError(err)
 		}
-		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
-			if err := svc.PatchEmployee(ctx, int64(f), p); err != nil {
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
+			if err := svc.PatchEmployee(ctx, eid, p); err != nil {
 				return nil, err
 			}
-			return map[string]any{"id": int64(f), "auditWarnings": warn.All()}, nil
+			return map[string]any{"id": eid, "auditWarnings": warn.All()}, nil
 		})
 		if res != nil || err != nil {
 			return res, out, err
 		}
-		s.changed("employee", int64(f))
+		s.changed("employee", eid)
 		return nil, out, nil
 	})
 }
@@ -439,12 +464,39 @@ func voucherResult(d *service.VoucherDetail, outcome *service.IdemOutcome,
 	return res
 }
 
+// 三个 map 输入写工具的完整可写键集合 —— 集合外的键一律
+// 拒绝：打错字段名被静默忽略，比报错危险（用户以为改了，
+// 实际一个字没动）。
+var contactPatchKeys = map[string]struct{}{
+	"kind": {}, "name": {}, "shortName": {}, "taxNo": {},
+	"bankName": {}, "bankAccount": {}, "contactPerson": {},
+	"phone": {}, "address": {}, "enabled": {}, "remark": {},
+}
+
+var departmentPatchKeys = map[string]struct{}{
+	"code": {}, "name": {}, "parentId": {}, "enabled": {}, "remark": {},
+}
+
 // employeePatchKeys 是 update_employee 的完整可写键集合
 // （服务层 EmployeePatch 的字段名）。
 var employeePatchKeys = map[string]struct{}{
 	"name": {}, "phone": {}, "idCard": {}, "bankName": {},
 	"bankAccount": {}, "expenseAccountCode": {},
 	"companyAccountCode": {}, "remark": {},
+}
+
+// checkPatchKeys 校验 map 输入只含白名单键（id 始终允许）。
+func checkPatchKeys(in map[string]any, allowed map[string]struct{}, tool string) error {
+	for k := range in {
+		if k == "id" {
+			continue
+		}
+		if _, ok := allowed[k]; !ok {
+			return &service.InvalidInput{
+				Msg: fmt.Sprintf("字段 %q 不在 %s 白名单内", k, tool)}
+		}
+	}
+	return nil
 }
 
 // patchErrs 收集补丁字段的类型错误。
@@ -505,9 +557,20 @@ func (e *patchErrs) patchInt(in map[string]any, key string) service.Field[int64]
 		return service.Field[int64]{Set: true, Null: true}
 	}
 	f, ok := v.(float64)
-	if !ok {
-		e.fail(key, "数字", v)
+	if !ok || f != math.Trunc(f) || f > math.MaxInt64 || f < math.MinInt64 {
+		e.fail(key, "整数", v)
 		return service.Field[int64]{}
 	}
 	return service.Field[int64]{Set: true, Value: int64(f)}
+}
+
+// idFromJSON 把 map 输入的 id 解成 int64 —— 非数字、带小数
+// （int64 截断会把 {"id":5.9} 静默写成 id=5）、超界一律
+// invalid_params，不许悄悄落到别的记录上。
+func idFromJSON(v any) (int64, error) {
+	f, ok := v.(float64)
+	if !ok || f != math.Trunc(f) || f > math.MaxInt64 || f < math.MinInt64 || f <= 0 {
+		return 0, &service.InvalidInput{Msg: fmt.Sprintf("id 必须是正整数，收到 %v", v)}
+	}
+	return int64(f), nil
 }

@@ -407,3 +407,171 @@ func TestInvoiceDirectionMapping(t *testing.T) {
 		t.Fatal("非法 direction 应报错而非返回空表")
 	}
 }
+
+// 复查发现：list_bank_flows 公布的状态枚举与域值不符
+// （unmatched/booked 都不存在）；其余非法值应报错。
+func TestBankFlowStatusMapping(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "list_bank_flows",
+		Arguments: map[string]any{"status": "unmatched"},
+	})
+	if res == nil || res.IsError {
+		b, _ := json.Marshal(res)
+		t.Fatalf("别名 unmatched 应可用: %s", b)
+	}
+	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "list_bank_flows",
+		Arguments: map[string]any{"status": "bogus"},
+	})
+	if res == nil || !res.IsError {
+		t.Fatal("非法 status 应报错")
+	}
+}
+
+// 复查同类：upsert_contact 传未知字段不得静默忽略。
+func TestContactPatchWhitelist(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "upsert_contact",
+		Arguments: map[string]any{
+			"kind": "customer", "name": "白名单测试",
+			"typo": "x",
+		},
+	})
+	if res == nil || !res.IsError {
+		t.Fatal("未知字段应被拒")
+	}
+	tc, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(tc), "白名单") {
+		t.Fatalf("应报白名单错误: %s", tc)
+	}
+}
+
+// 复查发现：kind 枚举外的值会原样落库（saveContactTx 只验名称）。
+func TestContactKindValidated(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "upsert_contact",
+		Arguments: map[string]any{
+			"kind": "bogus", "name": "脏数据测试",
+		},
+	})
+	if res == nil || !res.IsError {
+		t.Fatal("非法 kind 应被拒")
+	}
+	// 确认没有落库。
+	lst, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "list_contacts", Arguments: map[string]any{},
+	})
+	if sc := lst.StructuredContent.(map[string]any); sc["total"] != float64(0) {
+		t.Fatalf("非法 kind 不应落库: %v", sc)
+	}
+}
+
+// 复查发现：map 输入的 id 非数字时静默落成 0，
+// upsert 的「更新」会变成「新建」。
+func TestNonNumericIDRejected(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "upsert_contact",
+		Arguments: map[string]any{
+			"id": "5", "kind": "customer", "name": "字符串id",
+		},
+	})
+	if res == nil || !res.IsError {
+		t.Fatal("非数字 id 应被拒（否则静默新建）")
+	}
+}
+
+// 复查发现：create_draft_voucher 无 word 字段时凭证字
+// 永远落成「记」，付款凭证数据就错了。
+func TestCreateVoucherWord(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "create_draft_voucher",
+		Arguments: map[string]any{
+			"word": "付", "date": "2025-01-15", "remark": "付款",
+			"lines": []any{
+				map[string]any{"accountCode": "1002", "debit": "100.00"},
+				map[string]any{"accountCode": "5001", "credit": "100.00"},
+			},
+		},
+	})
+	if res == nil || res.IsError {
+		b, _ := json.Marshal(res)
+		t.Fatalf("创建失败: %s", b)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	v, _ := sc["voucher"].(map[string]any)
+	if v["word"] != "付" {
+		t.Fatalf("word = %v，期望「付」", v["word"])
+	}
+	// 非法凭证字应被拒（域校验 ErrBadWord 直通）。
+	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "create_draft_voucher",
+		Arguments: map[string]any{
+			"word": "bogus", "date": "2025-01-15",
+			"lines": []any{
+				map[string]any{"accountCode": "1002", "debit": "1.00"},
+				map[string]any{"accountCode": "5001", "credit": "1.00"},
+			},
+		},
+	})
+	if res == nil || !res.IsError {
+		t.Fatal("非法凭证字应被拒")
+	}
+}
+
+// 复查发现：来源字段在更新路径被静默刷成 manual
+// （repo 的 v.Source=="" 保留判断被 New 的默认 manual 绕过，
+// 是死代码）。MCP 建的凭证更新后来源应仍是 mcp。
+func TestUpdatePreservesVoucherSource(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "create_draft_voucher",
+		Arguments: map[string]any{
+			"date": "2025-01-15", "remark": "原摘要",
+			"lines": []any{
+				map[string]any{"accountCode": "1002", "debit": "100.00"},
+				map[string]any{"accountCode": "5001", "credit": "100.00"},
+			},
+		},
+	})
+	if res == nil || res.IsError {
+		b, _ := json.Marshal(res)
+		t.Fatalf("创建失败: %s", b)
+	}
+	created := res.StructuredContent.(map[string]any)["voucher"].(map[string]any)
+	if created["source"] != "mcp" {
+		t.Fatalf("MCP 创建来源 = %v", created["source"])
+	}
+
+	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "update_draft_voucher",
+		Arguments: map[string]any{
+			"id": created["id"], "expectedUpdatedAt": created["updatedAt"],
+			"remark": "改摘要",
+		},
+	})
+	if res == nil || res.IsError {
+		b, _ := json.Marshal(res)
+		t.Fatalf("更新失败: %s", b)
+	}
+	v := res.StructuredContent.(map[string]any)["voucher"].(map[string]any)
+	if v["source"] != "mcp" {
+		t.Fatalf("更新后来源 = %v，应为 mcp（被刷成 manual 了）", v["source"])
+	}
+}

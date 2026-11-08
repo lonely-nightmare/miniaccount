@@ -67,3 +67,10 @@ func callerOf(ctx context.Context) Caller {
 	}
 	return Caller{}
 }
+
+// HasCaller 报告 ctx 是否已带调用方身份 —— 适配层据此
+// 决定要不要兜底注入（写工具先挂了警告 sink 的不能覆盖）。
+func HasCaller(ctx context.Context) bool {
+	_, ok := ctx.Value(callerKey{}).(Caller)
+	return ok
+}

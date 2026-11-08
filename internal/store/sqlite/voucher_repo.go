@@ -1248,10 +1248,11 @@ func (r *VoucherRepo) SaveDraftInTx(ctx context.Context, tx *Tx, in DraftInput) 
 		if voucher.Status(status) != voucher.StatusDraft {
 			return nil, fmt.Errorf("%w（当前状态 %s）", ErrNotDraft, status)
 		}
-		// ★ 来源字段保留（§2.6 P1）：调用方没带 source 时不能覆写 ——
-		// GUI 原样保存一张 MCP/银行生成的草稿，会把来源刷回空。
-		// 本次调用的来源只进审计日志；created_by_ai 一旦标记不撤销。
-		if v.Source == "" && oldSource != "" {
+		// ★ 来源字段保留（§2.6 P1）：更新路径调用方置空
+		// source 表示「沿用旧值」—— 不管旧值是 bank 还是
+		// manual 都原样保留（oldSource=="" 的遗留行也保持原状，
+		// 不凭空编造 manual）。created_by_ai 一旦标记不撤销。
+		if v.Source == "" {
 			v.Source = voucher.Source(oldSource)
 			if oldSourceID.Valid {
 				v.SourceID = &oldSourceID.Int64

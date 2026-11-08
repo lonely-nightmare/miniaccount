@@ -291,9 +291,9 @@ func (s *Service) VerifyInvoice(ctx context.Context, id int64, operator string) 
 		return nil, err
 	}
 	s.recordAudit(ctx, AuditEvent{
-		Action: audit.ActionInvoiceVerify,
+		Action:  audit.ActionInvoiceVerify,
 		Summary: fmt.Sprintf("认证发票 %s", inv.Identity()),
-		Entity: "invoice", EntityID: fmt.Sprintf("%d", id),
+		Entity:  "invoice", EntityID: fmt.Sprintf("%d", id),
 		Operator: strings.TrimSpace(operator),
 		Detail: map[string]any{
 			"发票": inv.Identity(), "状态": "未认证 → 已认证",

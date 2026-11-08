@@ -372,12 +372,21 @@ func (s *Service) buildVoucher(ctx context.Context, in VoucherInput) (*voucher.V
 	}
 	v.ID = in.ID
 	v.Remark = strings.TrimSpace(in.Remark)
+	if in.AttachCount < 0 {
+		return nil, &InvalidInput{Msg: "附单据数不能为负"}
+	}
 	v.AttachCount = in.AttachCount
 	v.CreatedByAI = in.CreatedByAI
 	if in.Source != "" {
 		if err := v.SetSource(in.Source, in.SourceID); err != nil {
 			return nil, err
 		}
+	} else if in.ID != 0 {
+		// 更新路径：来源是历史事实不是入参 —— 置空让落库层
+		// 沿用旧值。New 默认的 manual 不拦的话，银行流水/发票/
+		// 报销生成的草稿被改一笔摘要，来源就静默刷成 manual。
+		v.Source = ""
+		v.SourceID = nil
 	}
 
 	for i, l := range in.Lines {

@@ -56,26 +56,30 @@ type BookProvider interface {
 	Generation() int64
 }
 
-// pinnedGenKey 是会话钉住世代的请求上下文键：
-// HTTP 中间件写入，providerSource 在账套读锁内复核。
-type pinnedGenKey struct{}
-
 // errStaleSession 表示请求到达时账套已切换（中间件检查
 // 之后、持锁执行之前的窗口里 generation 已递增）。
 var errStaleSession = errors.New("账套已切换，会话失效，请重新 initialize")
 
 // providerSource 把 BookProvider 适配成 bookSource。
-type providerSource struct{ p BookProvider }
+// table 是 HTTP 会话世代注册表；stdio 会话 ID 为空 → 跳过复核。
+type providerSource struct {
+	p     BookProvider
+	table *sessionTable
+}
 
 func (p providerSource) call(ctx context.Context,
 	fn func(ctx context.Context, svc *service.Service) (any, error)) (any, error) {
 	return p.p.Call(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
-		// 世代在持读锁的临界区内复核 —— BookProvider.Call 的
-		// 读锁与换账的写锁互斥，比过之后这次调用钉死在这本
-		// 账上，旧会话不可能把凭证写进新账套。
-		if g, ok := ctx.Value(pinnedGenKey{}).(int64); ok &&
-			g != p.p.Generation() {
-			return nil, errStaleSession
+		// 钉住世代在读锁临界区内复核：SDK 把 POST 派发到会话
+		// goroutine 执行，「中间件过注册表」和「这里真正取锁」
+		// 之间隔着换账窗口；读锁与换账写锁互斥，比过之后这次
+		// 调用钉死在这本账上，旧会话写不进新账套。
+		if sid, ok := ctx.Value(sessionIDKey{}).(string); ok && p.table != nil {
+			meta, found := p.table.get(sid)
+			if !found || meta.generation != p.p.Generation() ||
+				meta.bookID != p.p.BookID() {
+				return nil, errStaleSession
+			}
 		}
 		return fn(ctx, svc)
 	})
@@ -180,11 +184,14 @@ func (h *tokenHolder) set(s string) {
 type sessMeta struct {
 	bookID     string
 	generation int64
+	at         time.Time
 }
 
 // sessionTable 记录 MCP-Session-Id → 钉住的账套世代。
 // 账套切换（generation++）后旧表项天然失效；
 // 表项在「下一次带该 ID 的请求」到达时惰性清除。
+// 客户端 initialize 后不再回来的孤儿表项靠 seen 时间戳
+// 在 put 时顺扫过期 —— 不引入后台 goroutine。
 type sessionTable struct {
 	mu sync.Mutex
 	m  map[string]sessMeta
@@ -192,14 +199,38 @@ type sessionTable struct {
 
 func newSessionTable() *sessionTable { return &sessionTable{m: make(map[string]sessMeta)} }
 
+// sessionIdle 是孤儿表项的过期窗口（宽于 SDK 的
+// SessionTimeout 30min，宁可留不能误删）。
+const sessionIdle = time.Hour
+
 func (t *sessionTable) put(id string, meta sessMeta) {
 	t.mu.Lock()
+	meta.at = time.Now()
 	t.m[id] = meta
+	if len(t.m) > 256 {
+		cut := time.Now().Add(-sessionIdle)
+		for k, v := range t.m {
+			if v.at.Before(cut) {
+				delete(t.m, k)
+			}
+		}
+	}
 	t.mu.Unlock()
 }
 
+// get 只读取出会话钉住的账套快照（不移除）——providerSource
+// 在账套读锁内复核用；清理职责在中间件的 check。
+func (t *sessionTable) get(id string) (sessMeta, bool) {
+	t.mu.Lock()
+	meta, ok := t.m[id]
+	t.mu.Unlock()
+	return meta, ok
+}
+
 // check 返回会话钉住的账套快照与一致性结论；不一致（或已
-// 注销）的会话被移除并返回 false。
+// 注销）的会话被移除并返回 false。命中时刷新活跃时间——
+// 否则清扫只认 initialize 时的 at，长活会话会被误删，
+// 之后锁内复核永远拿不到钉住世代，业务调用被误拒。
 func (t *sessionTable) check(id string, p BookProvider) (sessMeta, bool) {
 	t.mu.Lock()
 	meta, ok := t.m[id]
@@ -208,6 +239,8 @@ func (t *sessionTable) check(id string, p BookProvider) (sessMeta, bool) {
 		t.mu.Unlock()
 		return sessMeta{}, false
 	}
+	meta.at = time.Now()
+	t.m[id] = meta
 	t.mu.Unlock()
 	return meta, true
 }
@@ -248,6 +281,9 @@ func (w *bufferWriter) flush(meta map[string]any) {
 	if status < 400 && len(body) > 0 {
 		if patched := injectMeta(body, meta); patched != nil {
 			body = patched
+			// 注入改了长度，上游若写过 Content-Length 已过期，
+			// 留着会让客户端按旧长度截断。
+			w.Header().Del("Content-Length")
 		}
 	}
 	w.ResponseWriter.WriteHeader(status)
@@ -351,7 +387,8 @@ func NewHTTPService(opts HTTPOpts) (*HTTPService, error) {
 		return nil, err
 	}
 
-	srv := NewWithSource(providerSource{p: opts.Provider}, Options{
+	table := newSessionTable()
+	srv := NewWithSource(providerSource{p: opts.Provider, table: table}, Options{
 		Operator: opts.Operator,
 		Version:  opts.Version,
 	})
@@ -367,7 +404,7 @@ func NewHTTPService(opts HTTPOpts) (*HTTPService, error) {
 
 	h := &HTTPService{
 		token: &tokenHolder{},
-		table: newSessionTable(),
+		table: table,
 	}
 	h.token.set(opts.Token)
 
@@ -394,17 +431,16 @@ func NewHTTPService(opts HTTPOpts) (*HTTPService, error) {
 		}
 		// 4. 会话世代 —— 带会话 ID 的请求先过注册表。
 		if sid := r.Header.Get(sessionHeader); sid != "" {
-			meta, ok := h.table.check(sid, opts.Provider)
-			if !ok {
+			if _, ok := h.table.check(sid, opts.Provider); !ok {
 				// 世代不符 → 按规范 404，客户端重新 initialize。
 				http.Error(w, "session expired", http.StatusNotFound)
 				return
 			}
-			// 钉住的世代随请求上下文走：中间件检查与真正取
-			// 账套读锁之间存在换账窗口，业务调用在锁内复核
-			// （providerSource.call），旧会话写不进新账套。
-			r = r.WithContext(context.WithValue(r.Context(),
-				pinnedGenKey{}, meta.generation))
+			// 检查到真正取账套读锁之间仍有换账窗口 —— 兜底在
+			// providerSource.call：handler 的 req.Session.ID()
+			// 把会话 ID 带下去，钉住的世代在锁内复核。注意不能
+			// 在这里包 Provider.Call：handler 会再进 Call 嵌套
+			// RLock，写者等待时 Go RWMutex 挡新读者 → 死锁。
 			inner.ServeHTTP(w, r)
 			return
 		}

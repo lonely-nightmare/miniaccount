@@ -137,10 +137,21 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 			occ = lk
 		}
 		if wlock != nil {
-			if wl, err := writerLock(opts.Path, true); err == nil {
-				wlock.Release()
-				wlock = wl
+			// 写者锁换不到真实身份必须失败，不能降级保留 w-p：
+			// 经别名路径并发建账时两边各持不同 w- 键，
+			// 「保留占位」等于放行双写。而 occ 的路径锁降级
+			// 保留是安全的——open/restore 都过同一把 p- 闸门。
+			wl, werr := writerLock(opts.Path, true)
+			if werr != nil {
+				_ = db.Close()
+				release()
+				if errors.Is(werr, filelock.ErrOccupied) {
+					return nil, errors.New("账套正被其它进程以读写方式打开")
+				}
+				return nil, werr
 			}
+			wlock.Release()
+			wlock = wl
 		}
 	}
 	if opts.ReadOnly {
