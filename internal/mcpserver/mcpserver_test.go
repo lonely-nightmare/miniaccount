@@ -264,3 +264,69 @@ func TestPatchTypeMismatchRejected(t *testing.T) {
 		t.Fatalf("类型错误的请求不应落库: %v", sc)
 	}
 }
+
+// 验收口径：update_employee 传白名单外字段（baseSalary/enabled）
+// 必须报错，不得静默忽略。
+func TestEmployeePatchWhitelist(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	for _, key := range []string{"baseSalary", "enabled", "departmentId"} {
+		res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name: "update_employee",
+			Arguments: map[string]any{
+				"id": float64(1), key: "x",
+			},
+		})
+		if !res.IsError {
+			t.Fatalf("%s 应被拒", key)
+		}
+		tc, _ := json.Marshal(res.Content)
+		if !strings.Contains(string(tc), "白名单") {
+			t.Fatalf("%s 应报白名单错误: %s", key, tc)
+		}
+	}
+	// 白名单内字段（即使员工不存在）不应被键校验拦下——
+	// 错误来自「员工不存在」而非 invalid_params。
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "update_employee",
+		Arguments: map[string]any{
+			"id": float64(1), "phone": "13800000000",
+		},
+	})
+	tc, _ := json.Marshal(res.Content)
+	if strings.Contains(string(tc), "白名单") {
+		t.Fatalf("白名单字段不应被拦: %s", tc)
+	}
+}
+
+// §2.10：报表输出带 balanced 标志（勾稽异常不是工具错误）。
+func TestReportsHaveBalancedFlag(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	for _, name := range []string{"balance_sheet", "income_statement"} {
+		args := map[string]any{"year": float64(2025), "month": float64(3)}
+		if name == "balance_sheet" {
+			args = map[string]any{"asOf": "2025-03-31"}
+		}
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name: name, Arguments: args,
+		})
+		if err != nil || res.IsError {
+			tc, _ := json.Marshal(res.Content)
+			t.Fatalf("%s 调用失败: %v %s", name, err, tc)
+		}
+		sc, ok := res.StructuredContent.(map[string]any)
+		if !ok {
+			t.Fatalf("%s 应返回结构化内容: %#v", name, res.StructuredContent)
+		}
+		bal, ok := sc["balanced"].(bool)
+		if !ok {
+			t.Fatalf("%s 缺 balanced 布尔标志: %v", name, sc)
+		}
+		if issues, has := sc["issues"].([]any); has && len(issues) > 0 && bal {
+			t.Fatalf("%s 有 issues 时 balanced 应为 false: %v", name, sc)
+		}
+	}
+}

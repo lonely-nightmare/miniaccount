@@ -576,3 +576,48 @@ true}`（mode=ro 不跑迁移）且**只注册读工具**（写工具不在工�
 **已知边界**：SDK 会话表是内部的，世代失效无法主动 kill 已建
 SSE 流（上面 SSE 说明即后果）；`yuanize` 键名白名单仍待显式
 DTO 化。
+
+## 附：客户端接入配置示例
+
+### stdio（Claude Desktop 等本地客户端）
+
+`command` 与 `--db` 都必须用**绝对路径**（客户端不继承
+shell 的 PATH/工作目录）：
+
+```json
+// ~/Library/Application Support/Claude/claude_desktop_config.json
+{
+  "mcpServers": {
+    "miniaccount": {
+      "command": "/usr/local/bin/miniaccount",
+      "args": [
+        "mcp",
+        "--db", "/Users/<你>/账本/公司.db",
+        "--operator", "Claude"
+      ]
+    }
+  }
+}
+```
+
+- 加 `"--readonly"` 进 `args` 即只读模式（`mode=ro` 打开、
+  不跑迁移、工具表只有 14 个读工具）。
+- `--db` 指向的必须是已初始化账套（`PeekBook` 校验；
+  不存在/非账套文件直接报错退出，不会顺手建库）。
+- stdout 只跑 JSON-RPC 协议帧；所有诊断走 stderr。
+
+### HTTP（桌面应用开启 MCP 服务后）
+
+在「设置 → MCP 服务」卡里启动后，对支持 HTTP/SSE 传输的
+客户端填：
+
+```
+URL:  http://127.0.0.1:<端口>/mcp
+头:   Authorization: Bearer <卡里显示的凭据>
+```
+
+凭据持久化在 `~/.mini-account/mcp.json`（0600）；服务停止
+即吊销，重开重新签发——卡片里的「重新生成」可随时轮换。
+
+**注意**：App 重启后 MCP 服务**不会自动重开**，需再到
+设置卡开启（已知边界，非缺陷）。

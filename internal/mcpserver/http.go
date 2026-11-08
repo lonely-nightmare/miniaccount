@@ -19,6 +19,7 @@ package mcpserver
 // ---------------------------------------------------------------------------
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -194,9 +195,105 @@ func (t *sessionTable) check(id string, p BookProvider) bool {
 	return true
 }
 
-// （SDK 把签发的 MCP-Session-Id 放在响应头里；SSE 流可能绕过
-// WriteHeader 直接 Write，所以注册点在 ServeHTTP 返回后统一
-// 读响应头，不用包装 writer。）
+// bufferWriter 完整缓冲 initialize 响应：
+//  1. 从响应头取签发的 MCP-Session-Id 钉入世代注册表；
+//  2. 往 JSON-RPC result 里注入 _meta{bookId, generation}（§2.3：
+//     「放响应 _meta 作附加元数据」——SDK 内部构造结果无注入点，
+//     只能在 HTTP 层补；解析失败原样透传，元数据是补充性的）。
+//
+// 缓冲是安全的：被包的只有「无会话 ID 的 POST」——长驻 SSE
+// 流走带会话 ID 的 GET 分支，不经过这里。
+type bufferWriter struct {
+	http.ResponseWriter
+	buf    bytes.Buffer
+	status int
+}
+
+func (w *bufferWriter) WriteHeader(code int) { w.status = code }
+
+func (w *bufferWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.buf.Write(b)
+}
+
+// Unwrap 透传底层 writer（ResponseController 查 Flush 等能力用）。
+func (w *bufferWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// flush 把缓冲内容（可能注入了 _meta）写给真实 writer。
+func (w *bufferWriter) flush(meta map[string]any) {
+	status := w.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	body := w.buf.Bytes()
+	if status < 400 && len(body) > 0 {
+		if patched := injectMeta(body, meta); patched != nil {
+			body = patched
+		}
+	}
+	w.ResponseWriter.WriteHeader(status)
+	_, _ = w.ResponseWriter.Write(body)
+}
+
+// injectMeta 往 initialize 结果的 result 里塞 _meta。
+// 覆盖两种响应形态：streamable SSE（`data: {...}` 行）与
+// JSONResponse 的裸 JSON。解析不动返回 nil（原样透传）。
+func injectMeta(body []byte, meta map[string]any) []byte {
+	// SSE：逐 data: 行处理；本服务 initialize 只会有一条。
+	if bytes.HasPrefix(body, []byte("event:")) {
+		var out bytes.Buffer
+		rest := body
+		patched := false
+		for len(rest) > 0 {
+			line := rest
+			if i := bytes.IndexByte(rest, '\n'); i >= 0 {
+				line, rest = rest[:i+1], rest[i+1:]
+			} else {
+				rest = nil
+			}
+			if !patched && bytes.HasPrefix(line, []byte("data: ")) {
+				end := bytes.IndexByte(line, '\n')
+				if end < 0 {
+					end = len(line)
+				}
+				if p := patchResultMeta(line[6:end], meta); p != nil {
+					out.WriteString("data: ")
+					out.Write(p)
+					out.WriteByte('\n')
+					patched = true
+					continue
+				}
+			}
+			out.Write(line)
+		}
+		if patched {
+			return out.Bytes()
+		}
+		return nil
+	}
+	return patchResultMeta(body, meta)
+}
+
+// patchResultMeta 在 JSON-RPC 响应的 result 上写 _meta；
+// 无 result 或解析失败返回 nil。
+func patchResultMeta(data []byte, meta map[string]any) []byte {
+	var msg map[string]any
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return nil
+	}
+	res, ok := msg["result"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	res["_meta"] = meta
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return nil
+	}
+	return b
+}
 
 // ---------------------------------------------------------------------------
 // HTTP 服务装配
@@ -289,14 +386,14 @@ func NewHTTPService(opts HTTPOpts) (*HTTPService, error) {
 			return
 		}
 		// 无会话 ID 的请求：initialize（或规范允许的会话建立
-		// POST）会签出新会话 —— 从响应头取 MCP-Session-Id，
-		// 把 (bookID, generation) 钉进注册表。
-		inner.ServeHTTP(w, r)
+		// POST）会签出新会话 —— 缓冲响应，注入 _meta 元数据，
+		// 同时把 (bookID, generation) 钉进注册表。
+		bw := &bufferWriter{ResponseWriter: w}
+		inner.ServeHTTP(bw, r)
+		bookID, gen := opts.Provider.BookID(), opts.Provider.Generation()
+		bw.flush(map[string]any{"bookId": bookID, "generation": gen})
 		if sid := w.Header().Get(sessionHeader); sid != "" {
-			h.table.put(sid, sessMeta{
-				bookID:     opts.Provider.BookID(),
-				generation: opts.Provider.Generation(),
-			})
+			h.table.put(sid, sessMeta{bookID: bookID, generation: gen})
 		}
 	})
 	h.Handler = mux

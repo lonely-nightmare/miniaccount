@@ -289,6 +289,19 @@ func (s *Server) registerWriteTools() {
 		if !ok || v == nil {
 			return toolError(&service.InvalidInput{Msg: "update_employee 必须提供员工 id"})
 		}
+		// 白名单外的键一律拒绝 —— 传 baseSalary 被静默忽略
+		// 比报错危险：用户以为改了薪酬，实际一个字没动。
+		// 验收口径：「传 baseSalary/enabled 被拒」。
+		for k := range in {
+			if k == "id" {
+				continue
+			}
+			if _, whitelisted := employeePatchKeys[k]; !whitelisted {
+				return toolError(&service.InvalidInput{
+					Msg: fmt.Sprintf("字段 %q 不在 update_employee 白名单内"+
+						"（薪酬/部门/离职/启用各有专属业务动作）", k)})
+			}
+		}
 		f, _ := v.(float64)
 		var pe patchErrs
 		p := service.EmployeePatch{
@@ -422,6 +435,14 @@ func voucherResult(d *service.VoucherDetail, outcome *service.IdemOutcome,
 		res["auditWarnings"] = w
 	}
 	return res
+}
+
+// employeePatchKeys 是 update_employee 的完整可写键集合
+// （服务层 EmployeePatch 的字段名）。
+var employeePatchKeys = map[string]struct{}{
+	"name": {}, "phone": {}, "idCard": {}, "bankName": {},
+	"bankAccount": {}, "expenseAccountCode": {},
+	"companyAccountCode": {}, "remark": {},
 }
 
 // patchErrs 收集补丁字段的类型错误。

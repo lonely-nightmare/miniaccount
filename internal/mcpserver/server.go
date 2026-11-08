@@ -101,6 +101,18 @@ func (s *Server) changed(entity string, id int64) {
 	}
 }
 
+// recordReportView 记一次「查看报表」（§2.6：query 走 RecordView，
+// 与 GUI 报表查看同一条审计口径；查看开关关着时它什么都不做）。
+func (s *Server) recordReportView(ctx context.Context, svc *service.Service,
+	kind, period string) {
+	svc.RecordView(ctx, service.AuditEvent{
+		Action: audit.ActionViewReport, Entity: "report",
+		EntityID: kind + "/" + period,
+		Summary:  "查看报表：" + kind,
+		Detail:   map[string]any{"报表": kind, "期间": period},
+	})
+}
+
 // Run 在给定 Transport 上服务，直到对端断开或 ctx 结束。
 func (s *Server) Run(ctx context.Context, t mcp.Transport) error {
 	return s.core.Run(ctx, t)

@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -172,6 +173,8 @@ func (s *Server) registerTools() {
 			if err != nil {
 				return nil, err
 			}
+			s.recordReportView(ctx, svc, "试算平衡表",
+				fmt.Sprintf("%04d-%02d", in.Year, in.Month))
 			return yuanize(r), nil
 		})
 	})
@@ -185,8 +188,11 @@ func (s *Server) registerTools() {
 			if err != nil {
 				return nil, err
 			}
+			s.recordReportView(ctx, svc, "资产负债表", in.AsOf)
+			// §2.10：勾稽异常不报错，balanced+issues[] 表达。
 			return yuanize(map[string]any{
-				"closing": closing, "opening": opening, "issues": issues,
+				"closing": closing, "opening": opening,
+				"balanced": len(issues) == 0, "issues": issues,
 			}), nil
 		})
 	})
@@ -200,8 +206,11 @@ func (s *Server) registerTools() {
 			if err != nil {
 				return nil, err
 			}
+			s.recordReportView(ctx, svc, "利润表",
+				fmt.Sprintf("%04d-%02d", in.Year, in.Month))
 			return yuanize(map[string]any{
-				"current": cur, "ytd": ytd, "issues": issues,
+				"current": cur, "ytd": ytd,
+				"balanced": len(issues) == 0, "issues": issues,
 			}), nil
 		})
 	})

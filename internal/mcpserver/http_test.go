@@ -173,6 +173,16 @@ func TestHTTPSessionGeneration(t *testing.T) {
 		t.Fatalf("initialize 应签发会话 ID（响应 %d: %s）", rec.Code, rec.Body.String())
 	}
 
+	// §2.3：initialize 响应 _meta 应带 {bookId, generation}。
+	body := rec.Body.String()
+	if !strings.Contains(body, `"_meta"`) {
+		t.Fatalf("initialize 响应缺 _meta: %s", body)
+	}
+	if !strings.Contains(body, `"bookId":"/tmp/book.db"`) ||
+		!strings.Contains(body, `"generation":0`) {
+		t.Fatalf("_meta 应含 bookId+generation: %s", body)
+	}
+
 	// 世代未变：会话可用（ping 不应 404）。
 	rec = do(t, h.Handler, func(r *http.Request) {
 		r.Header.Set("Mcp-Session-Id", sid)
