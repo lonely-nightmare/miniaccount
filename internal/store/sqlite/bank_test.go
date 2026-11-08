@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -823,5 +824,80 @@ func TestRuleCRUD(t *testing.T) {
 		CounterAccountCode: "9999",
 	}); err == nil {
 		t.Error("不存在的对方科目应报错")
+	}
+}
+
+// 复盘发现：旧版 DedupKey 把余额算进指纹，无余额导入存的 hash
+// 带 "|0|" 段。新导入带真实余额时指纹不同 → 去重失效插重复行。
+// 现行 fp2: 键不含余额，且要能通过旧 fp: 行命中去重并回填余额。
+func TestImportDedupRepairsLegacyBalance(t *testing.T) {
+	ctx := context.Background()
+	f := setupBank(t)
+	db := f.book.DB
+
+	// 手工种一条「旧版导入」的流水：dedup_hash 是含余额段的 fp:
+	// 形态，余额按旧 bug 存成 NULL（未知被当成 0）。
+	var accID int64
+	if err := db.WithTx(ctx, func(tx *Tx) error {
+		if err := tx.QueryRow(ctx,
+			`SELECT id FROM account WHERE code = '100201'`).Scan(&accID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO bank_import (account_id, file_name, file_sha256,
+				encoding, imported_by, imported_at)
+			VALUES (?,?,?,?,?,?)`,
+			accID, "旧对账单.csv", "deadbeef", "utf-8", "李会计", "2025-09-30T00:00:00Z"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO bank_flow (import_id, account_id, txn_date, direction,
+				amount, balance, counterparty_name, counterparty_account, summary,
+				serial_no, dedup_hash, status, raw_json, created_at, updated_at)
+			VALUES ((SELECT MAX(id) FROM bank_import),?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			accID, "2025-09-03", "in", int64(5000000), nil,
+			"张三", "", "转账", "",
+			"fp:2025-09-03|in|50000.00|0|张三|转账", // 旧指纹：含余额段
+			"matched", "{}", "2025-09-30T00:00:00Z", "2025-09-30T00:00:00Z")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重新导入同一笔流水，这次带真实余额 150000.00。
+	flow := &bank.Flow{
+		AccountCode: "100201",
+		TxnDate: calendar.MustParse("2025-09-03"),
+		Direction: bank.DirIn, Amount: money100(50000),
+		Balance: money100(150000), BalanceKnown: true,
+		CounterpartyName: "张三", Summary: "转账",
+		Status: bank.StatusImported,
+	}
+	res, err := db.Bank().Import(ctx, ImportInput{
+		AccountCode: "100201", FileName: "新对账单.csv",
+		FileData: []byte("x"), ImportedBy: "李会计",
+		Rows: []*bank.Flow{flow}, RawRows: [][]string{{"2025-09-03", "转账"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Inserted != 0 || res.Duplicated != 1 {
+		t.Fatalf("应判重复 1 条，实际 inserted=%d duplicated=%d",
+			res.Inserted, res.Duplicated)
+	}
+
+	// 余额被回填、指纹升级成 fp2:。
+	var bal sql.NullInt64
+	var hash string
+	if err := db.sql.QueryRowContext(ctx, `
+		SELECT balance, dedup_hash FROM bank_flow WHERE account_id = ?`,
+		accID).Scan(&bal, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if !bal.Valid || bal.Int64 != int64(money100(150000)) {
+		t.Errorf("余额 = %v，期望回填 150000.00", bal)
+	}
+	if !strings.HasPrefix(hash, "fp2:") {
+		t.Errorf("指纹未升级：%s", hash)
 	}
 }

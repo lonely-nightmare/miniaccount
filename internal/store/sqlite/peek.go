@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -229,10 +230,11 @@ func ScanBookDir(ctx context.Context, dir string) ([]BookPeek, error) {
 // 恢复流程回滚、原账套原样奉还。迁移写进的是副本，
 // 真实文件保持备份原样，由之后正常打开再迁移一遍。
 func VerifyOpenable(ctx context.Context, path string) error {
-	src, err := os.ReadFile(path)
+	in, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("读取待验证账套: %w", err)
 	}
+	defer func() { _ = in.Close() }()
 	tmp, err := os.CreateTemp("", "miniaccount-verify-*.db")
 	if err != nil {
 		return fmt.Errorf("建验证副本: %w", err)
@@ -245,7 +247,8 @@ func VerifyOpenable(ctx context.Context, path string) error {
 		_ = os.Remove(tmpPath + "-wal")
 		_ = os.Remove(tmpPath + "-shm")
 	}
-	if _, err := tmp.Write(src); err != nil {
+	// 流式复制：整库读进内存会让大账套恢复时内存翻倍。
+	if _, err := io.Copy(tmp, in); err != nil {
 		cleanup()
 		return fmt.Errorf("写验证副本: %w", err)
 	}
@@ -259,5 +262,19 @@ func VerifyOpenable(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("恢复的账套打不开: %w", err)
 	}
-	return db.Close()
+	defer func() { _ = db.Close() }()
+	// ★ 只开不迁等于没验：缺迁移记录的库在只读/Ping 下都正常，
+	// 真正打开跑迁移时才在重复列上崩 —— 恢复验证必须把这条
+	// 路径完整走一遍。迁移写进的是副本，原文件保持备份原样。
+	if err := db.Migrate(ctx); err != nil {
+		return fmt.Errorf("恢复的账套无法迁移到本程序版本: %w", err)
+	}
+	// 迁移能跑完只说明「是个可升级的 sqlite」，还得是真账套：
+	// 任意 sqlite 文件都能被迁移出一整套空表。
+	var n int
+	if err := db.sql.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM book`).Scan(&n); err != nil || n == 0 {
+		return fmt.Errorf("不是账套文件（没有账套登记信息）")
+	}
+	return nil
 }

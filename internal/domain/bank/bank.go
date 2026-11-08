@@ -196,11 +196,15 @@ func (f *Flow) DedupKey() string {
 	if s := strings.TrimSpace(f.SerialNo); s != "" {
 		return "sn:" + s
 	}
-	return "fp:" + strings.Join([]string{
+	// ★ 指纹不含余额：余额不是交易身份 —— 同一笔流水在不同时点
+	// 导出的对账单里余额读数不同，把余额算进指纹会让「换了一份
+	// 对账单再导」变成重复流水，也让旧版存下的坏余额无法靠
+	// 重新导入修复。前缀用 fp2 与历史遗留的 fp（含余额段）
+	// 明确分开：老库里的 fp: 串由 bank_repo 的去重扫描兼容。
+	return "fp2:" + strings.Join([]string{
 		f.TxnDate.String(),
 		string(f.Direction),
 		f.Amount.PlainString(),
-		f.Balance.PlainString(),
 		strings.TrimSpace(f.CounterpartyName),
 		strings.TrimSpace(f.Summary),
 	}, "|")

@@ -158,25 +158,32 @@ func (r *BankRepo) Import(ctx context.Context, in ImportInput) (*ImportResult, e
 func (r *BankRepo) insertFlow(ctx context.Context, tx *Tx, importID, accountID int64,
 	f *bank.Flow, raw, now string) (bool, error) {
 
-	// 先查一次，避免依赖错误信息判断重复（错误信息因驱动而异）
-	var exists int
-	err := tx.QueryRow(ctx,
-		`SELECT COUNT(*) FROM bank_flow WHERE account_id = ? AND dedup_hash = ?`,
-		accountID, f.DedupKey()).Scan(&exists)
+	// 先查一次，避免依赖错误信息判断重复（错误信息因驱动而异）。
+	// dedupHashOfDuplicate 同时兼容旧版含余额段的 fp: 指纹 ——
+	// 命中时把存量行的 dedup_hash 升级成新的 fp2: 键。
+	dupID, err := r.dedupHashOfDuplicate(ctx, tx, accountID, f)
 	if err != nil {
-		return false, translateErr(err)
+		return false, err
 	}
-	if exists > 0 {
-		// ★ 去重命中也顺带补余额：旧版把未知余额存成了 0，
-		// 重新导入带余额列的对账单时把真值回填进去。
-		// 新行仍算重复（DedupKey 不含余额），不产生新流水。
+	if dupID > 0 {
+		// ★ 命中即把存量指纹升级成 fp2:（旧 fp: 行自愈）；
+		// 新行带了余额时顺带回填 —— 旧版把未知余额存成了 0，
+		// 重导带余额列的对账单能把真值补回来。
+		// 新行仍算重复，不产生新流水。
+		var qerr error
 		if f.BalanceKnown {
-			if _, err = tx.Exec(ctx, `
-				UPDATE bank_flow SET balance = ?, updated_at = ?
-				 WHERE account_id = ? AND dedup_hash = ?`,
-				int64(f.Balance), now, accountID, f.DedupKey()); err != nil {
-				return false, translateErr(err)
-			}
+			_, qerr = tx.Exec(ctx, `
+				UPDATE bank_flow SET balance = ?, dedup_hash = ?, updated_at = ?
+				 WHERE id = ?`,
+				int64(f.Balance), f.DedupKey(), now, dupID)
+		} else {
+			_, qerr = tx.Exec(ctx, `
+				UPDATE bank_flow SET dedup_hash = ?, updated_at = ?
+				 WHERE id = ? AND dedup_hash <> ?`,
+				f.DedupKey(), now, dupID, f.DedupKey())
+		}
+		if qerr != nil {
+			return false, translateErr(qerr)
 		}
 		return false, nil
 	}
@@ -201,6 +208,60 @@ func (r *BankRepo) insertFlow(ctx context.Context, tx *Tx, importID, accountID i
 		return false, err
 	}
 	return true, nil
+}
+
+// dedupHashOfDuplicate 找出与 f 是同一笔交易的存量流水 id，找不到返回 0。
+//
+// 两段查找：
+//  1. 精确匹配现行 fp2:/sn: 键 —— 快路径；
+//  2. 旧版 fp: 指纹含余额段，字符串形状和 fp2 无法互相推导，
+//     按「日期|方向|金额」前缀捞出候选后，用库存列重算 fp2 键
+//     逐条比对 —— 这是旧库余额段（含存错的 0）唯一能对上的方式。
+func (r *BankRepo) dedupHashOfDuplicate(ctx context.Context, tx *Tx,
+	accountID int64, f *bank.Flow) (int64, error) {
+
+	key := f.DedupKey()
+	var id int64
+	err := tx.QueryRow(ctx,
+		`SELECT id FROM bank_flow WHERE account_id = ? AND dedup_hash = ?`,
+		accountID, key).Scan(&id)
+	switch {
+	case err == nil:
+		return id, nil
+	case err != sql.ErrNoRows:
+		return 0, translateErr(err)
+	}
+	if !strings.HasPrefix(key, "fp2:") {
+		return 0, nil // sn: 键无历史形态差异
+	}
+
+	// 旧 fp: 行的前三个字段与 fp2 相同，余额段在中间无法按整串匹配。
+	prefix := "fp:" + strings.Join([]string{
+		f.TxnDate.String(), string(f.Direction), f.Amount.PlainString(),
+	}, "|") + "|%"
+	rows, err := tx.Query(ctx, `
+		SELECT id, counterparty_name, summary
+		  FROM bank_flow
+		 WHERE account_id = ? AND dedup_hash LIKE ?`, accountID, prefix)
+	if err != nil {
+		return 0, translateErr(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rid int64
+		var cp, sum string
+		if err := rows.Scan(&rid, &cp, &sum); err != nil {
+			return 0, err
+		}
+		recomputed := "fp2:" + strings.Join([]string{
+			f.TxnDate.String(), string(f.Direction), f.Amount.PlainString(),
+			strings.TrimSpace(cp), strings.TrimSpace(sum),
+		}, "|")
+		if recomputed == key {
+			return rid, nil
+		}
+	}
+	return 0, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

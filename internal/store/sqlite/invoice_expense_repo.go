@@ -1066,13 +1066,15 @@ func (r *InvoiceRepo) smallScaleAt(ctx context.Context, on calendar.Date) (bool,
 	if err != nil {
 		return false, fmt.Errorf("invoice: 读纳税人身份历史: %w", err)
 	}
-	if st, ok := vat.StatusOn(periods, on); ok {
-		return st == vat.VATSmallScale, nil
-	}
+	var fallback vat.VATStatus
 	if b, err := r.db.Books().Get(ctx); err == nil && b.VATStatus != "" {
-		return vat.VATStatus(b.VATStatus) == vat.VATSmallScale, nil
+		fallback = vat.VATStatus(b.VATStatus)
 	}
-	return false, fmt.Errorf("invoice: 账套未登记纳税人身份，无法判定进项是否可抵扣")
+	st := vat.StatusOnOr(periods, on, fallback)
+	if st == "" {
+		return false, fmt.Errorf("invoice: 账套未登记 %s 时的纳税人身份，无法判定进项是否可抵扣", on)
+	}
+	return st == vat.VATSmallScale, nil
 }
 
 // invoiceSummary 拼出凭证摘要。

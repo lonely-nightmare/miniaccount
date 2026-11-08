@@ -190,6 +190,33 @@ func StatusOn(periods []StatusPeriod, on calendar.Date) (VATStatus, bool) {
 	return best.Status, true
 }
 
+// StatusOnOr 在 StatusOn 的基础上处理「查不到期间」的日期：
+//
+//   - 日期早于首条记录 → 用**首条记录**的身份：历史起点是账套
+//     建立日，起点之前的业务（期初补录）按建账时的身份算，
+//     绝不能退到「当前」身份 —— 否则一般纳税人转小规模后，
+//     历史起点前的凭证会被误判成小规模；
+//   - 历史为空或落在期间空隙 → 返回 fallback。
+func StatusOnOr(periods []StatusPeriod, on calendar.Date, fallback VATStatus) VATStatus {
+	if st, ok := StatusOn(periods, on); ok {
+		return st
+	}
+	var earliest *StatusPeriod
+	for i := range periods {
+		p := &periods[i]
+		if !p.EffectiveFrom.Valid() {
+			continue
+		}
+		if earliest == nil || p.EffectiveFrom.Before(earliest.EffectiveFrom) {
+			earliest = p
+		}
+	}
+	if earliest != nil && on.Before(earliest.EffectiveFrom) {
+		return earliest.Status
+	}
+	return fallback
+}
+
 // ValidatePeriods 校验身份期间列表。
 func ValidatePeriods(periods []StatusPeriod) error {
 	if len(periods) == 0 {

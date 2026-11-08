@@ -940,6 +940,9 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 	rows, err := s.db.SQL().QueryContext(ctx,
 		`SELECT sha256 FROM attachment`)
 	if err != nil {
+		// 查不出清单就无从迁移 —— 静默返回会让老附件「看起来
+		// 凭空消失」，至少要留下可查的痕迹。
+		_, _ = os.Stderr.WriteString("[files] 附件清单读取失败，旧附件未迁移: " + err.Error() + "\n")
 		return
 	}
 	var hashes []string

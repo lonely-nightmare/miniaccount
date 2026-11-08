@@ -1328,24 +1328,44 @@ func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64) (*DeleteResult,
 		var err error
 		// 发票 booked 回生成前一态：专票回「已认证」（生成凭证要求
 		// 已认证，见 PostInvoice），其余回「未认证」。
+		// ★ AND status='booked'：已作废的发票如果仍挂着这张凭证，
+		// 绝不能被「回退」复活 —— 只清关联不动状态。
 		if res.UnlinkedInvoice, err = affect(`
 			UPDATE invoice SET voucher_id = NULL, updated_at = ?,
 				status = CASE WHEN kind IN ('special','e_special')
 				              THEN 'verified' ELSE 'pending' END
-			 WHERE voucher_id = ?`, nowString(), id); err != nil {
+			 WHERE voucher_id = ? AND status = 'booked'`, nowString(), id); err != nil {
+			return err
+		}
+		if _, err = affect(`
+			UPDATE invoice SET voucher_id = NULL, updated_at = ?
+			 WHERE voucher_id = ? AND status <> 'booked'`, nowString(), id); err != nil {
 			return err
 		}
 		// 报销单 posted → approved（BuildEntries 只允许 approved，
-		// 上一态确定）。
+		// 上一态确定）；其它状态只摘关联不碰状态。
 		if res.UnlinkedClaim, err = affect(`
 			UPDATE expense_claim SET voucher_id = NULL, status = 'approved',
-				updated_at = ? WHERE voucher_id = ?`, nowString(), id); err != nil {
+				updated_at = ? WHERE voucher_id = ? AND status = 'posted'`,
+			nowString(), id); err != nil {
 			return err
 		}
-		// 银行流水 posted → matched（PostFlows 要求 matched）。
+		if _, err = affect(`
+			UPDATE expense_claim SET voucher_id = NULL, updated_at = ?
+			 WHERE voucher_id = ? AND status <> 'posted'`, nowString(), id); err != nil {
+			return err
+		}
+		// 银行流水 posted → matched（PostFlows 要求 matched）；
+		// 其它状态（如 ignored）只摘关联不碰状态。
 		if res.UnlinkedFlow, err = affect(`
 			UPDATE bank_flow SET voucher_id = NULL, status = 'matched',
-				updated_at = ? WHERE voucher_id = ?`, nowString(), id); err != nil {
+				updated_at = ? WHERE voucher_id = ? AND status = 'posted'`,
+			nowString(), id); err != nil {
+			return err
+		}
+		if _, err = affect(`
+			UPDATE bank_flow SET voucher_id = NULL, updated_at = ?
+			 WHERE voucher_id = ? AND status <> 'posted'`, nowString(), id); err != nil {
 			return err
 		}
 		// ★ 固定资产计提/摊销行**整行删除**，不是只清 voucher_id：
@@ -1516,15 +1536,12 @@ func smallScaleAtTx(ctx context.Context, tx *Tx, on calendar.Date) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	if st, ok := vat.StatusOn(periods, on); ok {
-		return st == vat.VATSmallScale, nil
-	}
 	var s string
 	if err := tx.QueryRow(ctx,
 		`SELECT COALESCE(vat_status,'') FROM book WHERE id = 1`).Scan(&s); err != nil {
-		return false, nil
+		s = ""
 	}
-	return vat.VATStatus(s) == vat.VATSmallScale, nil
+	return vat.StatusOnOr(periods, on, vat.VATStatus(s)) == vat.VATSmallScale, nil
 }
 
 // loadVATStatusPeriodsTx 读全部纳税人身份期间。

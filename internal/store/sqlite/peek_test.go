@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -165,4 +166,66 @@ func openRawFile(t *testing.T, path string) *DB {
 		t.Fatalf("打开 %s 失败: %v", path, err)
 	}
 	return db
+}
+
+// 复盘发现：VerifyOpenable 只 Open+Ping 没跑迁移，「缺迁移记录、
+// 真打开时崩在重复列」的库照样验证通过；还丢了「是账套」的校验。
+// 现在验证 = 副本上走 Open+Migrate+查 book 行的全真路径。
+func TestVerifyOpenable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	newBook := func(name string) string {
+		p := filepath.Join(dir, name)
+		db, err := Open(ctx, Options{Path: p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.CreateBook(ctx, CreateBookInput{
+			CompanyName: "验证账套", TaxType: TaxTypeGeneral,
+			StartYear: 2025, StartMonth: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// 好账套：通过
+	good := newBook("good.db")
+	if err := VerifyOpenable(ctx, good); err != nil {
+		t.Errorf("正常账套应通过验证: %v", err)
+	}
+
+	// 非账套 sqlite：只是张普通表 —— 迁移能给它造出全套空表，
+	// 但没有 book 行，必须拒。
+	notBook := filepath.Join(dir, "notabook.db")
+	if raw, err := sql.Open("sqlite", "file:"+notBook); err == nil {
+		if _, err := raw.Exec(`CREATE TABLE t (id INTEGER)`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+	if err := VerifyOpenable(ctx, notBook); err == nil {
+		t.Error("非账套 sqlite 居然通过了恢复验证")
+	}
+
+	// 缺迁移记录的账套：真打开时迁移重演 0001 撞已存在的表。
+	// 旧验证（Open+Ping 不迁移）会放它过去换掉原库。
+	broken := newBook("broken.db")
+	if raw, err := sql.Open("sqlite", "file:"+broken); err == nil {
+		if _, err := raw.Exec(
+			`DELETE FROM schema_migration WHERE version = 1`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+	if err := VerifyOpenable(ctx, broken); err == nil {
+		t.Error("缺迁移记录的账套居然通过了恢复验证 —— 恢复后打不开")
+	}
 }

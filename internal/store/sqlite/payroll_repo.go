@@ -769,7 +769,11 @@ var errVoucherNotDraft = errors.New("voucher: 凭证已不是草稿")
 type PayrollVoucherRegen struct {
 	VoucherID int64
 	Run       *payroll.Run
-	Entries   []payroll.Entry
+	// RunUpdatedAt 是准备时工资单的 updated_at 快照 ——
+	// 过账事务里复核它没变才允许应用，挡住「准备后又有人
+	// 改了工资单，仍按旧快照过账」的窗口。
+	RunUpdatedAt string
+	Entries      []payroll.Entry
 }
 
 // PrepareStaleDraftRegen 找出某期间内仍是草稿的工资凭证，
@@ -787,7 +791,7 @@ type PayrollVoucherRegen struct {
 // 单连接池里放进事务就是死锁 —— 所以只能事务外准备、事务内应用。
 func (r *PayrollRepo) PrepareStaleDraftRegen(ctx context.Context, k period.Key) ([]PayrollVoucherRegen, error) {
 	rows, err := r.db.sql.QueryContext(ctx, `
-		SELECT r.id, r.accrual_voucher_id, r.payment_voucher_id
+		SELECT r.id, r.accrual_voucher_id, r.payment_voucher_id, r.updated_at
 		  FROM salary_run r
 		  LEFT JOIN voucher va ON va.id = r.accrual_voucher_id
 		  LEFT JOIN voucher vp ON vp.id = r.payment_voucher_id
@@ -800,11 +804,12 @@ func (r *PayrollRepo) PrepareStaleDraftRegen(ctx context.Context, k period.Key) 
 	type runVouchers struct {
 		id       int64
 		acc, pay sql.NullInt64
+		updated  string
 	}
 	var list []runVouchers
 	for rows.Next() {
 		var rv runVouchers
-		if err := rows.Scan(&rv.id, &rv.acc, &rv.pay); err != nil {
+		if err := rows.Scan(&rv.id, &rv.acc, &rv.pay, &rv.updated); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -843,7 +848,8 @@ func (r *PayrollRepo) PrepareStaleDraftRegen(ctx context.Context, k period.Key) 
 				return nil, err
 			}
 			out = append(out, PayrollVoucherRegen{
-				VoucherID: pair.vid.Int64, Run: run, Entries: entries,
+				VoucherID: pair.vid.Int64, Run: run,
+				RunUpdatedAt: rv.updated, Entries: entries,
 			})
 		}
 	}
@@ -852,10 +858,29 @@ func (r *PayrollRepo) PrepareStaleDraftRegen(ctx context.Context, k period.Key) 
 
 // ApplyStaleDraftRegenTx 在过账事务内把准备好的工资凭证分录写回
 // 对应草稿。凭证已不再是草稿时跳过（比如它已被单独过账）。
+//
+// 每个任务先复核工资单 updated_at 与准备时一致 —— 准备到应用
+// 之间隔着事务边界，工资单若被改过，按旧快照写进的分录会与
+// 最终工资单对不上，宁可中止让调用方重来也不能放过账。
 func (r *PayrollRepo) ApplyStaleDraftRegenTx(ctx context.Context, tx *Tx,
 	tasks []PayrollVoucherRegen) error {
 
+	checked := map[int64]bool{}
 	for _, t := range tasks {
+		if t.Run != nil && !checked[t.Run.ID] {
+			var cur string
+			if err := tx.QueryRow(ctx,
+				`SELECT updated_at FROM salary_run WHERE id = ?`,
+				t.Run.ID).Scan(&cur); err != nil {
+				return translateErr(err)
+			}
+			if cur != t.RunUpdatedAt {
+				return fmt.Errorf(
+					"%d-%02d 月的工资单在过账期间被修改，请重新结账",
+					t.Run.Period.Year, t.Run.Period.Month)
+			}
+			checked[t.Run.ID] = true
+		}
 		if err := r.regenPayrollVoucherTx(ctx, tx, t.VoucherID,
 			t.Run, t.Entries); err != nil && !errors.Is(err, errVoucherNotDraft) {
 			return fmt.Errorf("工资凭证 #%d 刷新失败: %w", t.VoucherID, err)

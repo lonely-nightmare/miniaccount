@@ -985,3 +985,41 @@ func TestCascadeSkipsPostedRun(t *testing.T) {
 		}
 	}
 }
+
+// 复盘发现：PrepareStaleDraftRegen（事务外）到 Apply（过账事务内）
+// 之间有窗口 —— 工资单在窗口里被改，仍按旧快照写分录过账。
+// Apply 现在复核 updated_at，不一致即中止。
+func TestStaleRegenAbortsOnRunModified(t *testing.T) {
+	ctx := context.Background()
+	f := setupPayroll(t)
+	dept := int64(1)
+	emp := f.addEmployee(t, "E001", "张三", payroll.KindEmployee,
+		"560201", &dept, "测试城市")
+
+	runID := f.buildAndSave(t, 2025, 9, map[int64]*payroll.Item{
+		emp: {BaseSalary: money100(20000), SpecialAdditional: money100(2000)},
+	})
+	if _, err := f.DB.Payroll().PostRun(ctx, runID, "王主管",
+		time.Date(2025, 9, 30, 18, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+
+	regen, err := f.DB.Payroll().PrepareStaleDraftRegen(ctx, period.NewKey(2025, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(regen) == 0 {
+		t.Fatal("应有待刷新的工资草稿凭证")
+	}
+	// 模拟窗口内的并发修改
+	if _, err := f.DB.sql.ExecContext(ctx,
+		`UPDATE salary_run SET updated_at = '2999-01-01T00:00:00Z'`); err != nil {
+		t.Fatal(err)
+	}
+	err = f.DB.WithTx(ctx, func(tx *Tx) error {
+		return f.DB.Payroll().ApplyStaleDraftRegenTx(ctx, tx, regen)
+	})
+	if err == nil || !strings.Contains(err.Error(), "被修改") {
+		t.Fatalf("工资单被改后仍按旧快照应用 —— 应中止，实际 err=%v", err)
+	}
+}
