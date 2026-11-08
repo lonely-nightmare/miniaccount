@@ -28,7 +28,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"miniaccount/internal/attachment"
@@ -36,7 +38,6 @@ import (
 	"miniaccount/internal/domain/ai"
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/calendar"
-	"miniaccount/internal/domain/closing"
 	"miniaccount/internal/domain/ledger"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
@@ -47,8 +48,9 @@ import (
 
 // Service 是账套的操作入口。
 type Service struct {
-	db   *sqlite.DB
-	path string
+	db       *sqlite.DB
+	path     string
+	filesDir string
 }
 
 // Options 打开账套的参数。
@@ -80,7 +82,11 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Service{db: db, path: opts.Path}, nil
+	s := &Service{db: db, path: opts.Path, filesDir: strings.TrimSpace(opts.FilesDir)}
+	if !opts.ReadOnly {
+		s.migrateLegacyFilesDir(ctx)
+	}
+	return s, nil
 }
 
 // Shutdown 关闭账套，释放数据库连接。
@@ -606,14 +612,26 @@ type ClosingEntry struct {
 
 // PreviewClose 预览结账结果，**不写任何数据**。
 func (s *Service) PreviewClose(ctx context.Context, k period.Key) (*ClosingPreview, error) {
-	plan, err := s.db.Closing().Plan(ctx, k, closing.Accounts{})
-	if err != nil {
-		return nil, err
-	}
 	h, err := s.db.CheckPeriodHealth(ctx, k)
 	if err != nil {
 		return nil, err
 	}
+	// ★ 预览必须和真实结账看到同一套账。
+	//
+	// 真实结账会先把本期草稿全部过账、再按总账算结转；
+	// 直接拿已过账总账算出来的预览，有草稿时就和实际结果
+	// 对不上（200 元收入草稿：预览收入为零，结账却生成了
+	// 两条结转分录）。DryRunClose 在写事务里重放全部步骤后
+	// 回滚，预览与实结天然同源。
+	//
+	// postingBy 用占位值：dry-run 全部回滚，制单人不会落库。
+	res, err := s.db.Closing().DryRunClose(ctx, sqlite.CloseInput{
+		Period: k, PostingBy: "预览", At: time.Now(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	plan := res.Plan
 	out := &ClosingPreview{
 		Period: k.String(), Year: k.Year, Month: k.Month,
 		Health: convertHealth(h),
@@ -878,12 +896,81 @@ func (s *Service) AISuggestions(ctx context.Context, limit int) ([]sqlite.Sugges
 // ---------------------------------------------------------------------------
 
 // FilesDir 返回附件目录。
+//
+// ★ 按账套隔离，取 db 同级的 <账套名>.files。
+//
+// 曾经是 <db目录>/.files —— 同目录下的所有账套共用一个附件目录：
+// 备份 A 会把 B 的附件一并打包，恢复 A 时 stashExisting 挪走整个
+// 共享目录，B 的附件就物理消失了。CLI 恢复本来就按 <账套名>.files
+// 落附件，结果 GUI 打开时读的是共享目录、一个附件也看不见 ——
+// 两条路径对不上是同一个根因。
 func (s *Service) FilesDir() string {
+	if s.filesDir != "" {
+		return s.filesDir
+	}
 	base := s.path
 	if base == ":memory:" || base == "" {
 		return filepath.Join(".", ".files")
 	}
-	return filepath.Join(filepath.Dir(base), ".files")
+	name := strings.TrimSuffix(filepath.Base(base), filepath.Ext(base))
+	return filepath.Join(filepath.Dir(base), name+".files")
+}
+
+// migrateLegacyFilesDir 把旧版共享 .files 目录里、本账套引用的附件
+// 复制到按账套隔离的新目录。
+//
+// 只复制、不移动：内容寻址意味着同一 hash 文件可能被同目录下其他
+// 账套引用，移走了别人就丢。单文件失败不阻断打开 —— 文件还留在旧
+// 目录里，下次启动会再试；让建不了目录这种错误只影响附件写入
+// （届时附件操作自己会报清楚的错），不该让整本账打不开。
+func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
+	if s.path == ":memory:" || s.path == "" || s.filesDir != "" {
+		return
+	}
+	newDir := s.FilesDir()
+	legacy := filepath.Join(filepath.Dir(s.path), ".files")
+	if legacy == newDir {
+		return
+	}
+	if st, err := os.Stat(legacy); err != nil || !st.IsDir() {
+		return
+	}
+	rows, err := s.db.SQL().QueryContext(ctx, `
+		SELECT sha256 FROM attachment
+		UNION SELECT sha256 FROM attachment_v2`)
+	if err != nil {
+		return
+	}
+	var hashes []string
+	for rows.Next() {
+		var h string
+		if rows.Scan(&h) == nil {
+			hashes = append(hashes, h)
+		}
+	}
+	rows.Close()
+	for _, h := range hashes {
+		if len(h) < 4 {
+			continue
+		}
+		dst := filepath.Join(newDir, h[:2], h)
+		if _, err := os.Stat(dst); err == nil {
+			continue
+		}
+		src := filepath.Join(legacy, h[:2], h)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			_, _ = os.Stderr.WriteString("[files] 附件目录迁移失败: " + err.Error() + "\n")
+			return
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			_, _ = os.Stderr.WriteString("[files] 附件迁移失败: " + err.Error() + "\n")
+			return
+		}
+	}
 }
 
 // Attachments 返回附件仓库。
@@ -923,8 +1010,13 @@ type RestoreOptions struct {
 }
 
 // Restore 从备份恢复。
+//
+// 新库落位后立即用 VerifyOpenable 验「能打开」——版本过新或
+// 损坏都在 Restore 的回滚守卫内触发，原账套自动放回，
+// 而不是留给打开阶段再失败、让用户手工翻暂存目录。
 func (s *Service) Restore(ctx context.Context, o RestoreOptions) (*backup.RestoreResult, error) {
-	return backup.Restore(ctx, o.Archive, o.DBPath, o.FilesDir)
+	return backup.Restore(ctx, o.Archive, o.DBPath, o.FilesDir,
+		sqlite.VerifyOpenable)
 }
 
 // InspectBackup 只读查看备份内容，用于「恢复前确认」。

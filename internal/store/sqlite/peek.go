@@ -213,3 +213,43 @@ func ScanBookDir(ctx context.Context, dir string) ([]BookPeek, error) {
 	})
 	return out, nil
 }
+
+// VerifyOpenable 校验一个账套文件能被本程序打开。
+//
+// 只读打开、不跑迁移 —— 用在「动用户数据之前的最后一步验证」，
+// 比如恢复备份：新库落位后先确认它能开，再把原库从暂存放回去。
+//
+// 判定比 PeekBook 严格也比它宽松：
+//   - 严格：必须是账套（有 book 表）、必须读得出迁移版本；
+//   - 宽松：版本**比程序旧**不算失败 —— 正常打开路径会把它迁移升级，
+//     恢复的本来就可能是个旧备份；只有「比程序新」才拒绝。
+func VerifyOpenable(ctx context.Context, path string) error {
+	db, err := Open(ctx, Options{Path: path, ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	if !db.hasTable(ctx, "book") {
+		return fmt.Errorf("不是账套文件（没有 book 表）")
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		return err
+	}
+	maxEmbedded := migrations[len(migrations)-1].Version
+	if !db.hasTable(ctx, "schema_migration") {
+		// 有 book 表但没有迁移记录：比迁移框架还老的账套，
+		// 可写打开时按全量迁移处理，视为「旧」放行。
+		return nil
+	}
+	applied, err := db.appliedSet(ctx)
+	if err != nil {
+		return err
+	}
+	if maxApplied := applied.max(); maxApplied > maxEmbedded {
+		return fmt.Errorf("%w：账套版本 %d > 本程序 %d",
+			ErrSchemaTooNew, maxApplied, maxEmbedded)
+	}
+	return nil
+}

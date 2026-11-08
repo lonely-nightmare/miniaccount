@@ -457,6 +457,7 @@ func extractRow(row []string, ix *indexer, m Mapping, bankAccountCode string) (*
 	if m.Balance != "" {
 		if v, err := parseAmount(ix.get(row, m.Balance)); err == nil {
 			f.Balance = v
+			f.BalanceKnown = true
 		}
 	}
 	f.CounterpartyName = ix.get(row, m.CounterpartyName)

@@ -364,6 +364,9 @@ type PayrollRunDetail struct {
 	// PaymentVoucherLabel 同上。
 	PaymentVoucherLabel string `json:"paymentVoucherLabel"`
 
+	// CascadeWarnings 是保存工资单时级联重算后续月份产生的提示
+	// （某月重算失败、凭证非草稿未重生成等）。仅保存路径返回。
+	CascadeWarnings []string `json:"cascadeWarnings,omitempty"`
 	// CanConfirm / CanPost 由服务层算好，界面照着禁用按钮。
 	CanConfirm bool `json:"canConfirm"`
 	CanPost    bool `json:"canPost"`
@@ -500,11 +503,16 @@ func (s *Service) BuildPayroll(ctx context.Context, in BuildPayrollInput) (*Payr
 	if err != nil {
 		return nil, err
 	}
-	id, err := s.db.Payroll().SaveRun(ctx, run)
+	saveRes, err := s.db.Payroll().SaveRun(ctx, run)
 	if err != nil {
 		return nil, err
 	}
-	return s.PayrollRun(ctx, id)
+	detail, err := s.PayrollRun(ctx, saveRes.ID)
+	if err != nil {
+		return nil, err
+	}
+	detail.CascadeWarnings = saveRes.Warnings
+	return detail, nil
 }
 
 // PostPayroll 把工资单记账，生成计提与发放两张凭证。

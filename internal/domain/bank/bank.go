@@ -147,6 +147,13 @@ type Flow struct {
 
 	// Balance 是这笔交易后的银行账户余额。用于和账面余额对账。
 	Balance money.Money
+	// BalanceKnown 表示余额列是真实的对账单数据。
+	//
+	// 没有余额列的对账单（很多银行流水导出只有收支没有余额），
+	// 导入时 Balance 为零值 —— 但「未知」和「真实 0 元」必须分开：
+	// 前者落库存 NULL、不参与期初反推；当 0 当真值存，
+	// 余额调节表会拿它算出一个凭空差额的期初，判成不平。
+	BalanceKnown bool
 
 	CounterpartyName    string
 	CounterpartyAccount string

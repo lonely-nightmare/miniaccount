@@ -235,7 +235,7 @@ func TestDeleteDraftOnly(t *testing.T) {
 	v := draftVoucher(t, sh)
 	s, _ := db.Vouchers().SaveDraft(ctx, DraftInput{Voucher: v, CreatedBy: "李会计"})
 
-	if err := db.Vouchers().DeleteDraft(ctx, s.VoucherID); err != nil {
+	if _, err := db.Vouchers().DeleteDraft(ctx, s.VoucherID); err != nil {
 		t.Fatalf("删除草稿失败: %v", err)
 	}
 	assertVoucherCount(t, db, 0)
@@ -255,7 +255,7 @@ func TestDeleteDraftOnly(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Vouchers().DeleteDraft(ctx, s2.VoucherID); !errors.Is(err, ErrNotDraft) {
+	if _, err := db.Vouchers().DeleteDraft(ctx, s2.VoucherID); !errors.Is(err, ErrNotDraft) {
 		t.Errorf("已过账凭证应拒绝删除并报 ErrNotDraft，实际 %v", err)
 	}
 	assertVoucherCount(t, db, 1)

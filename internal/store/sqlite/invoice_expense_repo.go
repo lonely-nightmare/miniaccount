@@ -12,6 +12,7 @@ import (
 	"miniaccount/internal/domain/ledger"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
+	"miniaccount/internal/domain/vat"
 	"miniaccount/internal/domain/voucher"
 )
 
@@ -640,10 +641,20 @@ func (r *ClaimRepo) PostClaim(ctx context.Context, claimID int64,
 		}
 		res.VoucherID, res.No, res.Amount = out.VoucherID, "", c.TotalAmount
 
-		_, err = tx.Exec(ctx, `
+		// ★ WHERE voucher_id IS NULL 是并发防线：与 PostInvoice 同理，
+		// 两个连接同时过账同一报销单时，后到者拿 0 行回滚，
+		// 不会留下第二张草稿凭证。
+		res2, err := tx.Exec(ctx, `
 			UPDATE expense_claim SET status = 'posted', voucher_id = ?, updated_at = ?
-			 WHERE id = ?`, out.VoucherID, nowString(), claimID)
-		return err
+			 WHERE id = ? AND voucher_id IS NULL`,
+			out.VoucherID, nowString(), claimID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res2.RowsAffected(); n == 0 {
+			return fmt.Errorf("%w: 报销单 %s 已生成过凭证", ErrConflict, c.Code)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -928,7 +939,31 @@ func (r *InvoiceRepo) PostInvoice(ctx context.Context, invoiceID int64,
 		vc.DefaultExpense = expenseAccount
 	}
 
-	var res PostInvoiceResult
+	// ★ 进项抵扣的两道门（只约束专票 —— 普票 DeductibleTax 恒为 0）：
+	//
+	//	1) 认证门：未认证的专票不能挂「应交税费-进项税额」。
+	//	   认证抵扣链条要求先在税局勾选确认，直接入账会虚增进项。
+	//	2) 身份门：小规模纳税人没有可抵扣的进项税额科目，
+	//	   其取得专票的税额按准则计入成本费用（含税入账），
+	//	   而不是硬生成一个账套根本不支持的抵扣分录。
+	cost := inv.CostAmount()
+	deductible := inv.DeductibleTax()
+	if inv.Direction == invoice.DirInput && deductible.IsPositive() {
+		if inv.Status != invoice.StatusVerified {
+			return nil, fmt.Errorf("%w: 进项专票 %s 未认证，请先认证（勾选确认）后再生成凭证",
+				invoice.ErrBadStatus, inv.Identity())
+		}
+		small, err := r.smallScaleAt(ctx, inv.InvoiceDate)
+		if err != nil {
+			return nil, err
+		}
+		if small {
+			cost = inv.TotalAmount
+			deductible = 0
+		}
+	}
+
+		var res PostInvoiceResult
 	err = r.db.WithTx(ctx, func(tx *Tx) error {
 		v, err := voucher.New(voucher.WordJi, inv.InvoiceDate, postingBy)
 		if err != nil {
@@ -946,13 +981,13 @@ func (r *InvoiceRepo) PostInvoice(ctx context.Context, invoiceID int64,
 			// 进项：借 费用 + 进项税 / 贷 应付账款
 			entries = append(entries, ledger.Entry{
 				AccountCode: vc.DefaultExpense, Summary: summary,
-				Debit: inv.CostAmount(),
+				Debit: cost,
 				Aux:   ledger.Aux{ContactID: inv.ContactID, DeptID: deptID},
 			})
-			if tax := inv.DeductibleTax(); tax.IsPositive() {
+			if deductible.IsPositive() {
 				entries = append(entries, ledger.Entry{
 					AccountCode: vc.InputTax, Summary: summary + "（进项税额）",
-					Debit: tax,
+					Debit: deductible,
 				})
 			}
 			entries = append(entries, ledger.Entry{
@@ -994,10 +1029,21 @@ func (r *InvoiceRepo) PostInvoice(ctx context.Context, invoiceID int64,
 		// ★ 发票状态的取值由 CHECK 约束限定为
 		// pending / verified / booked / voided —— 生成凭证对应 booked（已入账），
 		// 不是 'posted'。写错值会被数据库直接拒绝。
-		if _, err := tx.Exec(ctx, `
+		//
+		// ★ WHERE voucher_id IS NULL 是并发防线：
+		// 事务外的「已生成过凭证」检查挡不住两个连接同时进来 ——
+		// 它们都看到 voucher_id 为空、都建了草稿，先提交者占住
+		// voucher_id，后到者靠这个条件拿 0 行、回滚自己刚建的凭证。
+		// 没有这个条件，一并发就留两张草稿、结账时全过账。
+		res2, err := tx.Exec(ctx, `
 			UPDATE invoice SET voucher_id = ?, status = 'booked', updated_at = ?
-			 WHERE id = ?`, pres.VoucherID, nowString(), inv.ID); err != nil {
+			 WHERE id = ? AND voucher_id IS NULL`,
+			pres.VoucherID, nowString(), inv.ID)
+		if err != nil {
 			return translateErr(err)
+		}
+		if n, _ := res2.RowsAffected(); n == 0 {
+			return fmt.Errorf("%w: 发票 %s 已生成过凭证", ErrConflict, inv.Identity())
 		}
 		res.VoucherID, res.No = pres.VoucherID, ""
 		return nil
@@ -1006,6 +1052,27 @@ func (r *InvoiceRepo) PostInvoice(ctx context.Context, invoiceID int64,
 		return nil, err
 	}
 	return &res, nil
+}
+
+// smallScaleAt 判定账套在给定日期是否为小规模纳税人。
+//
+// 身份历史（vat_status_history）优先 —— 它带生效区间，
+// 能正确回答「一月时还是小规模」这类问题；
+// 历史为空时退回账簿上登记的当前身份。
+// 两边都查不到身份时**报错**而不是放行 —— 默认成一般纳税人
+// 会生成一个账套可能根本无权抵扣的进项分录（见 vat.StatusOn 的说明）。
+func (r *InvoiceRepo) smallScaleAt(ctx context.Context, on calendar.Date) (bool, error) {
+	periods, err := r.db.VATRates().StatusHistory(ctx)
+	if err != nil {
+		return false, fmt.Errorf("invoice: 读纳税人身份历史: %w", err)
+	}
+	if st, ok := vat.StatusOn(periods, on); ok {
+		return st == vat.VATSmallScale, nil
+	}
+	if b, err := r.db.Books().Get(ctx); err == nil && b.VATStatus != "" {
+		return vat.VATStatus(b.VATStatus) == vat.VATSmallScale, nil
+	}
+	return false, fmt.Errorf("invoice: 账套未登记纳税人身份，无法判定进项是否可抵扣")
 }
 
 // invoiceSummary 拼出凭证摘要。

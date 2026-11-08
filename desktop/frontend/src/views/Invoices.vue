@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { Plus, Save, FileCheck2, Info, RefreshCw } from 'lucide-vue-next'
+import { Plus, Save, FileCheck2, ShieldCheck, Info, RefreshCw } from 'lucide-vue-next'
 import { api, notify, DRAFT_HINT } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
 import { fmtMoney, parseYuanToCents, todayISO } from '@/lib/format'
@@ -146,6 +146,23 @@ async function post({ id, expenseAccount = '', deptId = null }) {
 }
 
 const kindTone = (k) => (k === 'special' ? 'default' : 'muted')
+
+// canVerify 只有「未认证的进项专票」需要（且允许）认证：
+// 生成凭证的进项税分录以认证为前提，普票/销项票没有抵扣环节。
+const canVerify = (r) =>
+  r.direction === 'input' && (r.kind === 'special' || r.kind === 'e_special') && r.status === 'pending'
+
+async function verify(row) {
+  if (busy.value) return
+  if (!operator.value.trim()) { notify('请填写操作人', 'warn'); return }
+  if (!confirm(`确认发票 ${row.number || row.code} 已在税局勾选认证？\n\n认证后才能生成进项税凭证。`)) return
+  busy.value = true
+  const r = await api.verifyInvoice({ id: row.id, by: operator.value.trim() })
+  busy.value = false
+  if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
+  notify('已认证，现在可以生成凭证了', 'success')
+  await load()
+}
 </script>
 
 <template>
@@ -252,6 +269,9 @@ const kindTone = (k) => (k === 'special' ? 'default' : 'muted')
                 </td>
                 <td class="px-3 py-1.5">
                   <div class="flex justify-end gap-1">
+                    <Button v-if="canVerify(r)" variant="ghost" size="sm" :disabled="busy" @click="verify(r)">
+                      <ShieldCheck /> 认证
+                    </Button>
                     <Button v-if="!r.posted" variant="ghost" size="sm" :disabled="busy" @click="startPost(r)">
                       <FileCheck2 /> 生成凭证
                     </Button>

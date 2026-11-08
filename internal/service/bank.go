@@ -32,6 +32,8 @@ type BankFlowView struct {
 	Summary          string      `json:"summary"`
 	SerialNo         string      `json:"serialNo"`
 	Balance          money.Money `json:"balance"`
+	// BalanceKnown 为假表示对账单没有余额列（界面显示「—」而非 0.00）。
+	BalanceKnown bool `json:"balanceKnown"`
 
 	Status string `json:"status"`
 	// StatusLabel 是中文状态名。
@@ -88,6 +90,7 @@ func (s *Service) BankFlows(ctx context.Context, q BankFlowQuery) ([]BankFlowVie
 			Direction: string(f.Direction), DirectionLabel: f.Direction.Label(),
 			CounterpartyName: f.CounterpartyName, Summary: f.Summary,
 			SerialNo: f.SerialNo, Balance: f.Balance,
+			BalanceKnown:      f.BalanceKnown,
 			Status: string(f.Status), StatusLabel: f.Status.Label(),
 			CounterAccount: f.CounterAccount, Memo: f.Memo,
 			MatchLayer: string(f.MatchLayer), MatchLayerLabel: f.MatchLayer.Label(),

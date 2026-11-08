@@ -170,13 +170,19 @@ func (r *BankRepo) insertFlow(ctx context.Context, tx *Tx, importID, accountID i
 		return false, nil
 	}
 
+	// ★ 余额未知存 NULL 不存 0：对账的期初反推、余额比对
+	// 都按 balance IS NOT NULL 过滤，0 会被当成真值算出差错。
+	var balance any
+	if f.BalanceKnown {
+		balance = int64(f.Balance)
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO bank_flow (import_id, account_id, txn_date, direction, amount, balance,
 			counterparty_name, counterparty_account, summary, serial_no, dedup_hash,
 			status, match_layer, confidence, memo, raw_json, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		importID, accountID, f.TxnDate.String(), string(f.Direction),
-		int64(f.Amount), int64(f.Balance),
+		int64(f.Amount), balance,
 		f.CounterpartyName, f.CounterpartyAccount, f.Summary, f.SerialNo,
 		f.DedupKey(), string(f.Status), string(f.MatchLayer), f.Confidence,
 		f.Memo, raw, now, now)
@@ -191,7 +197,7 @@ func (r *BankRepo) insertFlow(ctx context.Context, tx *Tx, importID, accountID i
 // ---------------------------------------------------------------------------
 
 const flowColumns = `f.id, f.import_id, a.code, f.account_id, f.txn_date, f.direction,
-	f.amount, COALESCE(f.balance, 0), f.counterparty_name, f.counterparty_account,
+	f.amount, f.balance, f.counterparty_name, f.counterparty_account,
 	f.summary, f.serial_no, f.status, f.match_layer, f.confidence,
 	COALESCE(ca.code, ''), f.contact_id, f.employee_id, f.dept_id, f.project_id,
 	f.memo, f.voucher_id, f.rule_id`
@@ -274,7 +280,8 @@ func scanFlows(rows *sql.Rows) ([]*bank.Flow, error) {
 		f := &bank.Flow{}
 		var (
 			dateStr, dir, status, layer         string
-			amount, balance                     int64
+			amount                              int64
+			balance                             sql.NullInt64
 			contactID, empID, deptID, projectID sql.NullInt64
 			voucherID, ruleID                   sql.NullInt64
 		)
@@ -295,7 +302,8 @@ func scanFlows(rows *sql.Rows) ([]*bank.Flow, error) {
 		f.Status = bank.Status(status)
 		f.MatchLayer = bank.Layer(layer)
 		f.Amount = money.Money(amount)
-		f.Balance = money.Money(balance)
+		f.Balance = money.Money(balance.Int64)
+		f.BalanceKnown = balance.Valid
 		f.ContactID = toNullInt64(contactID)
 		f.EmployeeID = toNullInt64(empID)
 		f.DeptID = toNullInt64(deptID)

@@ -1072,6 +1072,9 @@ func parseTime(s string) time.Time {
 var (
 	ErrNotDraft      = errors.New("voucher: 只有草稿可以修改或删除")
 	ErrNotReversible = errors.New("voucher: 该凭证不能红字冲销")
+	// ErrGeneratedVoucher 表示这张凭证由业务单据生成，
+	// 不允许从凭证侧直接删除（会破坏单据的入账链路）。
+	ErrGeneratedVoucher = errors.New("voucher: 该凭证由业务单据生成")
 )
 
 // SaveDraft 在事务内创建或更新一张**草稿**凭证。
@@ -1254,8 +1257,31 @@ type DraftResult struct {
 // ★ 只有草稿能删。已过账的凭证**任何情况下都不能删** ——
 // 那是会计档案，只能红字冲销。删除会让凭证号断号、
 // 让已上报的报表失去可追溯的对应关系。
-func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64) error {
-	return r.db.WithTx(ctx, func(tx *Tx) error {
+// DeleteResult 是删除一张草稿的附带信息：解除了哪些单据关联。
+type DeleteResult struct {
+	UnlinkedInvoice     int // 发票 booked→verified/pending
+	UnlinkedClaim       int // 报销单 posted→approved
+	UnlinkedFlow        int // 银行流水 posted→matched
+	UnlinkedDepreciate  int // 固定资产计提行
+	UnlinkedAmortize    int // 摊销行
+	UnlinkedAISuggest   int // AI 建议终稿引用
+}
+
+// DeleteDraft 删除一张草稿凭证。
+//
+// ★ 只有草稿能删。已过账的凭证**任何情况下都不能删** ——
+// 那是会计档案，只能红字冲销。删除会让凭证号断号、
+// 让已上报的报表失去可追溯的对应关系。
+//
+// ★ 生成它的单据要一起解开 —— invoice/expense_claim/bank_flow
+// 等表都 REFERENCES voucher(id) 且没有级联动作：只删凭证
+// 会撞外键约束，单据还永远停在「已入账」。删除草稿的含义就是
+// 「撤销入账」——单据退回生成凭证前的状态，可以重新生成。
+// 工资单生成的凭证例外：删除它会留下「已计提发放却查无凭证」
+// 的工资单，代价太大，直接拒绝。
+func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64) (*DeleteResult, error) {
+	res := &DeleteResult{}
+	err := r.db.WithTx(ctx, func(tx *Tx) error {
 		var status string
 		if err := tx.QueryRow(ctx,
 			`SELECT status FROM voucher WHERE id = ?`, id).Scan(&status); err != nil {
@@ -1264,6 +1290,70 @@ func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64) error {
 		if voucher.Status(status) != voucher.StatusDraft {
 			return fmt.Errorf("%w（当前状态 %s）", ErrNotDraft, status)
 		}
+
+		// 工资凭证不让从凭证页删：计提/发放两张凭证是工资单的
+		// 入账载体，删掉一张工资单就变成「已入账但缺半套凭证」。
+		// 工资侧有专门的生命周期管理，请到工资页处理。
+		var payrollRef int
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM salary_run
+			 WHERE accrual_voucher_id = ? OR payment_voucher_id = ?`,
+			id, id).Scan(&payrollRef); err != nil {
+			return translateErr(err)
+		}
+		if payrollRef > 0 {
+			return fmt.Errorf("%w: 该凭证由工资单生成，请到工资页处理",
+				ErrGeneratedVoucher)
+		}
+
+		affect := func(q string, args ...any) (int, error) {
+			r2, err := tx.Exec(ctx, q, args...)
+			if err != nil {
+				return 0, translateErr(err)
+			}
+			n, _ := r2.RowsAffected()
+			return int(n), nil
+		}
+		var err error
+		// 发票 booked 回生成前一态：专票回「已认证」（生成凭证要求
+		// 已认证，见 PostInvoice），其余回「未认证」。
+		if res.UnlinkedInvoice, err = affect(`
+			UPDATE invoice SET voucher_id = NULL, updated_at = ?,
+				status = CASE WHEN kind IN ('special','e_special')
+				              THEN 'verified' ELSE 'pending' END
+			 WHERE voucher_id = ?`, nowString(), id); err != nil {
+			return err
+		}
+		// 报销单 posted → approved（BuildEntries 只允许 approved，
+		// 上一态确定）。
+		if res.UnlinkedClaim, err = affect(`
+			UPDATE expense_claim SET voucher_id = NULL, status = 'approved',
+				updated_at = ? WHERE voucher_id = ?`, nowString(), id); err != nil {
+			return err
+		}
+		// 银行流水 posted → matched（PostFlows 要求 matched）。
+		if res.UnlinkedFlow, err = affect(`
+			UPDATE bank_flow SET voucher_id = NULL, status = 'matched',
+				updated_at = ? WHERE voucher_id = ?`, nowString(), id); err != nil {
+			return err
+		}
+		// 固定资产计提/摊销行：回可重新生成态。
+		if res.UnlinkedDepreciate, err = affect(`
+			UPDATE asset_depreciation SET voucher_id = NULL
+			 WHERE voucher_id = ?`, id); err != nil {
+			return err
+		}
+		if res.UnlinkedAmortize, err = affect(`
+			UPDATE amortization_entry SET voucher_id = NULL
+			 WHERE voucher_id = ?`, id); err != nil {
+			return err
+		}
+		if res.UnlinkedAISuggest, err = affect(`
+			UPDATE ai_suggestion SET final_voucher_id = NULL
+			 WHERE final_voucher_id = ?`, id); err != nil {
+			return err
+		}
+
 		// ★ 附件关联也要一起删。
 		//
 		// attachment 的外键指向 voucher(id)，但 owner_id 是多态的、
@@ -1283,6 +1373,10 @@ func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // Reverse 对一张已过账凭证做红字冲销，返回冲销凭证的 id 与号。

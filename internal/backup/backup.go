@@ -264,7 +264,14 @@ type RestoreResult struct {
 // 恢复前会把现有 db 与附件目录整体**改名暂存**而不是删除：
 // 万一恢复过程中失败（磁盘满、归档损坏），可以把原来的账套放回去。
 // 用户的数据比磁盘空间值钱得多。
-func Restore(ctx context.Context, archivePath, dbPath, filesDir string) (res *RestoreResult, err error) {
+//
+// verify 是新库落位后的「能打开」验证（只读，不写库）——
+// 恢复一个比本程序新的备份、或归档里的库本身损坏时，
+// 在这里就把原账套放回去，而不是等调用方 Open 失败，
+// 让用户对着一个已进暂存目录的账套干瞪眼。
+// 传 nil 跳过（调用方都应传）。
+func Restore(ctx context.Context, archivePath, dbPath, filesDir string,
+	verify func(ctx context.Context, dbPath string) error) (res *RestoreResult, err error) {
 	zr, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: 打开 %s: %v", ErrBadArchive, archivePath, err)
@@ -395,6 +402,14 @@ func Restore(ctx context.Context, archivePath, dbPath, filesDir string) (res *Re
 		return nil, fmt.Errorf("backup: 写回账套数据库: %w", err)
 	}
 	res.DBRestored = true
+
+	// ★ 新库先验证能打开再解附件 —— 这步失败也要回滚，
+	// 所以必须在 success 置位之前做。
+	if verify != nil {
+		if err := verify(ctx, dbPath); err != nil {
+			return nil, fmt.Errorf("backup: 恢复的账套无法打开: %w", err)
+		}
+	}
 
 	// 4) 解压附件（逐个校验 sha256）
 	//

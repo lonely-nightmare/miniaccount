@@ -263,6 +263,54 @@ func (s *Service) PostInvoice(ctx context.Context, id int64,
 	return &v, nil
 }
 
+// VerifyInvoice 把一张进项专票标记为「已认证」。
+//
+// ★ 这个动作必须真实存在：进项抵扣的账务前提是发票已在税局
+// 勾选确认，生成凭证会校验「已认证」状态（见 PostInvoice 的
+// 认证门）。没有这一步，所有进项专票会永远卡在「未认证」，
+// 一张凭证也生成不出来。
+//
+// 只有**进项**且**可抵扣票种**需要认证 —— 销项票、普票的
+// 税额本来就不进进项科目，认证动作对它们没有意义。
+func (s *Service) VerifyInvoice(ctx context.Context, id int64, operator string) (*InvoiceView, error) {
+	if strings.TrimSpace(operator) == "" {
+		return nil, fmt.Errorf("请填写操作人")
+	}
+	inv, err := s.db.Invoices().GetInvoice(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if inv.Direction != invoice.DirInput || !inv.Kind.Deductible() {
+		return nil, fmt.Errorf("%w: 只有进项专用发票需要认证", invoice.ErrBadStatus)
+	}
+	if inv.Status != invoice.StatusPending {
+		return nil, fmt.Errorf("%w: 当前状态 %s，只有「未认证」的专票可以认证",
+			invoice.ErrBadStatus, inv.Status.Label())
+	}
+	if err := s.db.Invoices().UpdateInvoiceStatus(ctx, id, invoice.StatusVerified); err != nil {
+		return nil, err
+	}
+	s.recordAudit(ctx, AuditEvent{
+		Action: audit.ActionInvoiceVerify,
+		Summary: fmt.Sprintf("认证发票 %s", inv.Identity()),
+		Entity: "invoice", EntityID: fmt.Sprintf("%d", id),
+		Operator: strings.TrimSpace(operator),
+		Detail: map[string]any{
+			"发票": inv.Identity(), "状态": "未认证 → 已认证",
+		},
+	})
+	got, err := s.db.Invoices().GetInvoice(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	vnos, err := s.voucherNos(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v := toInvoiceView(got, vnos)
+	return &v, nil
+}
+
 // InvoiceSummaryView 是发票汇总。
 type InvoiceSummaryView struct {
 	Count       int         `json:"count"`

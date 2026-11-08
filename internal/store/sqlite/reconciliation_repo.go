@@ -247,12 +247,20 @@ func (r *ReconciliationRepo) bankOpening(ctx context.Context, q Querier,
 func (r *ReconciliationRepo) flowsNotBooked(ctx context.Context, q Querier,
 	accountID int64, from, asOf calendar.Date, dir string) ([]reconciliation.Item, error) {
 
+	// ★ 流水生成了凭证但凭证还是草稿时，流水仍是未达账项：
+	// 草稿没过账、账面余额没变，把它从未达里提前摘掉，
+	// 调节表就少了一笔真实的未达。
+	// voucher_id 已回填只能说明「凭证已生成」，账面要等结账过账才变。
 	rows, err := q.Query(ctx, `
-		SELECT txn_date, summary, counterparty_name, amount, COALESCE(serial_no, '')
-		  FROM bank_flow
-		 WHERE account_id = ? AND direction = ? AND txn_date >= ? AND txn_date <= ?
-		   AND voucher_id IS NULL AND status <> 'ignored'
-		 ORDER BY txn_date, id`, accountID, dir, from.String(), asOf.String())
+		SELECT f.txn_date, f.summary, f.counterparty_name, f.amount,
+			COALESCE(f.serial_no, '')
+		  FROM bank_flow f
+		  LEFT JOIN voucher v ON v.id = f.voucher_id
+		 WHERE f.account_id = ? AND f.direction = ?
+		   AND f.txn_date >= ? AND f.txn_date <= ?
+		   AND (f.voucher_id IS NULL OR v.status = 'draft')
+		   AND f.status <> 'ignored'
+		 ORDER BY f.txn_date, f.id`, accountID, dir, from.String(), asOf.String())
 	if err != nil {
 		return nil, translateErr(err)
 	}

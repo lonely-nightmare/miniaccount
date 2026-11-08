@@ -78,7 +78,11 @@ func (f *payrollFixture) buildAndSave(t *testing.T, year, month int,
 	if err != nil {
 		t.Fatalf("生成工资单失败: %v", err)
 	}
-	id, err := f.DB.Payroll().SaveRun(ctx, run)
+	saveRes, err := f.DB.Payroll().SaveRun(ctx, run)
+	id := int64(0)
+	if saveRes != nil {
+		id = saveRes.ID
+	}
 	if err != nil {
 		t.Fatalf("保存工资单失败: %v", err)
 	}

@@ -512,3 +512,61 @@ func TestReconciliationOpeningDiffDiagnosesGap(t *testing.T) {
 		t.Errorf("期初不一致时 Check 不应报程序性错误: %v", errs)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 体检问题 5：余额列缺失 & 草稿流水的未达口径
+// ---------------------------------------------------------------------------
+
+// 对账单没有余额列时，余额是「未知」（NULL），不是 0 元。
+// 修前把未知存成 0，期初反推拿它当真值 → 调节表凭空判不平。
+func TestReconciliationNoBalanceColumn(t *testing.T) {
+	ctx := context.Background()
+	f := setupReconciliation(t)
+
+	// 无「余额」列的对账单
+	f.importStatement(t, `交易日期,摘要,对方户名,对方账号,借贷标志,交易金额
+2025-09-03,转账,张三,6222020000000001,收入,"50,000.00"
+2025-09-10,办公用品,杭州某某办公用品有限公司,6222020000000002,支出,"3,000.00"
+`)
+
+	flows, err := f.book.DB.Bank().ListFlows(ctx, "", calendar.Date{}, calendar.Date{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(flows) != 2 {
+		t.Fatalf("流水 = %d 条，期望 2", len(flows))
+	}
+	for _, fl := range flows {
+		if fl.BalanceKnown {
+			t.Errorf("流水 %s 的余额应是未知，却标成了已知 %s", fl.Summary, fl.Balance)
+		}
+	}
+
+	// 手工给银行期末余额：账面 100,000 + 50,000 − 3,000 = 147,000（草稿未过账）
+	f.matchAll(t)
+	ids := make([]int64, 0, len(flows))
+	for _, fl := range flows {
+		ids = append(ids, fl.ID)
+	}
+	// PostFlows 生成的是草稿凭证，不要 postDrafts ——
+	// 正是要测「voucher_id 已回填但凭证还没过账」这个中间态。
+	res, err := f.book.DB.Bank().PostFlows(ctx, ids, "李会计", time.Now())
+	if err != nil || res.Created != len(ids) {
+		t.Fatalf("生成流水凭证失败: %v / %+v", err, res.Failures)
+	}
+
+	manualBal := money.Money(14_700_000)
+	rep, err := f.book.DB.Reconciliation().BuildReconciliation(ctx, "100201", reconAsOf, &manualBal)
+	if err != nil {
+		t.Fatalf("生成调节表失败: %v", err)
+	}
+	// 两条流水的凭证都还是草稿：没进总账，应全部在未达里，
+	// 而不是像修前那样「voucher_id 非空 → 提前从未达消失」。
+	if len(rep.BankReceivedNotBooked) != 1 || len(rep.BankPaidNotBooked) != 1 {
+		t.Fatalf("草稿流水应在未达账项里（收 %d 笔 / 付 %d 笔，期望各 1）",
+			len(rep.BankReceivedNotBooked), len(rep.BankPaidNotBooked))
+	}
+	if !rep.Balanced() {
+		t.Errorf("草稿口径一致时应平衡，实际差 %s", rep.Difference())
+	}
+}

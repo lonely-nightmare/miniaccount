@@ -330,6 +330,8 @@ export function VATReference():Promise<service.VATReferenceInfo>;
 
 export function VerifyAuditLog():Promise<audit.VerifyResult>;
 
+export function VerifyInvoice(arg1:main.VerifyInvoiceRequest):Promise<service.InvoiceView>;
+
 export function VoidAmortization(arg1:main.VoidAmortizationRequest):Promise<service.AmortizationView>;
 
 export function VoidTaxFiling(arg1:main.VoidTaxFilingRequest):Promise<service.TaxFilingListView>;

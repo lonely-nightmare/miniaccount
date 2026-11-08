@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -498,10 +499,28 @@ func payrollPeriodKey(k period.Key) payroll.PeriodKey {
 // 保存 / 读取工资单
 // ---------------------------------------------------------------------------
 
+// SaveRunResult 是保存工资单的结果。
+type SaveRunResult struct {
+	ID int64
+	// Recalced 是联动重算过的后续月份（"2025-02"…）。
+	//
+	// 个税是年度累计预扣：任何一月重算后，其后各月的累计税基都变了。
+	// 不联动，后续月份（含已生成的凭证草稿）就永远带着旧税。
+	Recalced []string
+	// Warnings 是级联中的非致命提示（某月重算失败、凭证非草稿等）。
+	Warnings []string
+}
+
 // SaveRun 保存工资单（草稿可覆盖，已确认/已过账不可改）。
-func (r *PayrollRepo) SaveRun(ctx context.Context, run *payroll.Run) (int64, error) {
+//
+// 提交后会**级联重算**同年后续月份已存在的工资单：
+// 先存本月，再按月份顺序逐月重算 —— 每步提交后下月就能读到
+// 新的累计数，单连接下这是唯一能顺序传播的方式。
+// 某月重算失败即停止级联并在 Warnings 里说明卡在哪月
+// （其后月份的累计基准已不可信，继续算只会算出更错的结果）。
+func (r *PayrollRepo) SaveRun(ctx context.Context, run *payroll.Run) (*SaveRunResult, error) {
 	if err := run.Validate(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	var id int64
 	err := r.db.WithTx(ctx, func(tx *Tx) error {
@@ -518,15 +537,9 @@ func (r *PayrollRepo) SaveRun(ctx context.Context, run *payroll.Run) (int64, err
 					ErrRunNotDraft, run.Period.Year, run.Period.Month,
 					payroll.RunStatus(status).Label())
 			}
-			// 覆盖草稿：先删明细
-			if _, err := tx.Exec(ctx, `DELETE FROM salary_item WHERE run_id = ?`, existingID); err != nil {
-				return err
-			}
 			id = existingID
-			if _, err := tx.Exec(ctx, `
-				UPDATE salary_run SET status = ?, tax_table_json = ?, updated_at = ?
-				 WHERE id = ?`,
-				string(run.Status), mustJSON(run.TaxTable), nowString(), id); err != nil {
+			run.ID = id
+			if err := r.rewriteRunTx(ctx, tx, run); err != nil {
 				return err
 			}
 		case err == sql.ErrNoRows:
@@ -548,25 +561,225 @@ func (r *PayrollRepo) SaveRun(ctx context.Context, run *payroll.Run) (int64, err
 			if err != nil {
 				return err
 			}
+			for i, it := range run.Items {
+				if err := r.insertSalaryItem(ctx, tx, id, i+1, it); err != nil {
+					return err
+				}
+			}
 		default:
 			return translateErr(err)
 		}
 		run.ID = id
-
-		empIDs, err := r.db.Accounts().IDsByCodeTx(ctx, tx)
-		if err != nil {
-			return err
-		}
-		_ = empIDs
-
-		for i, it := range run.Items {
-			if err := r.insertSalaryItem(ctx, tx, id, i+1, it); err != nil {
-				return err
-			}
-		}
 		return nil
 	})
-	return id, err
+	if err != nil {
+		return nil, err
+	}
+	res := &SaveRunResult{ID: id}
+	r.cascadeAfter(ctx, run.Period.Year, run.Period.Month, res)
+	return res, nil
+}
+
+// rewriteRunTx 用 run 的内容覆盖已存在的工资单（删明细、改汇总、
+// 重写明细）。状态列按 run.Status 写——调用方负责摆对状态。
+//
+// ★ 汇总列必须跟着明细一起写。
+// 原来 UPDATE 只写 status/tax_table_json/updated_at，
+// total_gross 等只在 INSERT 时落 —— 草稿重算覆盖后，
+// 工资列表显示的永远是最初那版合计。
+func (r *PayrollRepo) rewriteRunTx(ctx context.Context, tx *Tx, run *payroll.Run) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM salary_item WHERE run_id = ?`, run.ID); err != nil {
+		return err
+	}
+	t := run.Totals()
+	if _, err := tx.Exec(ctx, `
+		UPDATE salary_run SET status = ?, tax_table_json = ?,
+			total_gross = ?, total_iit = ?, total_si_self = ?,
+			total_si_company = ?, total_net = ?, headcount = ?, updated_at = ?
+		 WHERE id = ?`,
+		string(run.Status), mustJSON(run.TaxTable),
+		int64(t.Gross), int64(t.IIT), int64(t.InsuranceSelf),
+		int64(t.InsuranceCompany), int64(t.Net), t.Headcount,
+		nowString(), run.ID); err != nil {
+		return err
+	}
+	for i, it := range run.Items {
+		if err := r.insertSalaryItem(ctx, tx, run.ID, i+1, it); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cascadeAfter 联动重算 year/month 之后同年已存在的工资单，
+// 结果（重算月份、警告）写进 res。
+func (r *PayrollRepo) cascadeAfter(ctx context.Context, year, month int, res *SaveRunResult) {
+	rows, err := r.db.sql.QueryContext(ctx, `
+		SELECT id, month FROM salary_run WHERE year = ? AND month > ?
+		 ORDER BY month`, year, month)
+	if err != nil {
+		res.Warnings = append(res.Warnings, "后续月份级联检查失败: "+err.Error())
+		return
+	}
+	type later struct {
+		id    int64
+		month int
+	}
+	var laters []later
+	for rows.Next() {
+		var l later
+		if rows.Scan(&l.id, &l.month) == nil {
+			laters = append(laters, l)
+		}
+	}
+	rows.Close()
+
+	for _, l := range laters {
+		label := fmt.Sprintf("%d-%02d", year, l.month)
+		warns, err := r.recascadeRun(ctx, l.id)
+		res.Warnings = append(res.Warnings, warns...)
+		if err != nil {
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("%s 月重算失败：%v（其后月份未联动）", label, err))
+			return
+		}
+		res.Recalced = append(res.Recalced, label)
+	}
+}
+
+// recascadeRun 重算一张已存在的工资单并落库；若它有仍是草稿的
+// 计提/发放凭证，凭证分录一并重生成。返回非致命警告。
+func (r *PayrollRepo) recascadeRun(ctx context.Context, runID int64) ([]string, error) {
+	run, err := r.loadRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	// 用已存明细当输入重算：手工调整的基数/扣除/社保覆盖都
+	// 持久化在 salary_item 行里，喂回去不会丢；
+	// 人员构成保持原样（不增不删）。
+	amounts := map[int64]*payroll.Item{}
+	empIDs := make([]int64, 0, len(run.Items))
+	for _, it := range run.Items {
+		amounts[it.EmployeeID] = it
+		empIDs = append(empIDs, it.EmployeeID)
+	}
+	rebuilt, err := r.BuildRun(ctx, BuildRunInput{
+		Period:             period.NewKey(run.Period.Year, run.Period.Month),
+		CreatedBy:          run.CreatedBy,
+		Amounts:            amounts,
+		IncludeEmployeeIDs: empIDs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	rebuilt.ID = run.ID
+	rebuilt.Status = run.Status // 草稿还是已过账都保持原状态
+
+	var warns []string
+	if len(rebuilt.Items) != len(run.Items) {
+		warns = append(warns, fmt.Sprintf(
+			"%d-%02d 月有 %d 名人员不再计入（离职或档案删除），已按 %d 人重算",
+			run.Period.Year, run.Period.Month,
+			len(run.Items)-len(rebuilt.Items), len(rebuilt.Items)))
+	}
+
+	// 查该 run 关联的两张凭证
+	var accID, payID sql.NullInt64
+	if err := r.db.sql.QueryRowContext(ctx, `
+		SELECT accrual_voucher_id, payment_voucher_id
+		  FROM salary_run WHERE id = ?`, runID).Scan(&accID, &payID); err != nil {
+		return warns, translateErr(err)
+	}
+
+	// 凭证科目与分录必须在事务外算好：它们要查 db.sql，
+	// 单连接下放进事务里就是死锁。
+	vc, err := r.VoucherAccounts(ctx)
+	if err != nil {
+		return warns, err
+	}
+	accrualEntries, err := rebuilt.BuildAccrualEntries(vc)
+	if err != nil {
+		return warns, err
+	}
+	paymentEntries, err := rebuilt.BuildPaymentEntries(vc)
+	if err != nil {
+		return warns, err
+	}
+
+	err = r.db.WithTx(ctx, func(tx *Tx) error {
+		if err := r.rewriteRunTx(ctx, tx, rebuilt); err != nil {
+			return err
+		}
+		regen := func(voucherID sql.NullInt64, entries []payroll.Entry) error {
+			if !voucherID.Valid {
+				return nil
+			}
+			if err := r.regenPayrollVoucherTx(ctx, tx, voucherID.Int64,
+				rebuilt, entries); err != nil {
+				if errors.Is(err, errVoucherNotDraft) {
+					warns = append(warns, fmt.Sprintf(
+						"%d-%02d 月的凭证 #%d 已不是草稿，未重生成",
+						run.Period.Year, run.Period.Month, voucherID.Int64))
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
+		if err := regen(accID, accrualEntries); err != nil {
+			return err
+		}
+		return regen(payID, paymentEntries)
+	})
+	return warns, err
+}
+
+var errVoucherNotDraft = errors.New("voucher: 凭证已不是草稿")
+
+// regenPayrollVoucherTx 用重算后的分录覆写一张仍是草稿的工资凭证。
+// 凭证已不是草稿时返回 errVoucherNotDraft（调用方降级为警告）。
+func (r *PayrollRepo) regenPayrollVoucherTx(ctx context.Context, tx *Tx,
+	voucherID int64, run *payroll.Run, entries []payroll.Entry) error {
+
+	var st string
+	if err := tx.QueryRow(ctx,
+		`SELECT status FROM voucher WHERE id = ?`, voucherID).Scan(&st); err != nil {
+		return translateErr(err)
+	}
+	if st != string(voucher.StatusDraft) {
+		return errVoucherNotDraft
+	}
+	old, err := loadVoucherTx(ctx, tx, voucherID)
+	if err != nil {
+		return err
+	}
+	// 凭证载体原样保留（凭证字/日期/制单人/备注/来源），只换分录。
+	vc, err := voucher.New(old.Word, old.BizDate, old.CreatedBy)
+	if err != nil {
+		return err
+	}
+	vc.ID = voucherID
+	vc.Source = voucher.SourceSalary
+	runID := run.ID
+	vc.SourceID = &runID
+	vc.Remark = old.Remark
+	for _, e := range entries {
+		if err := vc.AddEntry(ledger.Entry{
+			AccountCode: e.AccountCode, Summary: e.Summary,
+			Debit: e.Debit, Credit: e.Credit,
+			Aux: ledger.Aux{
+				ContactID:  e.ContactID,
+				EmployeeID: e.EmployeeID,
+				DeptID:     e.DeptID,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	_, err = r.db.Vouchers().SaveDraftInTx(ctx, tx, DraftInput{
+		Voucher: vc, CreatedBy: old.CreatedBy, Generated: true,
+	})
+	return err
 }
 
 func (r *PayrollRepo) insertSalaryItem(ctx context.Context, tx *Tx,
@@ -723,11 +936,20 @@ func (r *PayrollRepo) PostRun(ctx context.Context, runID int64,
 		}
 		res.PaymentVoucherID, res.PaymentNo = pay.VoucherID, pay.No
 
-		_, err = tx.Exec(ctx, `
+		// ★ WHERE status='draft' 是并发防线：与 PostInvoice 同理，
+		// 两个连接同时过账同一工资单时，后到者拿 0 行回滚，
+		// 不会留下第二套计提/发放草稿。
+		res2, err := tx.Exec(ctx, `
 			UPDATE salary_run SET status = 'posted', accrual_voucher_id = ?,
-				payment_voucher_id = ?, updated_at = ? WHERE id = ?`,
+				payment_voucher_id = ?, updated_at = ? WHERE id = ? AND status = 'draft'`,
 			res.AccrualVoucherID, res.PaymentVoucherID, nowString(), runID)
-		return err
+		if err != nil {
+			return err
+		}
+		if n, _ := res2.RowsAffected(); n == 0 {
+			return fmt.Errorf("%w: 工资单已过账", ErrRunNotDraft)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

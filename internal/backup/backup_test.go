@@ -328,7 +328,7 @@ func TestRestoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := Restore(context.Background(), dest, f.DBPath, f.FilesDir)
+	res, err := Restore(context.Background(), dest, f.DBPath, f.FilesDir, nil)
 	if err != nil {
 		t.Fatalf("恢复失败: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestRestoreIntoEmptyLocationLeavesNoStash(t *testing.T) {
 	dbPath := filepath.Join(dir, "fresh.db")
 	filesDir := filepath.Join(dir, "fresh.files")
 
-	res, err := Restore(context.Background(), dest, dbPath, filesDir)
+	res, err := Restore(context.Background(), dest, dbPath, filesDir, nil)
 	if err != nil {
 		t.Fatalf("恢复到空位置失败: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestRestoreStashesExisting(t *testing.T) {
 	db.Exec(`INSERT INTO voucher VALUES (99, '记-2025-09-0099', '2025-09-30')`)
 	db.Close()
 
-	res, err := Restore(context.Background(), dest, f.DBPath, f.FilesDir)
+	res, err := Restore(context.Background(), dest, f.DBPath, f.FilesDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func TestRestoreDetectsCorruptAttachment(t *testing.T) {
 	corruptArchive(t, dest, f)
 
 	target := filepath.Join(f.Dir, "restored.db")
-	_, err := Restore(context.Background(), dest, target, filepath.Join(f.Dir, "restored.files"))
+	_, err := Restore(context.Background(), dest, target, filepath.Join(f.Dir, "restored.files"), nil)
 	if !errors.Is(err, ErrChecksumFail) {
 		t.Fatalf("附件损坏应报 ErrChecksumFail，得到 %v", err)
 	}
@@ -487,7 +487,7 @@ func TestRestoreBadArchive(t *testing.T) {
 	// 不是 zip
 	notZip := filepath.Join(dir, "notzip.mabak")
 	os.WriteFile(notZip, []byte("this is not a zip"), 0o644)
-	if _, err := Restore(context.Background(), notZip, filepath.Join(dir, "a.db"), ""); !errors.Is(err, ErrBadArchive) {
+	if _, err := Restore(context.Background(), notZip, filepath.Join(dir, "a.db"), "", nil); !errors.Is(err, ErrBadArchive) {
 		t.Errorf("非 zip 应报 ErrBadArchive，得到 %v", err)
 	}
 
@@ -499,7 +499,7 @@ func TestRestoreBadArchive(t *testing.T) {
 	w.Write([]byte("x"))
 	zw.Close()
 	fh.Close()
-	if _, err := Restore(context.Background(), noManifest, filepath.Join(dir, "b.db"), ""); !errors.Is(err, ErrBadArchive) {
+	if _, err := Restore(context.Background(), noManifest, filepath.Join(dir, "b.db"), "", nil); !errors.Is(err, ErrBadArchive) {
 		t.Errorf("缺 manifest 应报 ErrBadArchive，得到 %v", err)
 	}
 }
@@ -518,7 +518,7 @@ func TestRestoreRejectsNewerFormat(t *testing.T) {
 	zw.Close()
 	fh.Close()
 
-	_, err := Restore(context.Background(), dest, filepath.Join(dir, "x.db"), "")
+	_, err := Restore(context.Background(), dest, filepath.Join(dir, "x.db"), "", nil)
 	if !errors.Is(err, ErrVersionTooNew) {
 		t.Fatalf("应报 ErrVersionTooNew，得到 %v", err)
 	}

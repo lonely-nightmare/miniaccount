@@ -523,7 +523,8 @@ func (s *Service) DeleteVoucher(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	if err := s.db.Vouchers().DeleteDraft(ctx, id); err != nil {
+	delRes, err := s.db.Vouchers().DeleteDraft(ctx, id)
+	if err != nil {
 		return err
 	}
 	detail := map[string]any{
@@ -541,6 +542,21 @@ func (s *Service) DeleteVoucher(ctx context.Context, id int64) error {
 		})
 	}
 	detail["被删除的分录"] = lines
+	// 删除草稿会顺带把生成它的单据退回生成前状态
+	// （发票回已认证、报销回已审批、流水回已匹配……）——
+	// 用户得知道删的不只是一张凭证。
+	if delRes != nil {
+		unlinks := map[string]int{
+			"发票": delRes.UnlinkedInvoice, "报销单": delRes.UnlinkedClaim,
+			"银行流水": delRes.UnlinkedFlow, "计提行": delRes.UnlinkedDepreciate,
+			"摊销行": delRes.UnlinkedAmortize,
+		}
+		for k, n := range unlinks {
+			if n > 0 {
+				detail["解除关联:"+k] = n
+			}
+		}
+	}
 	s.recordAudit(ctx, AuditEvent{
 		Action:  audit.ActionVoucherDelete,
 		Summary: "删除凭证草稿 " + firstNonEmpty(before.No, "#"+strconv.FormatInt(id, 10)),
@@ -664,13 +680,37 @@ func (s *Service) ReverseVoucher(ctx context.Context, id int64, by, date string)
 		}
 		bizDate = d
 	}
+	orig, err := s.Voucher(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	res, err := s.db.Vouchers().Reverse(ctx, sqlite.ReverseInput{
 		VoucherID: id, By: strings.TrimSpace(by), BizDate: bizDate, At: time.Now(),
 	})
 	if err != nil {
 		return nil, err
 	}
-	return s.Voucher(ctx, res.VoucherID)
+	det, err := s.Voucher(ctx, res.VoucherID)
+	if err != nil {
+		return nil, err
+	}
+	// ★ 冲销是改账动作，成功也必须进操作日志：
+	// 凭证上虽然留着 voided_by 的追溯关系，但「谁在什么时候
+	// 冲销了哪张凭证」是审计要单独回答的问题。
+	s.recordAudit(ctx, AuditEvent{
+		Action: audit.ActionVoucherReverse,
+		Summary: fmt.Sprintf("冲销凭证 %s", orig.No),
+		Entity: "voucher", EntityID: fmt.Sprintf("%d", id),
+		Operator: strings.TrimSpace(by),
+		Detail: map[string]any{
+			"原凭证号":  orig.No,
+			"原凭证ID": id,
+			"冲销凭证号": det.No,
+			"冲销凭证ID": res.VoucherID,
+			"冲销日期":  det.Date,
+		},
+	})
+	return det, nil
 }
 
 // ---------------------------------------------------------------------------

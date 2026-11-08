@@ -73,7 +73,7 @@ func TestRestoreRejectsPathTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := Restore(context.Background(), archive, filepath.Join(dir, "book.db"), filesDir)
+	_, err := Restore(context.Background(), archive, filepath.Join(dir, "book.db"), filesDir, nil)
 	if !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("应报 ErrUnsafePath，得到 %v", err)
 	}
@@ -143,7 +143,7 @@ func TestRestoreRollsBackOnFailure(t *testing.T) {
 		filesPrefix + "aa/bb": []byte("附件内容与校验和不符"),
 	})
 
-	_, err := Restore(context.Background(), archive, dbPath, filesDir)
+	_, err := Restore(context.Background(), archive, dbPath, filesDir, nil)
 	if !errors.Is(err, ErrChecksumFail) {
 		t.Fatalf("应报 ErrChecksumFail，得到 %v", err)
 	}
@@ -194,7 +194,7 @@ func TestRestoreKeepsOneStashOfPreviousBook(t *testing.T) {
 		}
 		db.Close()
 
-		if _, err := Restore(context.Background(), dest, f.DBPath, f.FilesDir); err != nil {
+		if _, err := Restore(context.Background(), dest, f.DBPath, f.FilesDir, nil); err != nil {
 			t.Fatalf("第 %d 次恢复失败: %v", i, err)
 		}
 	}
@@ -254,7 +254,7 @@ func TestRestoreRejectsBeforeTouchingBook(t *testing.T) {
 		Files:         map[string]string{"../x": ""},
 	}, map[string][]byte{filesPrefix + "../x": []byte("x")})
 
-	if _, err := Restore(context.Background(), archive, dbPath, filesDir); !errors.Is(err, ErrUnsafePath) {
+	if _, err := Restore(context.Background(), archive, dbPath, filesDir, nil); !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("应报 ErrUnsafePath，得到 %v", err)
 	}
 	// 账套一个字节都不该被动过，也不该出现暂存目录
@@ -288,7 +288,7 @@ func TestRestoreRejectsMissingOrBadDBHash(t *testing.T) {
 			FormatVersion: FormatVersion, DBSHA256: h,
 		}, map[string][]byte{dbName: []byte("NOT A DATABASE")})
 
-		_, err := Restore(context.Background(), archive, dbPath, filesDir)
+		_, err := Restore(context.Background(), archive, dbPath, filesDir, nil)
 		if err == nil {
 			t.Fatalf("指纹 %q 应被拒绝，却返回成功", h)
 		}
@@ -329,7 +329,7 @@ func TestRestoreRollsBackEvenOnPanicPath(t *testing.T) {
 		filesPrefix + "aa/bb": []byte("内容与校验和不符"),
 	})
 
-	if _, err := Restore(context.Background(), archive, dbPath, filesDir); err == nil {
+	if _, err := Restore(context.Background(), archive, dbPath, filesDir, nil); err == nil {
 		t.Fatal("应报错")
 	}
 	// 关键：账套必须在原路径上，而不是只剩在暂存目录里

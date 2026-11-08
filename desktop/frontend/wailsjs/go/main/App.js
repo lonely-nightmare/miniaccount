@@ -650,6 +650,10 @@ export function VerifyAuditLog() {
   return window['go']['main']['App']['VerifyAuditLog']();
 }
 
+export function VerifyInvoice(arg1) {
+  return window['go']['main']['App']['VerifyInvoice'](arg1);
+}
+
 export function VoidAmortization(arg1) {
   return window['go']['main']['App']['VoidAmortization'](arg1);
 }

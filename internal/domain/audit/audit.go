@@ -140,8 +140,9 @@ const (
 	// 业务单据
 	ActionBankImport  Action = "bank.import"
 	ActionBankPost    Action = "bank.post"
-	ActionInvoiceSave Action = "invoice.save"
-	ActionInvoicePost Action = "invoice.post"
+	ActionInvoiceSave   Action = "invoice.save"
+	ActionInvoiceVerify Action = "invoice.verify"
+	ActionInvoicePost   Action = "invoice.post"
 	ActionClaimSave   Action = "claim.save"
 	ActionClaimPost   Action = "claim.post"
 	ActionClaimReject Action = "claim.reject"
@@ -235,8 +236,9 @@ var actionLabels = map[Action]string{
 
 	ActionBankImport:  "导入银行流水",
 	ActionBankPost:    "银行流水生成凭证",
-	ActionInvoiceSave: "维护发票",
-	ActionInvoicePost: "发票生成凭证",
+	ActionInvoiceSave:   "维护发票",
+	ActionInvoiceVerify: "发票认证",
+	ActionInvoicePost:   "发票生成凭证",
 	ActionClaimSave:   "维护报销单",
 	ActionClaimPost:   "报销单生成凭证",
 	ActionClaimReject: "驳回报销单",

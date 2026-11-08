@@ -1019,7 +1019,8 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		}
 		dbPath = curPath
 	}
-	filesDir := filepath.Join(filepath.Dir(dbPath), ".files")
+	filesDir := filepath.Join(filepath.Dir(dbPath),
+		strings.TrimSuffix(filepath.Base(dbPath), filepath.Ext(dbPath))+".files")
 
 	// 关掉当前连接再动文件：先把指针摘掉，后到的调用
 	// 直接报「未打开账套」，而不是打到一个半关的连接上。
@@ -1029,7 +1030,8 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		_ = cur.Shutdown()
 	}
 
-	res, rerr := backup.Restore(a.context(), req.Archive, dbPath, filesDir)
+	res, rerr := backup.Restore(a.context(), req.Archive, dbPath, filesDir,
+		sqlite.VerifyOpenable)
 	if rerr != nil {
 		// 恢复失败后把原来的账套重新打开，让用户至少还能用
 		if curPath != "" {

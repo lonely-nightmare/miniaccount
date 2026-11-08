@@ -191,6 +191,10 @@ func TestEndToEndFullCycle(t *testing.T) {
 	if inv.DeductibleTax != money100(390) {
 		t.Errorf("可抵扣税额 = %s，期望 390.00", inv.DeductibleTax)
 	}
+	// 进项专票认证后才能生成抵扣凭证（税局勾选确认的对应动作）。
+	if _, err := svc.VerifyInvoice(ctx, inv.ID, "王主管"); err != nil {
+		t.Fatalf("认证发票失败: %v", err)
+	}
 	if _, err := svc.PostInvoice(ctx, inv.ID, "王主管", "", &dept); err != nil {
 		t.Fatalf("发票生成凭证失败: %v", err)
 	}

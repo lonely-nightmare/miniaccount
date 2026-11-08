@@ -119,6 +119,13 @@ func TestPostInvoiceCreatesVoucher(t *testing.T) {
 	if _, err := svc.PostInvoice(ctx, v.ID, "", "", nil); err == nil {
 		t.Fatal("缺少记账人应被拒绝")
 	}
+	// 未认证的进项专票不能生成进项税凭证：先走认证。
+	if _, err := svc.PostInvoice(ctx, v.ID, "王主管", "", &dept); err == nil {
+		t.Fatal("未认证的专票应被拒绝生成凭证")
+	}
+	if _, err := svc.VerifyInvoice(ctx, v.ID, "王主管"); err != nil {
+		t.Fatalf("认证发票失败: %v", err)
+	}
 
 	posted, err := svc.PostInvoice(ctx, v.ID, "王主管", "", &dept)
 	if err != nil {
@@ -183,6 +190,9 @@ func TestPostInvoiceUsesStoredPostParams(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := svc.VerifyInvoice(ctx, v.ID, "王主管"); err != nil {
+		t.Fatalf("认证发票失败: %v", err)
 	}
 	// 不传费用科目/部门：应从发票档案取，而不是落空被 560206 拒绝。
 	posted, err := svc.PostInvoice(ctx, v.ID, "王主管", "", nil)

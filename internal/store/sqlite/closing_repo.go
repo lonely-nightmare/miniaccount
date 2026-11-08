@@ -213,29 +213,93 @@ func (r *ClosingRepo) ClosePeriod(ctx context.Context, in CloseInput) (*CloseRes
 	var out CloseResult
 	err := r.db.WithTx(ctx, func(tx *Tx) error {
 		out = CloseResult{Period: k, Health: health}
+		return r.closeInTx(ctx, tx, in, ac, &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
 
-		// 1. 期间状态：必须存在、必须 open
-		st, err := periodStatusTx(ctx, tx, k)
-		if err != nil {
+// errDryRunRollback 是预览回滚的哨兵错误：
+// 用它强制事务回滚，DryRunClose 再把它过滤掉。
+var errDryRunRollback = errors.New("closing: 预览回滚")
+
+// DryRunClose 在真实写事务里重放结账的**全部**步骤（过草稿 → 算结转
+// → 写结转凭证 → 关期间 → 启用下期），最后以哨兵错误强制回滚。
+//
+// # 为什么不用「只读的总账快照」做预览
+//
+// 旧的预览直接按已过账总账算结转，可实际结账会**先把本期草稿过账**。
+// 有草稿时两边看到的账就不是同一套：200 元收入还没过账，预览显示
+// 收入为零、没有结转分录，确认后却真的生成了两条结转 ——
+// 预览变成了一份承诺不了任何东西的假数据。
+//
+// 用同一事务体重放再回滚，预览和真实结账走的是同一段代码，
+// 不存在两边对不齐的可能；代价是预览会短暂持有写锁。
+func (r *ClosingRepo) DryRunClose(ctx context.Context, in CloseInput) (*CloseResult, error) {
+	ac := in.Accounts
+	if ac == (closing.Accounts{}) {
+		ac = closing.DefaultAccounts()
+	}
+	k := in.Period
+	if !k.Valid() {
+		return nil, fmt.Errorf("%w: %v", closing.ErrBadPeriod, k)
+	}
+	if in.PostingBy == "" {
+		return nil, voucher.ErrMissingMaker
+	}
+	at := in.At
+	if at.IsZero() {
+		at = time.Now()
+	}
+	in.At = at
+
+	var out CloseResult
+	err := r.db.WithTx(ctx, func(tx *Tx) error {
+		out = CloseResult{Period: k}
+		if err := r.closeInTx(ctx, tx, in, ac, &out); err != nil {
 			return err
 		}
-		if st == period.StatusClosed {
-			return fmt.Errorf("%w: %s", ErrAlreadyClosed, k)
-		}
-		if st != period.StatusOpen {
-			return fmt.Errorf("%w: 期间 %s 状态为 %s", period.ErrNotOpen, k, st)
-		}
+		return errDryRunRollback
+	})
+	if errors.Is(err, errDryRunRollback) {
+		return &out, nil
+	}
+	return nil, err
+}
 
-		// 2. 顺序结账：不允许跳过前期
-		prior, err := firstOpenPriorTx(ctx, tx, k)
-		if err != nil {
-			return err
-		}
-		if prior != nil {
-			return fmt.Errorf("%w: %s 仍未结账", ErrPriorOpen, *prior)
-		}
+// closeInTx 是结账事务体，ClosePeriod 与 DryRunClose 共用。
+//
+// 顺序：校验期间 → 过本期草稿 → 算结转 → 写结转凭证 → 关期间 →
+// 启用下期。任何一步失败整个事务回滚。
+func (r *ClosingRepo) closeInTx(ctx context.Context, tx *Tx, in CloseInput,
+	ac closing.Accounts, out *CloseResult) error {
+	k := in.Period
+	at := in.At
 
-		// 2b. ★ 先把本期的草稿凭证**全部过账**，再算结转计划。
+	// 1. 期间状态：必须存在、必须 open
+	st, err := periodStatusTx(ctx, tx, k)
+	if err != nil {
+		return err
+	}
+	if st == period.StatusClosed {
+		return fmt.Errorf("%w: %s", ErrAlreadyClosed, k)
+	}
+	if st != period.StatusOpen {
+		return fmt.Errorf("%w: 期间 %s 状态为 %s", period.ErrNotOpen, k, st)
+	}
+
+	// 2. 顺序结账：不允许跳过前期
+	prior, err := firstOpenPriorTx(ctx, tx, k)
+	if err != nil {
+		return err
+	}
+	if prior != nil {
+		return fmt.Errorf("%w: %s 仍未结账", ErrPriorOpen, *prior)
+	}
+
+	{
 		//
 		// 顺序不能颠倒：结转计划是按总账算出来的，草稿还没过账时
 		// 总账里根本没有本期的数，算出来的损益必然是错的（而且
@@ -310,12 +374,8 @@ func (r *ClosingRepo) ClosePeriod(ctx context.Context, in CloseInput) (*CloseRes
 		if err := r.db.Periods().EnsureNextOpen(ctx, tx, k); err != nil {
 			return err
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	return &out, nil
+	return nil
 }
 
 // buildClosingVoucher 把结账计划变成一张凭证。

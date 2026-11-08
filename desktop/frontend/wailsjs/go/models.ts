@@ -1771,6 +1771,20 @@ export namespace main {
 	        this.includeConditional = source["includeConditional"];
 	    }
 	}
+	export class VerifyInvoiceRequest {
+	    id: number;
+	    by: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new VerifyInvoiceRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.by = source["by"];
+	    }
+	}
 	export class VoidAmortizationRequest {
 	    id: number;
 	    void: boolean;
@@ -3598,6 +3612,7 @@ export namespace service {
 	    summary: string;
 	    serialNo: string;
 	    balance: number;
+	    balanceKnown: boolean;
 	    status: string;
 	    statusLabel: string;
 	    counterAccount: string;
@@ -3622,6 +3637,7 @@ export namespace service {
 	        this.summary = source["summary"];
 	        this.serialNo = source["serialNo"];
 	        this.balance = source["balance"];
+	        this.balanceKnown = source["balanceKnown"];
 	        this.status = source["status"];
 	        this.statusLabel = source["statusLabel"];
 	        this.counterAccount = source["counterAccount"];
@@ -5138,6 +5154,7 @@ export namespace service {
 	    accrualVoucherLabel: string;
 	    paymentVoucherNo: string;
 	    paymentVoucherLabel: string;
+	    cascadeWarnings?: string[];
 	    canConfirm: boolean;
 	    canPost: boolean;
 	
@@ -5163,6 +5180,7 @@ export namespace service {
 	        this.accrualVoucherLabel = source["accrualVoucherLabel"];
 	        this.paymentVoucherNo = source["paymentVoucherNo"];
 	        this.paymentVoucherLabel = source["paymentVoucherLabel"];
+	        this.cascadeWarnings = source["cascadeWarnings"];
 	        this.canConfirm = source["canConfirm"];
 	        this.canPost = source["canPost"];
 	    }

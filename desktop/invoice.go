@@ -103,6 +103,13 @@ func (a *App) SaveInvoice(req InvoiceRequest) (out *service.InvoiceView, err err
 }
 
 // PostInvoiceRequest 是发票生成凭证的参数。
+// VerifyInvoiceRequest 是一次「进项专票认证」的请求。
+type VerifyInvoiceRequest struct {
+	ID int64 `json:"id"`
+	// By 是操作人 —— 认证会进操作日志。
+	By string `json:"by"`
+}
+
 type PostInvoiceRequest struct {
 	ID int64 `json:"id"`
 	// PostingBy 是记账人。
@@ -127,6 +134,22 @@ func (a *App) PostInvoice(req PostInvoiceRequest) (out *service.InvoiceView, err
 	}
 	return wrap(svc.PostInvoice(a.context(), req.ID, req.PostingBy,
 		req.ExpenseAccount, req.DeptID))
+}
+
+// VerifyInvoice 把一张进项专票标记为「已认证」（对应税局勾选确认）。
+//
+// 认证后才能生成凭证 —— 未认证的专票不得挂进项税额，
+// 这条链在 service.PostInvoice 里强制。
+func (a *App) VerifyInvoice(req VerifyInvoiceRequest) (out *service.InvoiceView, err error) {
+	defer recoverTo(&err, "VerifyInvoice")()
+	svc, f := a.book()
+	if f != nil {
+		return nil, f
+	}
+	if strings.TrimSpace(req.By) == "" {
+		return nil, &Fault{Kind: FaultInvalid, Message: "请填写操作人"}
+	}
+	return wrap(svc.VerifyInvoice(a.context(), req.ID, req.By))
 }
 
 // InvoiceSummaryView 返回发票汇总。

@@ -167,7 +167,7 @@ func (u DepartmentUsage) Describe() string {
 	}
 	add(u.Employees, "员工")
 	add(u.Children, "下级部门")
-	add(u.Entries, "已记账的凭证明细")
+	add(u.Entries, "凭证明细（含草稿）")
 	add(u.BankFlows, "银行流水")
 	add(u.BankRules, "银行规则")
 	add(u.Claims, "报销单")
@@ -189,7 +189,11 @@ func (s *Service) DepartmentUsageOf(ctx context.Context, id int64) (DepartmentUs
 	}{
 		{`SELECT COUNT(*) FROM employee WHERE dept_id = ?`, &u.Employees},
 		{`SELECT COUNT(*) FROM department WHERE parent_id = ?`, &u.Children},
-		{`SELECT COUNT(*) FROM ledger_entry WHERE dept_id = ?`, &u.Entries},
+		// ★ 查 voucher_entry 而不是 ledger_entry：
+		// ledger_entry 只有过账后才写入，草稿分录的部门引用全在
+		// voucher_entry 里。只查总账会让「只被草稿引用」的部门
+		// 用量为 0、被删掉，草稿再过账就留下孤儿引用。
+		{`SELECT COUNT(*) FROM voucher_entry WHERE dept_id = ?`, &u.Entries},
 		{`SELECT COUNT(*) FROM bank_flow WHERE dept_id = ?`, &u.BankFlows},
 		{`SELECT COUNT(*) FROM bank_rule WHERE dept_id = ?`, &u.BankRules},
 		{`SELECT COUNT(*) FROM expense_claim WHERE dept_id = ?`, &u.Claims},

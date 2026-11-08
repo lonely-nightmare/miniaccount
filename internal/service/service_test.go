@@ -254,8 +254,8 @@ func TestFilesDirAndBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 附件目录默认落在账套同级
-	if got, want := svc.FilesDir(), filepath.Join(dir, ".files"); got != want {
+	// 附件目录默认落在账套同级、按账套名隔离
+	if got, want := svc.FilesDir(), filepath.Join(dir, "b.files"); got != want {
 		t.Errorf("附件目录 = %s，期望 %s", got, want)
 	}
 	st, err := svc.Attachments()
