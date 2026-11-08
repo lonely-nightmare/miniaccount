@@ -423,7 +423,9 @@ func (s *Service) linkViews(ctx context.Context, links []evidence.Link) []Eviden
 		switch {
 		case l.RefKind.HasFile():
 			if store != nil {
-				v.Path = store.MustPath(l.SHA256)
+				// ResolvePath 取实际落点 —— 文件可能还在旧布局的
+				// 回退目录里，MustPath 只给主目录规范位置。
+				v.Path, _ = store.ResolvePath(l.SHA256)
 				v.Missing = !store.Exists(l.SHA256)
 			}
 		case l.RefID > 0:

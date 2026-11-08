@@ -26,6 +26,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -945,16 +947,8 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 		return
 	}
 	newDir := s.FilesDir()
-	stem := strings.TrimSuffix(filepath.Base(s.path), filepath.Ext(s.path))
-	legacies := []string{
-		filepath.Join(filepath.Dir(s.path), ".files"),
-		filepath.Join(filepath.Dir(s.path), stem+".files"),
-	}
 	var legacyDirs []string
-	for _, d := range legacies {
-		if d == newDir {
-			continue
-		}
+	for _, d := range s.legacyDirs() {
 		if st, err := os.Stat(d); err == nil && st.IsDir() {
 			legacyDirs = append(legacyDirs, d)
 		}
@@ -970,7 +964,13 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 		err := s.db.SQL().QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`,
 			table).Scan(&one)
-		if err != nil || one == 0 {
+		if err != nil {
+			// 查表失败 ≠ 表不存在 —— 静默跳过会把这张表的
+			// 附件整个漏迁，至少要留下可查的痕迹。
+			_, _ = os.Stderr.WriteString("[files] 附件表检查失败，旧附件未迁移: " + err.Error() + "\n")
+			return
+		}
+		if one == 0 {
 			continue
 		}
 		rows, err := s.db.SQL().QueryContext(ctx,
@@ -997,9 +997,17 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 		if _, err := os.Stat(dst); err == nil {
 			continue
 		}
+		// ★ 逐目录找「内容对得上文件名」的副本：两个旧目录
+		// 都可能有同名文件，先读到的若是坏副本，迁过去的就是
+		// 一份读不掉的坏数据 —— 取首个 hash 校验通过的。
 		var data []byte
 		for _, legacy := range legacyDirs {
-			if d, err := os.ReadFile(filepath.Join(legacy, h[:2], h)); err == nil {
+			d, err := os.ReadFile(filepath.Join(legacy, h[:2], h))
+			if err != nil {
+				continue
+			}
+			sum := sha256.Sum256(d)
+			if hex.EncodeToString(sum[:]) == h {
 				data = d
 				break
 			}
@@ -1024,7 +1032,33 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 // 不入库：附件以 PDF 为主，入库会让单个账套文件迅速膨胀到 GB 级，
 // 而备份与恢复也都因此变得笨重。
 func (s *Service) Attachments() (*attachment.Store, error) {
-	return attachment.New(attachment.Options{Dir: s.FilesDir()})
+	return attachment.New(attachment.Options{
+		Dir: s.FilesDir(), FallbackDirs: s.legacyDirs(),
+	})
+}
+
+// legacyDirs 返回本账套旧布局的附件目录（共享 .files 与
+// <stem>.files 两代），不含当前目录本身、不要求存在。
+//
+// 只读打开不做物理迁移、迁移也可能只迁了一半 —— 读附件
+// 与备份收集都要把这些目录算进去，才不会把完好的原件
+// 误报「缺失」。
+func (s *Service) legacyDirs() []string {
+	if s.path == ":memory:" || s.path == "" || s.filesDir != "" {
+		return nil
+	}
+	newDir := s.FilesDir()
+	stem := strings.TrimSuffix(filepath.Base(s.path), filepath.Ext(s.path))
+	var out []string
+	for _, d := range []string{
+		filepath.Join(filepath.Dir(s.path), ".files"),
+		filepath.Join(filepath.Dir(s.path), stem+".files"),
+	} {
+		if d != newDir {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // BackupOptions 是备份参数。
@@ -1038,6 +1072,7 @@ type BackupOptions struct {
 func (s *Service) Backup(ctx context.Context, opts BackupOptions) (*backup.Manifest, error) {
 	bk := &backup.Backup{
 		DBPath: s.path, FilesDir: s.FilesDir(), AppVersion: AppVersion,
+		FallbackFilesDirs: s.legacyDirs(),
 	}
 	if info, err := s.Book(ctx); err == nil {
 		bk.CompanyName, bk.CreditCode = info.CompanyName, info.CreditCode

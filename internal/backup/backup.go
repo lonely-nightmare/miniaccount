@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"miniaccount/internal/attachment"
+	"miniaccount/internal/store/sqlite"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,6 +51,7 @@ var (
 	ErrBadArchive    = errors.New("backup: 备份文件格式非法")
 	ErrVersionTooNew = errors.New("backup: 备份由更高版本的软件创建")
 	ErrChecksumFail  = errors.New("backup: 附件校验和不匹配")
+	ErrMissingFile   = errors.New("backup: 被引用的附件原件缺失")
 	ErrTargetExists  = errors.New("backup: 目标已存在")
 	// ErrUnsafePath 表示归档里的路径会写到目标目录之外。
 	//
@@ -103,6 +105,10 @@ type Backup struct {
 	DBPath string
 	// FilesDir 是附件目录。为空表示该账套没有附件。
 	FilesDir string
+	// FallbackFilesDirs 是旧布局附件目录（共享 .files、<stem>.files
+	// 两代）—— 未迁移或只读打开的账套，引用文件可能还躺在那里。
+	// 收集时并入、同名 rel 以 FilesDir 为准。
+	FallbackFilesDirs []string
 	// AppVersion 写入 manifest，便于将来判断兼容性。
 	AppVersion string
 	// CompanyName 写入 manifest。
@@ -154,10 +160,31 @@ func (b *Backup) Create(ctx context.Context, dest string, opts Options) (*Manife
 		return nil, err
 	}
 
-	// 2) 收集附件清单
-	files, totalBytes, err := collectFiles(b.FilesDir, opts.IncludeFiles)
+	// 2) 先取快照里的附件引用集合：回退目录是可能多账套共用的
+	//    池子（旧版共享 .files），只能收「这本账引用到」的文件，
+	//    否则别的账套的附件会混进这份归档。
+	var referenced map[string]bool
+	if opts.IncludeFiles {
+		referenced, err = referencedHashes(ctx, snapshot)
+		if err != nil {
+			return nil, err
+		}
+	}
+	files, totalBytes, err := collectFiles(b.FilesDir, b.FallbackFilesDirs,
+		opts.IncludeFiles, referenced)
 	if err != nil {
 		return nil, err
+	}
+
+	// ★ 库里有引用、磁盘上找不到的附件必须当场报出来：
+	// 之前的备份只遍历「磁盘上有的」，原件丢了的账套照样产出
+	// 一份「报告成功」的归档，恢复回去附件仍是缺失 —— 备份
+	// 的完整性承诺就成了空话。核对的是快照：那才是进归档的
+	// 数据，与源库此刻的状态无关。
+	if len(referenced) > 0 {
+		if err := checkReferencedFiles(referenced, files); err != nil {
+			return nil, err
+		}
 	}
 
 	// 3) 组装 manifest
@@ -671,8 +698,10 @@ func Inspect(archivePath string) (*Manifest, error) {
 //   - 得到的是数据库页级一致的副本，不会出现「写到一半的页」
 //   - 顺带整理碎片，备份文件通常比原库小
 func vacuumInto(ctx context.Context, dbPath, dest string) error {
-	// 以只读方式打开源库：备份不应该改动源库
-	dsn := "file:" + dbPath + "?mode=ro&_pragma=busy_timeout(5000)"
+	// 以只读方式打开源库：备份不应该改动源库。
+	// ★ 路径必须经 EscapeURIPath 转义 —— `base?copy.db` 不转义
+	// 时打开的是 `base`，归档里装的就成了另一份库的快照。
+	dsn := "file:" + sqlite.EscapeURIPath(dbPath) + "?mode=ro&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("backup: 打开账套: %w", err)
@@ -693,7 +722,8 @@ func vacuumInto(ctx context.Context, dbPath, dest string) error {
 // ai_suggestion 里的 raw_response 属账主自己的数据（脱敏前的原文），
 // 它是审计留痕的一部分，保留。
 func scrubSecrets(ctx context.Context, snapshot string) error {
-	db, err := sql.Open("sqlite", "file:"+snapshot+"?_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite",
+		"file:"+sqlite.EscapeURIPath(snapshot)+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return fmt.Errorf("backup: 打开快照: %w", err)
 	}
@@ -716,7 +746,8 @@ func scrubSecrets(ctx context.Context, snapshot string) error {
 // fillBookStats 从快照里读取账套概况写进 manifest。
 // 读不到不算错误 —— 备份本身仍然有效。
 func fillBookStats(ctx context.Context, snapshot string, m *Manifest) {
-	db, err := sql.Open("sqlite", "file:"+snapshot+"?mode=ro")
+	db, err := sql.Open("sqlite",
+		"file:"+sqlite.EscapeURIPath(snapshot)+"?mode=ro")
 	if err != nil {
 		return
 	}
@@ -746,6 +777,7 @@ type fileEntry struct {
 	abs  string // 绝对路径
 	rel  string // 归档内的相对路径（使用 / 分隔）
 	hash string // sha256
+	size int64
 }
 
 // collectFiles 遍历附件目录，返回清单与总字节数。
@@ -753,24 +785,88 @@ type fileEntry struct {
 // 附件目录按内容寻址（.files/<hash前2位>/<hash>），因此文件名本身就是校验和；
 // 这里仍然重新计算一遍，既是为了容错（用户可能手工改过文件名），
 // 也让 manifest 自带可信的校验依据。
-func collectFiles(filesDir string, include bool) ([]fileEntry, int64, error) {
-	if !include || filesDir == "" {
+//
+// fallbackDirs 是旧布局的附件目录（只读打开/未迁移时引用文件
+// 仍在那里）—— 同名 rel 以主目录为准。
+//
+// ★ 回退目录不遍历、只按 referenced 定点取件：共享 .files 是同
+// 目录下多本账共用的池子，整收会把别家账套的附件打进这份归档；
+// 而 referenced 之外的文件（哪怕是坏件）与这本账无关，不该让
+// 它搅黄备份。referenced 为 nil 时回退目录一个文件都不收。
+func collectFiles(filesDir string, fallbackDirs []string,
+	include bool, referenced map[string]bool) ([]fileEntry, int64, error) {
+	if !include || (filesDir == "" && len(fallbackDirs) == 0) {
 		return nil, 0, nil
 	}
-	info, err := os.Stat(filesDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, 0, nil // 没有附件目录是正常情况
-		}
-		return nil, 0, fmt.Errorf("backup: 读取附件目录: %w", err)
-	}
-	if !info.IsDir() {
-		return nil, 0, fmt.Errorf("backup: %s 不是目录", filesDir)
-	}
 
+	seen := map[string]bool{}
 	var out []fileEntry
 	var total int64
-	err = filepath.WalkDir(filesDir, func(path string, d os.DirEntry, err error) error {
+	add := func(e fileEntry) {
+		if seen[e.rel] {
+			return
+		}
+		seen[e.rel] = true
+		out = append(out, e)
+		total += e.size
+	}
+
+	if filesDir != "" {
+		info, err := os.Stat(filesDir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return nil, 0, fmt.Errorf("backup: 读取附件目录: %w", err)
+			}
+		} else if !info.IsDir() {
+			return nil, 0, fmt.Errorf("backup: %s 不是目录", filesDir)
+		} else {
+			ents, err := collectFilesIn(filesDir)
+			if err != nil {
+				return nil, 0, err
+			}
+			for _, e := range ents {
+				add(e)
+			}
+		}
+	}
+
+	// 回退目录：只补「引用了、主目录没有」的件。
+	for h := range referenced {
+		rel := attachment.RelPath(h)
+		if seen[rel] {
+			continue // 主目录已收到
+		}
+		for _, dir := range fallbackDirs {
+			p := filepath.Join(dir, filepath.FromSlash(rel))
+			fi, err := os.Lstat(p)
+			if err != nil {
+				continue
+			}
+			// 与 collectFilesIn 同口径：符号链接不读
+			if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+				continue
+			}
+			hash, size, err := fileSHA256(p)
+			if err != nil {
+				return nil, 0, err
+			}
+			// 引用指向的件内容与 hash 不符 = 原件已坏：
+			// 不能打成「成功」的归档，也不能跳过装没事。
+			if hash != h {
+				return nil, 0, fmt.Errorf("%w: 附件 %s 内容与文件名不符（期望 %s，实际 %s）",
+					ErrChecksumFail, rel, h, hash)
+			}
+			add(fileEntry{abs: p, rel: rel, hash: hash, size: size})
+			break
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].rel < out[j].rel })
+	return out, total, nil
+}
+
+func collectFilesIn(filesDir string) ([]fileEntry, error) {
+	var out []fileEntry
+	err := filepath.WalkDir(filesDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -804,15 +900,79 @@ func collectFiles(filesDir string, include bool) ([]fileEntry, int64, error) {
 			return fmt.Errorf("%w: 附件 %s 内容与文件名不符（期望 %s，实际 %s）",
 				ErrChecksumFail, rel, b, hash)
 		}
-		out = append(out, fileEntry{abs: path, rel: rel, hash: hash})
-		total += size
+		out = append(out, fileEntry{abs: path, rel: rel, hash: hash, size: size})
 		return nil
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("backup: 遍历附件: %w", err)
+		return nil, fmt.Errorf("backup: 遍历附件: %w", err)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].rel < out[j].rel })
-	return out, total, nil
+	return out, nil
+}
+
+// referencedHashes 读出账套引用的全部附件 hash。
+//
+// 引用面与孤儿统计同口径：attachment（凭证/发票/报销附件）
+// + audit_evidence（底稿原件）。老账套可能缺其中一张表，
+// 按 sqlite_master 查表存在性后分别取。
+func referencedHashes(ctx context.Context, dbPath string) (map[string]bool, error) {
+	db, err := sql.Open("sqlite",
+		"file:"+sqlite.EscapeURIPath(dbPath)+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("backup: 打开账套: %w", err)
+	}
+	defer db.Close()
+
+	out := map[string]bool{}
+	for _, table := range []string{"attachment", "audit_evidence"} {
+		var one int
+		if err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`,
+			table).Scan(&one); err != nil {
+			// 查表本身失败不能当「表不存在」—— 那会把引用集静默
+			// 清空，下游缺失核对连带失效，坏备份照出。
+			return nil, fmt.Errorf("backup: 检查 %s 表: %w", table, err)
+		}
+		if one == 0 {
+			continue // 老账套可能没有这张表
+		}
+		rows, err := db.QueryContext(ctx,
+			`SELECT DISTINCT sha256 FROM `+table+` WHERE sha256 <> ''`)
+		if err != nil {
+			return nil, fmt.Errorf("backup: 读取附件引用: %w", err)
+		}
+		for rows.Next() {
+			var h string
+			if rows.Scan(&h) == nil && attachment.ValidateHash(h) == nil {
+				out[h] = true
+			}
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+// checkReferencedFiles 核对「库里引用的附件」在收集到的清单
+// 里都能找到。
+//
+// 之前的备份只遍历「磁盘上有的」：原件丢了的账套照样产出
+// 一份「报告成功」的归档，恢复回去附件仍是缺失 —— 备份
+// 的完整性承诺就成了空话。
+func checkReferencedFiles(referenced map[string]bool, files []fileEntry) error {
+	present := make(map[string]bool, len(files))
+	for _, f := range files {
+		present[f.rel] = true
+	}
+	var missing []string
+	for h := range referenced {
+		if !present[attachment.RelPath(h)] {
+			missing = append(missing, h)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: %d 个被引用的附件原件不在附件目录（首个 %s）",
+			ErrMissingFile, len(missing), missing[0])
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

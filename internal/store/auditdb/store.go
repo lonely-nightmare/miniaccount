@@ -35,6 +35,7 @@ import (
 
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/filelock"
+	"miniaccount/internal/store/sqlite"
 )
 
 // 默认分片上限：100MB。
@@ -388,7 +389,8 @@ func openSQLite(path string, readOnly bool) (*sql.DB, error) {
 	if readOnly {
 		q.Set("mode", "ro")
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
+	db, err := sql.Open("sqlite",
+		"file:"+sqlite.EscapeURIPath(path)+"?"+q.Encode())
 	if err != nil {
 		return nil, fmt.Errorf("auditdb: 打开 %s: %w", path, err)
 	}

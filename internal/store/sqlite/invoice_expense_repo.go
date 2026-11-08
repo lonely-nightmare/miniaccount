@@ -406,6 +406,7 @@ func (r *ClaimRepo) SaveClaim(ctx context.Context, c *expense.Claim) (int64, err
 
 		var existingStatus string
 		oldMeta := map[string]*Meta{}
+		anyMeta := map[string]*Meta{}
 		err = tx.QueryRow(ctx, `SELECT status FROM expense_claim WHERE code = ?`, c.Code).
 			Scan(&existingStatus)
 		switch {
@@ -420,25 +421,32 @@ func (r *ClaimRepo) SaveClaim(ctx context.Context, c *expense.Claim) (int64, err
 			}
 			// ★ 旧明细的附件关联要连同清理：attachment 行挂在明细
 			// id 上，明细删了行还在 —— 既悬空，又可能在 id 被复用
-			// 后错挂到新明细。删之前先按 hash 快照元数据：
+			// 后错挂到新明细。删之前先按 (行号,hash) 快照元数据：
 			// 重新关联同一文件时把文件名/类型/大小/kind 带回来，
 			// 否则重存一次报销单，附件就只剩个 hash。
+			// 键带行号：同一文件可以按不同文件名挂到多条明细上，
+			// 按整单 hash 合并会让后面明细的名字盖掉前面的。
 			mrows, err := tx.Query(ctx, `
-				SELECT file_name, sha256, mime, size, kind
-				  FROM attachment
-				 WHERE owner_type = 'expense_item' AND owner_id IN (
-				       SELECT id FROM expense_item WHERE claim_id = ?)`, id)
+				SELECT i.line_no, a.file_name, a.sha256, a.mime, a.size, a.kind
+				  FROM attachment a
+				  JOIN expense_item i
+				    ON i.id = a.owner_id AND a.owner_type = 'expense_item'
+				 WHERE i.claim_id = ?`, id)
 			if err != nil {
 				return translateErr(err)
 			}
 			for mrows.Next() {
 				m := &Meta{}
-				if err := mrows.Scan(&m.FileName, &m.SHA256, &m.Mime,
-					&m.Size, &m.Kind); err != nil {
+				var lineNo int64
+				if err := mrows.Scan(&lineNo, &m.FileName, &m.SHA256,
+					&m.Mime, &m.Size, &m.Kind); err != nil {
 					mrows.Close()
 					return translateErr(err)
 				}
-				oldMeta[m.SHA256] = m
+				oldMeta[metaKey(lineNo, m.SHA256)] = m
+				if anyMeta[m.SHA256] == nil {
+					anyMeta[m.SHA256] = m
+				}
 			}
 			mrows.Close()
 			if _, err := tx.Exec(ctx, `
@@ -540,7 +548,7 @@ func (r *ClaimRepo) SaveClaim(ctx context.Context, c *expense.Claim) (int64, err
 			}
 			it.ID, it.ClaimID, it.LineNo = itemID, id, i+1
 			if err := r.db.Attachments().linkTxMeta(ctx, tx, "expense_item",
-				itemID, it.AttachmentHashes, oldMeta); err != nil {
+				itemID, int64(it.LineNo), it.AttachmentHashes, oldMeta, anyMeta); err != nil {
 				return err
 			}
 		}
@@ -754,23 +762,35 @@ func (r *AttachmentRepo) ListOf(ctx context.Context, ownerType string,
 	return out, rows.Err()
 }
 
+// metaKey 构造 (行号,hash) 的复合键，用于报销单明细附件元数据快照。
+func metaKey(lineNo int64, hash string) string {
+	return fmt.Sprintf("%d/%s", lineNo, hash)
+}
+
 // linkTx 在事务内把一组 hash 关联到某单据（已存在则忽略）。
 func (r *AttachmentRepo) linkTx(ctx context.Context, tx *Tx, ownerType string,
 	ownerID int64, hashes []string) error {
-	return r.linkTxMeta(ctx, tx, ownerType, ownerID, hashes, nil)
+	return r.linkTxMeta(ctx, tx, ownerType, ownerID, 0, hashes, nil, nil)
 }
 
-// linkTxMeta 同 linkTx，但按 hash 从 metas 带回文件名/类型/大小/kind ——
-// 报销单重存明细时旧关联被删掉重建，不带回元数据就只剩个裸 hash。
+// linkTxMeta 同 linkTx，但按 (行号,hash) 从 exact、再按 hash 从 any
+// 带回文件名/类型/大小/kind —— 报销单重存明细时旧关联被删掉重建，
+// 不带回元数据就只剩个裸 hash；同一文件可按不同文件名挂到多条明细，
+// 所以精确键带行号、hash 键只作兜底。
 func (r *AttachmentRepo) linkTxMeta(ctx context.Context, tx *Tx, ownerType string,
-	ownerID int64, hashes []string, metas map[string]*Meta) error {
+	ownerID int64, lineNo int64, hashes []string,
+	exact, any map[string]*Meta) error {
 	for _, h := range hashes {
 		if h == "" {
 			continue
 		}
 		var name, mime, kind string
 		var size int64
-		if m := metas[h]; m != nil {
+		m := exact[metaKey(lineNo, h)]
+		if m == nil {
+			m = any[h]
+		}
+		if m != nil {
 			name, mime, size, kind = m.FileName, m.Mime, m.Size, m.Kind
 		}
 		if _, err := tx.Exec(ctx, `

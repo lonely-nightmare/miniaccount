@@ -778,3 +778,78 @@ func TestAttachmentStorePathUnderBookDir(t *testing.T) {
 		t.Errorf("附件文件不存在: %v", err)
 	}
 }
+
+// 同一文件按不同文件名挂到同一报销单的两条明细上：重存后
+// 每条明细必须保留「自己的」附件名 —— 按整单 hash 合并元数据
+// 会让后一条的名字盖掉前一条（实测复现）。
+func TestReSaveClaimKeepsPerItemAttachmentMeta(t *testing.T) {
+	ctx := context.Background()
+	f := setupIE(t)
+
+	shared := f.putAttachment(t, "shared.pdf", "共享内容")
+	dept := int64(1)
+	c := &expense.Claim{
+		ClaimantEmployeeID: f.Employee,
+		DeptID:             &dept,
+		ApplyDate:          calendar.MustParse("2025-09-20"),
+		TripStart:          calendar.MustParse("2025-09-10"),
+		TripEnd:            calendar.MustParse("2025-09-14"),
+		Destination:        "上海",
+		Reason:             "出差",
+		Status:             expense.StatusDraft,
+		Items: []*expense.Item{
+			{Category: expense.CatTransport, OccurDate: calendar.MustParse("2025-09-10"),
+				Summary: "交通", Amount: money100(1200), AccountCode: "560207",
+				AttachmentHashes: []string{shared}},
+			{Category: expense.CatMeal, OccurDate: calendar.MustParse("2025-09-12"),
+				Summary: "餐费", Amount: money100(400), AccountCode: "560207",
+				AttachmentHashes: []string{shared}},
+		},
+	}
+	c.ComputeTotal()
+
+	id, err := f.DB.Claims().SaveClaim(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟两条明细各自的上传 —— 同一文件、不同显示名。
+	if err := f.DB.Attachments().LinkDetailed(ctx, "expense_item",
+		c.Items[0].ID, "line-1.txt", shared, "text/plain", 4, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.DB.Attachments().LinkDetailed(ctx, "expense_item",
+		c.Items[1].ID, "line-2.txt", shared, "text/plain", 4, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重存同一单号。
+	c2, err := f.DB.Claims().GetClaim(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.Items[0].Summary = "交通（改签）"
+	if _, err := f.DB.Claims().SaveClaim(ctx, c2); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := f.DB.Claims().GetClaim(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Items) != 2 {
+		t.Fatalf("明细数 = %d，期望 2", len(reloaded.Items))
+	}
+	want := []string{"line-1.txt", "line-2.txt"}
+	for i, it := range reloaded.Items {
+		metas, err := f.DB.Attachments().ListOf(ctx, "expense_item", it.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(metas) != 1 {
+			t.Fatalf("明细 %d 应有 1 个附件，实际 %d", i, len(metas))
+		}
+		if metas[0].FileName != want[i] {
+			t.Errorf("明细 %d 的附件名 = %q，期望 %q", i, metas[0].FileName, want[i])
+		}
+	}
+}

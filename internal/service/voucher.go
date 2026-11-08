@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -975,6 +978,14 @@ func (s *Service) AttachDocument(ctx context.Context, ownerType string,
 	if err != nil {
 		return nil, err
 	}
+	// ★ 入库失败要能把「这次新写的文件」收回去：记下落盘前
+	// 主目录里这个内容在不在 —— 已存在的（别的单据共享着的）
+	// 文件绝不能删。判定只看主目录路径：回退目录里有同内容
+	// 文件不代表主目录这份是共享的。
+	sum := sha256.Sum256(data)
+	preHash := hex.EncodeToString(sum[:])
+	_, statErr := os.Stat(store.MustPath(preHash))
+	existed := statErr == nil
 	blob, err := store.Put(data, filename)
 	if err != nil {
 		return nil, err
@@ -1006,6 +1017,33 @@ func (s *Service) AttachDocument(ctx context.Context, ownerType string,
 		return nil
 	})
 	if err != nil {
+		// ★ 入库失败要收回这次新落的文件：不然调用方拿到错误，
+		// 磁盘上却多出一份能读、能进孤儿清单、能进备份的实物。
+		// 只删「本来不在 + 此刻仍无人引用」的 —— 并发传同一份
+		// 文件的另一个上传可能已经把关联落库，删了它就让那笔
+		// 关联指向缺失文件。
+		if !existed {
+			var refs int
+			_ = s.db.SQL().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM attachment WHERE sha256 = ?`,
+				blob.SHA256).Scan(&refs)
+			var evRefs int
+			var hasEvidence int
+			if s.db.SQL().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_evidence'`).
+				Scan(&hasEvidence) == nil && hasEvidence > 0 {
+				_ = s.db.SQL().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM audit_evidence WHERE sha256 = ?`,
+					blob.SHA256).Scan(&evRefs)
+			}
+			if refs == 0 && evRefs == 0 {
+				if derr := store.Delete(blob.SHA256); derr != nil {
+					// 删不掉不盖过原始错误 —— 孤儿清理还能收拾。
+					_, _ = os.Stderr.WriteString(
+						"[attachment] 失败上传的残留文件清理失败: " + derr.Error() + "\n")
+				}
+			}
+		}
 		return nil, err
 	}
 	// ★ 挂附件是单据内容的变更，必须留痕：
@@ -1049,7 +1087,8 @@ func (s *Service) ListAttachments(ctx context.Context, ownerType string, ownerID
 		}
 		// hash 从库里读出来，但也走校验版：库里若被外部工具改坏，
 		// 这里退化成一个「指向不存在位置」的路径，而不是越界路径。
-		a.Path = store.MustPath(a.Hash)
+		// ResolvePath 取实际落点 —— 文件可能还在旧布局回退目录。
+		a.Path, _ = store.ResolvePath(a.Hash)
 		// 文件实体可能被误删（用户手动清理 .files 目录）。
 		// 这里如实标出来，界面才能提示「原件已丢失」而不是
 		// 让用户点开一个不存在的路径。

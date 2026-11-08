@@ -129,11 +129,21 @@ func buildDSN(path string, readOnly bool) string {
 		}
 		return path + sep + q.Encode()
 	}
-	// ★ 路径里的 ? / # / % 必须先转义再拼 DSN：不转义，
-	// `book?copy.db` 会被当成「文件 book + 参数 copy.db」——
-	// 打开的是另一份库，写的东西进错账套。SQLite URI 的文件
-	// 名段允许百分号编码，且只转义这三个字符：其余字符
-	// （含非 ASCII 文件名）原样通过即可。
+	return "file:" + EscapeURIPath(path) + "?" + q.Encode()
+}
+
+// EscapeURIPath 把文件系统路径转义成可放进 SQLite URI 文件名段
+// 的形式。
+//
+// ★ 路径里的 ? / # / % 必须先转义再拼 DSN：不转义，
+// `book?copy.db` 会被当成「文件 book + 参数 copy.db」——
+// 打开的是另一份库，写的东西进错账套。SQLite URI 的文件
+// 名段允许百分号编码，且只转义这三个字符：其余字符
+// （含非 ASCII 文件名）原样通过即可。
+//
+// 导出是因为 backup 自己也拼 file: DSN（VACUUM INTO、
+// 快照打开）——同一个坑不能在两个包里各踩一次。
+func EscapeURIPath(path string) string {
 	var esc strings.Builder
 	esc.Grow(len(path))
 	for i := 0; i < len(path); i++ {
@@ -148,7 +158,7 @@ func buildDSN(path string, readOnly bool) string {
 			esc.WriteByte(path[i])
 		}
 	}
-	return "file:" + esc.String() + "?" + q.Encode()
+	return esc.String()
 }
 
 // Path 返回数据库文件路径。

@@ -36,7 +36,12 @@ import os from 'node:os'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../../..') // mini-account/
 const APP_BIN = path.join(root, 'dist', '小账本-darwin-arm64')
-const dbPath = path.join(os.tmpdir(), `miniaccount-gui-${process.pid}.db`)
+// 账套放进独立子目录：账套所在目录的 .files / <stem>.files 会被当成
+// 旧布局回退附件目录 —— 直接放在共享 tmpdir 根下，会读到历次测试
+// 留下的同内容文件（内容寻址下同 hash 即同一份原件），「删掉实体
+// 就该报丢失」的断言就站不住了。
+const bookDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miniaccount-gui-'))
+const dbPath = path.join(bookDir, `miniaccount-gui-${process.pid}.db`)
 
 // ★ 给后端一个**假的家目录**。
 //
@@ -1531,8 +1536,8 @@ test('★ 审计证据链：挂依据、判重、原件丢了要说出来', asyn
   assert.ok(body.includes('证据链回归测试'), '证据链里应当能看到那笔调整')
 
   // ---- 原件不见了：必须报出来 ----
-  // 附件目录按账套隔离：<账套文件名>.files/<hash 前两位>/<hash>
-  const filesDir = `${path.basename(dbPath, path.extname(dbPath))}.files`
+  // 附件目录按账套隔离：<完整账套文件名>.files/<hash 前两位>/<hash>
+  const filesDir = `${path.basename(dbPath)}.files`
   const filePath = path.join(path.dirname(dbPath), filesDir, link.hash.slice(0, 2), link.hash)
   assert.ok(fs.existsSync(filePath), `附件实体不在预期位置：${filePath}`)
   fs.unlinkSync(filePath)

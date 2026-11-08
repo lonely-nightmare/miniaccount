@@ -50,6 +50,12 @@ const DefaultMaxSize int64 = 20 << 20
 type Options struct {
 	// Dir 是附件根目录（账套的 .files 目录）。
 	Dir string
+	// FallbackDirs 是只读回退目录 —— 旧布局（共享 .files、
+	// <stem>.files）里的文件。读操作（Open/Get/Exists/Size）
+	// 在主目录找不到时依次查回退目录；写与列举始终只面对
+	// 主目录。用于只读打开旧账套（不做物理迁移）与迁移
+	// 只迁了一半的情况。
+	FallbackDirs []string
 	// MaxSize 是单文件字节上限；0 表示用 DefaultMaxSize。
 	MaxSize int64
 	// AllowedMimes 为空表示不限制类型；否则只接受列出的 MIME。
@@ -58,9 +64,10 @@ type Options struct {
 
 // Store 是一个账套的附件仓库。
 type Store struct {
-	dir     string
-	maxSize int64
-	allowed map[string]bool
+	dir       string
+	fallbacks []string
+	maxSize   int64
+	allowed   map[string]bool
 }
 
 // New 打开（必要时创建）附件仓库。
@@ -76,6 +83,9 @@ func New(opts Options) (*Store, error) {
 		maxSize = DefaultMaxSize
 	}
 	s := &Store{dir: opts.Dir, maxSize: maxSize}
+	if len(opts.FallbackDirs) > 0 {
+		s.fallbacks = append([]string(nil), opts.FallbackDirs...)
+	}
 	if len(opts.AllowedMimes) > 0 {
 		s.allowed = map[string]bool{}
 		for _, m := range opts.AllowedMimes {
@@ -112,12 +122,27 @@ func (s *Store) Path(hash string) (string, error) {
 // MustPath 在 hash 已被校验过时使用（如刚从库里读出来的）。
 // hash 非法时返回空串 —— 调用方拿到空串自然会把附件标为缺失，
 // 而不是拿到一个能指向任意位置的路径。
+//
+// ★ 它只返回主目录下的规范位置。文件实际可能在回退目录
+// （旧布局迁移前）——「打开原件」这类要拿到真实落点的
+// 场景用 ResolvePath。
 func (s *Store) MustPath(hash string) string {
 	p, err := s.Path(hash)
 	if err != nil {
 		return ""
 	}
 	return p
+}
+
+// ResolvePath 返回该附件实际所在的绝对路径：
+// 第一个真实存在的候选位置（主目录优先，其次各回退目录）；
+// 都不存在时返回主目录下的规范位置 —— 那才是它「应该」在的
+// 地方，配合 Exists 的缺失判定不会把路径指向错误位置。
+func (s *Store) ResolvePath(hash string) (string, error) {
+	if err := ValidateHash(hash); err != nil {
+		return "", err
+	}
+	return s.resolve(hash), nil
 }
 
 // RelPath 返回按内容寻址的相对路径：`<hash前2位>/<hash>`。
@@ -221,11 +246,34 @@ func fileMatches(path, wantHash string) (bool, error) {
 }
 
 // Open 打开一个附件的读取流。
+// candidates 返回 hash 的全部候选绝对路径：主目录在前，
+// 其后是各回退目录 —— 按序尝试，先到先得。
+func (s *Store) candidates(hash string) []string {
+	rel := filepath.FromSlash(RelPath(hash))
+	out := make([]string, 0, 1+len(s.fallbacks))
+	out = append(out, filepath.Join(s.dir, rel))
+	for _, d := range s.fallbacks {
+		out = append(out, filepath.Join(d, rel))
+	}
+	return out
+}
+
+// resolve 返回第一个实际存在的候选路径；都不存在时返回主目录
+// 下的（也就是这个附件「应该」在的位置）。
+func (s *Store) resolve(hash string) string {
+	for _, p := range s.candidates(hash) {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return s.candidates(hash)[0]
+}
+
 func (s *Store) Open(hash string) (io.ReadCloser, error) {
 	if err := ValidateHash(hash); err != nil {
 		return nil, err
 	}
-	f, err := os.Open(s.MustPath(hash))
+	f, err := os.Open(s.resolve(hash))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w: %s", ErrNotFound, hash)
@@ -236,31 +284,45 @@ func (s *Store) Open(hash string) (io.ReadCloser, error) {
 }
 
 // Get 读取附件全部内容，并校验内容与 hash 一致。
+//
+// 回退目录里可能有同名的坏副本 —— 逐候选校验内容 hash，
+// 取第一个有效件；都存在但全都对不上时才报损坏。
 func (s *Store) Get(hash string) ([]byte, error) {
 	if err := ValidateHash(hash); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(s.MustPath(hash))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, hash)
+	found := false
+	for _, p := range s.candidates(hash) {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return nil, err
+			}
+			continue
 		}
-		return nil, err
+		found = true
+		sum := sha256.Sum256(data)
+		if got := hex.EncodeToString(sum[:]); got == hash {
+			return data, nil
+		}
 	}
-	sum := sha256.Sum256(data)
-	if got := hex.EncodeToString(sum[:]); got != hash {
-		return nil, fmt.Errorf("attachment: 文件损坏，内容 hash %s ≠ 文件名 %s", got, hash)
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, hash)
 	}
-	return data, nil
+	return nil, fmt.Errorf("attachment: 文件损坏，内容 hash 与文件名 %s 不符", hash)
 }
 
-// Exists 报告某个附件是否已存在。
+// Exists 报告某个附件是否已存在（主目录或回退目录）。
 func (s *Store) Exists(hash string) bool {
 	if ValidateHash(hash) != nil {
 		return false
 	}
-	_, err := os.Stat(s.MustPath(hash))
-	return err == nil
+	for _, p := range s.candidates(hash) {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Size 返回某个 hash 的文件大小；文件不在或 hash 非法时返回 0。
@@ -268,7 +330,7 @@ func (s *Store) Exists(hash string) bool {
 // 单独一个方法而不是让调用方 Walk 一遍：Walk 要扫整个目录，
 // 而「这条证据的文件多大」是列表页每次渲染都要问的问题。
 func (s *Store) Size(hash string) int64 {
-	fi, err := os.Stat(s.MustPath(hash))
+	fi, err := os.Stat(s.resolve(hash))
 	if err != nil {
 		return 0
 	}
@@ -283,9 +345,13 @@ func (s *Store) Delete(hash string) error {
 	if err := ValidateHash(hash); err != nil {
 		return err
 	}
-	if err := os.Remove(s.MustPath(hash)); err != nil && !os.IsNotExist(err) {
+	path := s.MustPath(hash)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	// 顺手清掉空了的 <hash前2位> 目录；里面还有别的文件时
+	// Remove 会失败 —— 忽略即可。
+	_ = os.Remove(filepath.Dir(path))
 	return nil
 }
 

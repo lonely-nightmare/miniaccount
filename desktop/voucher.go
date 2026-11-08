@@ -347,7 +347,7 @@ func (a *App) OpenAttachment(hash string) (err error) {
 	if serr != nil {
 		return classify(serr)
 	}
-	p, perr := store.Path(hash)
+	p, perr := store.ResolvePath(hash)
 	if perr != nil {
 		return &Fault{Kind: FaultInvalid, Message: "附件标识不合法"}
 	}
@@ -374,7 +374,7 @@ func (a *App) AttachmentPath(hash string) (out string, err error) {
 	if serr != nil {
 		return "", classify(serr)
 	}
-	p, perr := store.Path(hash)
+	p, perr := store.ResolvePath(hash)
 	if perr != nil {
 		return "", &Fault{Kind: FaultInvalid, Message: "附件标识不合法"}
 	}

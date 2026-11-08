@@ -338,3 +338,262 @@ func TestAttachmentCoverageCountsMissingFiles(t *testing.T) {
 		t.Fatalf("文件丢失后应 posted=1 withAttach=0 without=1，实际 %+v", cov)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 二次复查回归（验收实测 5 项）
+// ---------------------------------------------------------------------------
+
+// 备份带 ? 的账套名：vacuumInto 的 DSN 同样要把 ? 转义，否则
+// VACUUM INTO 打开的是另一个文件（实测复现）。
+func TestBackupPathWithQuestionMark(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	svc, err := service.Open(ctx, service.Options{
+		Path: filepath.Join(dir, "base?copy.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Shutdown()
+	if _, err := svc.CreateBook(ctx, service.CreateBookInput{
+		CompanyName: "问号备份", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "b.mabak")
+	m, err := svc.Backup(ctx, service.BackupOptions{Dest: dest})
+	if err != nil {
+		t.Fatalf("备份带 ? 的账套失败: %v", err)
+	}
+	if m.CompanyName != "问号备份" {
+		t.Fatalf("备份内容来自错误的账套: %s", m.CompanyName)
+	}
+	rd, _ := filepath.EvalSymlinks(dir)
+	if _, err := os.Stat(filepath.Join(rd, "base")); !os.IsNotExist(err) {
+		t.Fatal("不应在 base 上另建数据库")
+	}
+}
+
+// 原件缺失的账套做「完整」备份必须报错 —— 只遍历磁盘上有的，
+// 恢复出来仍是缺件的坏账套（实测复现）。
+func TestBackupRejectsMissingReferencedFile(t *testing.T) {
+	ctx := context.Background()
+	svc := newSvc(t, 1)
+
+	d, err := svc.SaveVoucher(ctx, service.VoucherInput{
+		Word: "记", Date: "2025-01-10", Remark: "x", CreatedBy: "会计",
+		Lines: []service.VoucherLineInput{
+			{AccountCode: "1002", Summary: "借", Debit: money100(100)},
+			{AccountCode: "5001", Summary: "贷", Credit: money100(100)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	att, err := svc.AttachDocument(ctx, "voucher", d.ID, "发票.pdf", []byte("原件"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 删原件留关联 = 缺失形态。
+	if err := os.Remove(filepath.Join(svc.FilesDir(), att.Hash[:2], att.Hash)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.Backup(ctx, service.BackupOptions{
+		Dest: filepath.Join(t.TempDir(), "b.mabak"), IncludeFiles: true,
+	})
+	if !errors.Is(err, backup.ErrMissingFile) {
+		t.Fatalf("缺失原件的备份应报 ErrMissingFile，得到 %v", err)
+	}
+}
+
+// 只读打开旧布局账套：不做物理迁移，但读附件要能兜回旧目录
+// （实测复现：只读 MCP 打开后完好附件被报缺失）；顺带覆盖
+// 备份也要把旧目录里的文件收进去。
+func TestReadOnlyOpenReadsLegacyFilesDir(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "y.db")
+
+	svc, err := service.Open(ctx, service.Options{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateBook(ctx, service.CreateBookInput{
+		CompanyName: "旧布局", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := svc.SaveVoucher(ctx, service.VoucherInput{
+		Word: "记", Date: "2025-01-10", Remark: "x", CreatedBy: "会计",
+		Lines: []service.VoucherLineInput{
+			{AccountCode: "1002", Summary: "借", Debit: money100(100)},
+			{AccountCode: "5001", Summary: "贷", Credit: money100(100)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AttachDocument(ctx, "voucher", d.ID, "发票.pdf", []byte("原件")); err != nil {
+		t.Fatal(err)
+	}
+	svc.Shutdown()
+
+	// 把新布局附件目录整个改名成旧 <stem>.files，模拟旧版本写的账套。
+	rd, _ := filepath.EvalSymlinks(dir)
+	if err := os.Rename(filepath.Join(rd, "y.db.files"),
+		filepath.Join(rd, "y.files")); err != nil {
+		t.Fatal(err)
+	}
+
+	ro, err := service.Open(ctx, service.Options{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := ro.ListAttachments(ctx, "voucher", d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Missing {
+		t.Fatalf("只读打开旧账套，附件不应缺失: %+v", list)
+	}
+	// 备份也要把旧目录里的文件收进去。
+	m, err := ro.Backup(ctx, service.BackupOptions{
+		Dest: filepath.Join(t.TempDir(), "ro.mabak"), IncludeFiles: true,
+	})
+	if err != nil {
+		t.Fatalf("只读账套备份失败: %v", err)
+	}
+	if m.FileCount != 1 {
+		t.Fatalf("备份应含 1 个附件，实际 %d", m.FileCount)
+	}
+	ro.Shutdown()
+}
+
+// 迁移选副本必须验证内容 hash：.files 里放坏副本、
+// <stem>.files 里放好原件，迁过来的必须是好的那份
+// （实测复现：先读到坏副本 → 之后读附件 hash 不符）。
+func TestLegacyMigrationSkipsCorruptCopy(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "z.db")
+
+	svc, err := service.Open(ctx, service.Options{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateBook(ctx, service.CreateBookInput{
+		CompanyName: "副本选择", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := svc.SaveVoucher(ctx, service.VoucherInput{
+		Word: "记", Date: "2025-01-10", Remark: "x", CreatedBy: "会计",
+		Lines: []service.VoucherLineInput{
+			{AccountCode: "1002", Summary: "借", Debit: money100(100)},
+			{AccountCode: "5001", Summary: "贷", Credit: money100(100)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	att, err := svc.AttachDocument(ctx, "voucher", d.ID, "发票.pdf", []byte("正确的原件"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Shutdown()
+
+	rd, _ := filepath.EvalSymlinks(dir)
+	good := filepath.Join(rd, "z.db.files")
+	// 拆成两代旧目录：坏副本放 .files，好原件放 z.files。
+	if err := os.Rename(good, filepath.Join(rd, "z.files")); err != nil {
+		t.Fatal(err)
+	}
+	badDir := filepath.Join(rd, ".files", att.Hash[:2])
+	if err := os.MkdirAll(badDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badDir, att.Hash),
+		[]byte("坏副本"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc2, err := service.Open(ctx, service.Options{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc2.Shutdown()
+	st, err := svc2.Attachments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := st.Get(att.Hash)
+	if err != nil {
+		t.Fatalf("迁移后读取附件失败: %v", err)
+	}
+	if string(data) != "正确的原件" {
+		t.Fatalf("迁移选了坏副本: %q", data)
+	}
+}
+
+// 入库失败要收回落盘文件：只读账套的事务必然失败，
+// 模拟「SQLite 拒绝插入关联」的出错路径（实测复现）。
+func TestFailedInsertLeavesNoFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ro.db")
+
+	svc, err := service.Open(ctx, service.Options{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateBook(ctx, service.CreateBookInput{
+		CompanyName: "只读账套", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := svc.SaveVoucher(ctx, service.VoucherInput{
+		Word: "记", Date: "2025-01-10", Remark: "x", CreatedBy: "会计",
+		Lines: []service.VoucherLineInput{
+			{AccountCode: "1002", Summary: "借", Debit: money100(100)},
+			{AccountCode: "5001", Summary: "贷", Credit: money100(100)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Shutdown()
+
+	ro, err := service.Open(ctx, service.Options{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Shutdown()
+	if _, err := ro.AttachDocument(ctx, "voucher", d.ID,
+		"幽灵.pdf", []byte("x")); err == nil {
+		t.Fatal("只读账套上的上传应失败")
+	}
+	st, err := ro.Attachments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := st.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("失败的上传不应留下文件，实际留下 %d 个", len(files))
+	}
+	orphans, err := ro.OrphanAttachments(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("孤儿清单应为空，实际 %d 项", len(orphans))
+	}
+}

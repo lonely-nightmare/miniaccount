@@ -731,3 +731,149 @@ func faithfulCorruptArchive(t *testing.T, archivePath string, f *fixture) {
 		t.Fatal(err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 回退附件目录（旧布局）的收集口径
+// ---------------------------------------------------------------------------
+
+// 把 data 按内容寻址写进 dir，返回 (hash, 归档内 rel)
+func putBlob(t *testing.T, dir string, data []byte) (string, string) {
+	t.Helper()
+	hash := SHA256Of(data)
+	rel := BlobPath(hash)
+	abs := filepath.Join(dir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return hash, rel
+}
+
+// ★ 共享 .files 是同目录多本账共用的池子：回退目录只许收
+// 「本账引用」的文件 —— 否则别家账套的附件会被打进这份
+// 归档（实测复现），而本账引用的原件漏收一样不行。
+func TestBackupFallbackDirsPackOnlyReferenced(t *testing.T) {
+	f := newFixture(t)
+
+	// 库里加一张 attachment 表，登记「本账引用的附件」
+	db, err := sql.Open("sqlite", "file:"+f.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE attachment (
+		id INTEGER PRIMARY KEY, owner_type TEXT, owner_id INTEGER,
+		sha256 TEXT, file_name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	mine := []byte("这本账引用的发票原件")
+	mineHash, mineRel := SHA256Of(mine), BlobPath(SHA256Of(mine))
+	if _, err := db.Exec(
+		`INSERT INTO attachment(owner_type, owner_id, sha256, file_name)
+		 VALUES ('voucher', 1, ?, 'fp.pdf')`, mineHash); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// 旧共享目录：本账引用的原件（未迁移、只在旧目录）
+	// + 同目录另一本账的附件（本账没引用）
+	shared := filepath.Join(f.Dir, ".files")
+	putBlob(t, shared, mine)
+	otherRel := ""
+	{
+		data := []byte("别家账套的附件，不该进这份归档")
+		_, otherRel = putBlob(t, shared, data)
+	}
+
+	dest := filepath.Join(f.Dir, "b.mabak")
+	b := &Backup{DBPath: f.DBPath, FilesDir: f.FilesDir,
+		FallbackFilesDirs: []string{shared}}
+	if _, err := b.Create(context.Background(), dest,
+		Options{IncludeFiles: true}); err != nil {
+		t.Fatalf("备份失败: %v", err)
+	}
+
+	zr, err := zip.OpenReader(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	names := map[string]bool{}
+	for _, ze := range zr.File {
+		names[ze.Name] = true
+	}
+	if !names[filesPrefix+mineRel] {
+		t.Error("本账引用、只在旧目录的原件必须被打包")
+	}
+	if names[filesPrefix+otherRel] {
+		t.Error("共享旧目录里别家账套的附件不该进这份归档")
+	}
+}
+
+// 回退目录里恰好有引用文件的坏副本：主目录没有该件时按
+// rel 取主目录版本 —— 主目录缺、回退坏：收集时内容 hash
+// 校验已经会把它拦下（见 collectFilesIn），这里只验证
+// 主目录的好件压过回退坏件（同名 rel 以主目录为准）。
+func TestBackupPrimaryWinsOverFallbackCopy(t *testing.T) {
+	f := newFixture(t)
+
+	db, err := sql.Open("sqlite", "file:"+f.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE attachment (
+		id INTEGER PRIMARY KEY, sha256 TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("主目录里的好原件")
+	hash, rel := putBlob(t, f.FilesDir, data)
+	if _, err := db.Exec(`INSERT INTO attachment(sha256) VALUES (?)`, hash); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// 回退目录放同 rel 的坏副本 —— 它根本不会被读到：
+	// 主目录已收过这个 rel，回退定点取件直接跳过。
+	stale := filepath.Join(f.Dir, ".files")
+	bad := filepath.Join(stale, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(bad), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("被改坏的旧副本"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(f.Dir, "b.mabak")
+	b := &Backup{DBPath: f.DBPath, FilesDir: f.FilesDir,
+		FallbackFilesDirs: []string{stale}}
+	// 关键断言：归档里的那份必须是主目录的好件；
+	// 回退坏件不是「绕过校验」的证据，而是压根不参与收集。
+	if _, err := b.Create(context.Background(), dest,
+		Options{IncludeFiles: true}); err != nil {
+		t.Fatalf("主目录有好件时不该被回退坏副本搅黄: %v", err)
+	}
+
+	zr, err := zip.OpenReader(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	for _, ze := range zr.File {
+		if ze.Name != filesPrefix+rel {
+			continue
+		}
+		rc, err := ze.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, len(data)+64)
+		n, _ := rc.Read(buf)
+		rc.Close()
+		if string(buf[:n]) != string(data) {
+			t.Fatalf("归档里的附件内容应是主目录的好件，实际 %q", buf[:n])
+		}
+		return
+	}
+	t.Fatal("归档缺附件")
+}

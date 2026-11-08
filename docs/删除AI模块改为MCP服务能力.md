@@ -979,3 +979,54 @@ invalid_params），避免解码出几百 MB 的内存申请。
   写 hash 丢 file_name/mime/size/kind。修法：删明细前先
   快照旧附件行并按 hash 保留元数据，删旧行，重新关联时
   用 `linkTx` 的元数据版把名字/类型/大小/kind 带回来。
+
+### 附件链路二次复查修复（验收实测 5 项）
+
+- `vacuumInto`/`scrubSecrets` 同样裸拼 `file:`+path+`?`：
+  带 `?` 的账套名让备份打开的是另一份库，快照内容来自
+  错误的文件。修法：转义逻辑提为 `sqlite.EscapeURIPath`，
+  `buildDSN` 与备份两处共用。
+- 备份只遍历「磁盘上有的」，不核对「库里引用的」：原件
+  丢失的账套生成的是一份「看起来完整」的备份。修法：
+  `Create` 在含附件时按表存在性查 `attachment`/`audit_
+  evidence` 的引用 hash（`referencedHashes`），任一缺失报
+  `ErrMissingFile`；`Backup.FallbackFilesDirs` 让旧布局
+  目录参与收集——但**只按引用 hash 定点取件**，不整目录
+  遍历：共享 `.files` 是同目录多本账共用的池子，整收会把
+  别家账套的附件打进这份归档，引用之外的坏件也不该搅黄
+  备份（主目录同名 rel 优先，回退坏件不参与）。
+- 只读打开跳过物理迁移 → 旧目录里的完好原件被报缺失；
+  迁移按「先读到」选副本 → 坏副本盖过好原件。修法：
+  `attachment.Options.FallbackDirs` 给只读路径兜读 —
+  `Open/Get/Exists/Size` 经 `resolve` 依次查主目录与回退
+  目录，`Get` 逐副本校验 hash 取首个有效；迁移选副本时
+  同样按内容 hash 验证，首个通过验证的才复制。
+- `AttachDocument` 落盘后 SQLite 关联失败仍留文件。
+  修法：Put 前记录 hash 是否已存在，事务失败且该文件
+  本来不在、又无任何引用时 `store.Delete` 清理。
+- `SaveClaim` 元数据按「整单 hash」合并：两条明细共享同一
+  文件但名字不同（line-1/line-2.txt）时后写覆盖先写。
+  修法：快照键改 `(line_no, sha256)` 精确匹配 +
+  `sha256` 兜底（行序变了也能找回元数据）。
+- GUI 冒烟用例随新目录约定同步：`<完整名>.files`。
+
+### 附件链路二次复查收尾（本轮内自查出 +4 项）
+
+- 用户侧「打开原件/下载」路径与实际落点脱节：`MustPath`
+  只回主目录规范位置，文件只在回退目录时界面拿到的是
+  不存在路径。修法：`Store.ResolvePath` 返回首个真实存在
+  的候选（主目录优先），证据链 `linkViews`、`ListAttachments`、
+  桌面 `OpenAttachment`/`AttachmentPath` 全部改走它；
+  写路径（`Put`/`AttachDocument`/孤儿列表）仍用 `MustPath`。
+- `referencedHashes` 查表失败被当「表不存在」跳过：
+  引用集静默清空会让缺失核对失效、坏备份照出。修法：
+  `sqlite_master` 查询出错直接返回错误，只有 `one==0`
+  （老账套真没这张表）才跳过。
+- `migrateLegacyFilesDir` 同款吞错：查表失败静默跳过会
+  整表漏迁。修法：与既有「清单读取失败」分支同口径 —
+  不阻塞开账，但写 stderr 留痕。
+- GUI 冒烟账套原放在 `$TMPDIR` 根：该目录的 `.files` 是
+  历代测试共用的遗留池，内容寻址下同 hash 即同一份原件 —
+  「删实体就报丢失」断言被陈旧副本搅黄（38/39）。修法：
+  账套放进 `mkdtemp` 独立子目录，旧布局回退目录随账套
+  目录一起隔离 —— 与生产环境「账套住在自己的目录里」同构。
