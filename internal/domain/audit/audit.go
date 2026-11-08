@@ -138,14 +138,14 @@ const (
 	ActionBankRuleSave     Action = "bank_rule.save"
 
 	// 业务单据
-	ActionBankImport  Action = "bank.import"
-	ActionBankPost    Action = "bank.post"
+	ActionBankImport    Action = "bank.import"
+	ActionBankPost      Action = "bank.post"
 	ActionInvoiceSave   Action = "invoice.save"
 	ActionInvoiceVerify Action = "invoice.verify"
 	ActionInvoicePost   Action = "invoice.post"
-	ActionClaimSave   Action = "claim.save"
-	ActionClaimPost   Action = "claim.post"
-	ActionClaimReject Action = "claim.reject"
+	ActionClaimSave     Action = "claim.save"
+	ActionClaimPost     Action = "claim.post"
+	ActionClaimReject   Action = "claim.reject"
 
 	// 工资
 	ActionPayrollBuild Action = "payroll.build"
@@ -234,14 +234,14 @@ var actionLabels = map[Action]string{
 	ActionProjectSave:      "维护项目",
 	ActionBankRuleSave:     "维护匹配规则",
 
-	ActionBankImport:  "导入银行流水",
-	ActionBankPost:    "银行流水生成凭证",
+	ActionBankImport:    "导入银行流水",
+	ActionBankPost:      "银行流水生成凭证",
 	ActionInvoiceSave:   "维护发票",
 	ActionInvoiceVerify: "发票认证",
 	ActionInvoicePost:   "发票生成凭证",
-	ActionClaimSave:   "维护报销单",
-	ActionClaimPost:   "报销单生成凭证",
-	ActionClaimReject: "驳回报销单",
+	ActionClaimSave:     "维护报销单",
+	ActionClaimPost:     "报销单生成凭证",
+	ActionClaimReject:   "驳回报销单",
 
 	ActionPayrollBuild: "生成工资表",
 	ActionPayrollPost:  "工资表过账",
@@ -349,6 +349,7 @@ const (
 	SourceGUI    Source = "gui"
 	SourceCLI    Source = "cli"
 	SourceAI     Source = "ai"
+	SourceMCP    Source = "mcp"
 	SourceSystem Source = "system"
 )
 
@@ -361,6 +362,8 @@ func (s Source) Label() string {
 		return "命令行"
 	case SourceAI:
 		return "AI"
+	case SourceMCP:
+		return "外部接口"
 	case SourceSystem:
 		return "系统"
 	}

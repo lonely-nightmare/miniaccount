@@ -174,11 +174,19 @@ func classify(err error) *Fault {
 		errors.Is(err, period.ErrPeriodNotFound):
 		return &Fault{Kind: FaultBlocked, Message: err.Error()}
 
+	// 服务层参数校验错误：输入问题，不是程序坏了。
+	case func() bool { var i *service.InvalidInput; return errors.As(err, &i) }():
+		return &Fault{Kind: FaultInvalid, Message: err.Error()}
+
 	case errors.Is(err, sqlite.ErrBookExists),
 		errors.Is(err, sqlite.ErrBadTaxType),
 		errors.Is(err, sqlite.ErrBadContactKind),
 		errors.Is(err, period.ErrInvalidYearMonth):
 		return &Fault{Kind: FaultInvalid, Message: err.Error()}
+
+	case errors.Is(err, sqlite.ErrVoucherConflict):
+		return &Fault{Kind: FaultBlocked, Message: err.Error() +
+			"\n（这张凭证在你打开后被改过了；刷新列表后重新编辑）"}
 
 	// 数据库层的约束冲突：**这是「你的数据有问题」，不是程序坏了**。
 	//
@@ -873,8 +881,11 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		_ = cur.Shutdown()
 	}
 
-	res, rerr := backup.Restore(a.context(), req.Archive, dbPath, filesDir,
-		sqlite.VerifyOpenable)
+	// 经 service.Restore：内部持跨进程独占占用（§2.4），
+	// 别处开着这个账套的 CLI/MCP/另一实例都会挡住恢复。
+	res, rerr := (&service.Service{}).Restore(a.context(), service.RestoreOptions{
+		Archive: req.Archive, DBPath: dbPath, FilesDir: filesDir,
+	})
 	if rerr != nil {
 		// 恢复失败后把原来的账套重新打开，让用户至少还能用
 		if curPath != "" {

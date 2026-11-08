@@ -88,6 +88,9 @@ type VoucherRequest struct {
 	// 而本工程只在账期结算时过账（用账期管理里填的操作人）。
 	// 字段留着是为了兼容旧调用方传参，不再参与存草稿。
 	PostedBy string `json:"postedBy"`
+	// ExpectedUpdatedAt 是乐观锁戳：编辑器载入详情时拿到的
+	// updatedAt 原样回传；空 = 新建。
+	ExpectedUpdatedAt string `json:"expectedUpdatedAt"`
 }
 
 // toService 把界面输入转成 service 输入，同时完成「元 → 分」的换算。
@@ -95,6 +98,7 @@ func (r VoucherRequest) toService() (service.VoucherInput, error) {
 	out := service.VoucherInput{
 		ID: r.ID, Word: r.Word, Date: r.Date, Remark: r.Remark,
 		AttachCount: r.AttachCount, CreatedBy: r.CreatedBy,
+		ExpectedUpdatedAt: r.ExpectedUpdatedAt,
 	}
 	for i, l := range r.Lines {
 		d, err := ParseYuan(l.DebitYuan)
@@ -140,13 +144,13 @@ func (a *App) SaveVoucher(req VoucherRequest) (out *service.VoucherDetail, err e
 // 想「把这一期记进账」只有一条路：结账。
 
 // DeleteVoucher 删除一张草稿。
-func (a *App) DeleteVoucher(id int64) (err error) {
+func (a *App) DeleteVoucher(id int64, expectedUpdatedAt string) (err error) {
 	defer recoverTo(&err, "DeleteVoucher")()
 	svc, f := a.book()
 	if f != nil {
 		return f
 	}
-	if derr := svc.DeleteVoucher(a.context(), id); derr != nil {
+	if derr := svc.DeleteVoucher(a.context(), id, expectedUpdatedAt); derr != nil {
 		return classify(derr)
 	}
 	return nil

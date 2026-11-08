@@ -75,6 +75,9 @@ async function loadVoucher() {
   form.value = {
     id: d.id, word: d.word, date: d.date, remark: d.remark,
     attachCount: d.attachCount,
+    // 乐观锁戳：载入时看到的 updatedAt，保存时原样回传 ——
+    // 载入后被别的窗口改过的话后端报冲突，不静默覆盖。
+    expectedUpdatedAt: d.updatedAt || '',
     createdBy: d.createdBy || '',
     lines: d.lines.map((l) => ({
       accountCode: l.accountCode, summary: l.summary,
@@ -387,6 +390,7 @@ function payload() {
     date: form.value.date,
     remark: form.value.remark,
     attachCount: Number(form.value.attachCount) || 0,
+    expectedUpdatedAt: form.value.expectedUpdatedAt || '',
     createdBy: form.value.createdBy,
     lines: form.value.lines.map((l) => ({
       accountCode: l.accountCode,
@@ -409,8 +413,10 @@ async function save() {
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
   // 记住这次用的制单人：下次默认就是他（空则不记）
   if (form.value.createdBy?.trim()) await rememberBookkeeper(form.value.createdBy.trim())
-  // 新建的凭证此时才拿到 id —— 附件列表要跟着刷新
+  // 新建的凭证此时才拿到 id —— 附件列表要跟着刷新。
+  // 锁戳也要换成服务端写的新值：接着再改再存才不误判冲突。
   form.value.id = r.data.id
+  form.value.expectedUpdatedAt = r.data.updatedAt || ''
   await loadAttachments()
   emit('saved', r.data)
 }

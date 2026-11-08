@@ -164,6 +164,8 @@ func main() {
 		err = cmdLog(ctx, args)
 	case "bookkeeper":
 		err = cmdBookkeeper(ctx, args)
+	case "mcp":
+		err = cmdMCP(ctx, args)
 	case "version", "-v", "--version":
 		cmdVersion()
 		return

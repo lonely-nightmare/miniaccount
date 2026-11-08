@@ -128,7 +128,7 @@ func TestAuditRecordsVoucherDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DeleteVoucher(ctx, d.ID); err != nil {
+	if err := svc.DeleteVoucher(ctx, d.ID, ""); err != nil {
 		t.Fatalf("删除失败: %v", err)
 	}
 	got := findAudit(t, svc, audit.ActionVoucherDelete)

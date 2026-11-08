@@ -395,6 +395,18 @@ func (s *Service) SaveContact(ctx context.Context, in ContactInput) (id int64, e
 }
 
 func (s *Service) saveContact(ctx context.Context, in ContactInput) (int64, error) {
+	var id int64
+	err := s.db.WithTx(ctx, func(tx *sqliteTx) error {
+		var e error
+		id, e = s.saveContactTx(ctx, tx, in)
+		return e
+	})
+	return id, err
+}
+
+// saveContactTx 在调用方事务内写往来单位；Patch 路径复用它
+// （读旧→合并→校验→写 全在同一事务里）。
+func (s *Service) saveContactTx(ctx context.Context, tx *sqliteTx, in ContactInput) (int64, error) {
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return 0, fmt.Errorf("往来单位名称不能为空")
@@ -405,7 +417,7 @@ func (s *Service) saveContact(ctx context.Context, in ContactInput) (int64, erro
 		kind = "customer"
 	}
 	var id int64
-	err := s.db.WithTx(ctx, func(tx *sqliteTx) error {
+	err := func() error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		if in.ID == 0 {
 			res, err := tx.Exec(ctx, `
@@ -438,7 +450,7 @@ func (s *Service) saveContact(ctx context.Context, in ContactInput) (int64, erro
 		}
 		id = in.ID
 		return nil
-	})
+	}()
 	return id, err
 }
 

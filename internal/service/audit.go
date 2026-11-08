@@ -208,15 +208,19 @@ type AuditEvent struct {
 // ★ 日志写失败**不阻断业务**：用户正在记账，不能让「日志写不进去」
 // 把记账也拦下来。但要在 stderr 留痕 —— 静默失败最后会变成
 // 「审计时发现少了三个月日志」。
-func (s *Service) recordAudit(ctx context.Context, ev AuditEvent) {
+func (s *Service) recordAudit(ctx context.Context, ev AuditEvent) error {
 	if s == nil {
-		return
+		return nil
 	}
 	st, err := auditStoreRef(ctx)
 	if err != nil {
 		auditWarn(err)
-		return
+		if c := callerOf(ctx); c.Warn != nil {
+			c.Warn.Add("审计日志写入失败：" + err.Error())
+		}
+		return err
 	}
+	c := callerOf(ctx)
 	e := audit.Entry{
 		At:       audit.NowStamp(time.Now()),
 		Operator: strings.TrimSpace(ev.Operator),
@@ -233,6 +237,14 @@ func (s *Service) recordAudit(ctx context.Context, ev AuditEvent) {
 		// 不记这个就分不清「哪本账的凭证被删了」。
 		Book:       s.path,
 		AppVersion: AppVersion,
+	}
+	// 调用方身份优先（§2.6）：MCP 等外部通道把「谁、从哪来」
+	// 挂进 ctx，日志照实记，不能全写成「界面」。
+	if c.Operator != "" {
+		e.Operator = c.Operator
+	}
+	if c.Source != "" {
+		e.Source = c.Source
 	}
 	if e.Operator == "" {
 		// 没署名时用**操作系统用户名**兜底，而不是写「未署名」。
@@ -260,7 +272,15 @@ func (s *Service) recordAudit(ctx context.Context, ev AuditEvent) {
 	}
 	if _, err := st.Append(ctx, e); err != nil {
 		auditWarn(err)
+		// 除 stderr 外同步进调用方警告（§2.6）：MCP 适配层把它
+		// 映射为工具结果的 auditWarning —— 外部要知道「操作成了，
+		// 但日志没记上」。幂等重试的留痕证明由 audit_state 持久化。
+		if c.Warn != nil {
+			c.Warn.Add("审计日志写入失败：" + err.Error())
+		}
+		return err
 	}
+	return nil
 }
 
 // cachedCompany 取当前账套的单位名称（取不到就返回空，不报错）。

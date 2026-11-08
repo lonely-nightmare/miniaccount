@@ -127,7 +127,7 @@ async function removeDraft(row) {
   if (removingIds.value.has(row.id)) return
   if (!confirm(`确认删除草稿「${row.remark || row.no || '未命名'}」？\n草稿不占凭证号，删除不会造成断号。`)) return
   removingIds.value = new Set(removingIds.value).add(row.id)
-  const r = await api.deleteVoucher(row.id)
+  const r = await api.deleteVoucher(row.id, row.updatedAt || '')
   removingIds.value.delete(row.id)
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
   notify('草稿已删除', 'success')

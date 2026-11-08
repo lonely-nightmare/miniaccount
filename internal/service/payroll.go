@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"miniaccount/internal/domain/audit"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -239,7 +240,17 @@ func (s *Service) SaveEmployee(ctx context.Context, in EmployeeInput) (int64, er
 	if err := parseIntoDate(in.LeaveDate, &e.LeaveDate); err != nil {
 		return 0, fmt.Errorf("离职日期：%w", err)
 	}
-	return s.db.Payroll().UpsertEmployee(ctx, e)
+	id, err := s.db.Payroll().UpsertEmployee(ctx, e)
+	if err != nil {
+		return 0, err
+	}
+	s.recordAudit(ctx, AuditEvent{
+		Action:  audit.ActionEmployeeSave,
+		Summary: fmt.Sprintf("维护员工 %s", e.Name),
+		Entity:  "employee", EntityID: strconv.FormatInt(id, 10),
+		Detail: map[string]any{"姓名": e.Name, "类别": string(e.Kind)},
+	})
+	return id, nil
 }
 
 // ---------------------------------------------------------------------------

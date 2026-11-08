@@ -435,3 +435,89 @@ func dirPermOf(t *testing.T, path string) os.FileMode {
 	}
 	return fi.Mode().Perm()
 }
+
+// ★ 跨进程交错（文档 §2.7 验收）：
+// A 写满轮转 → B 以陈旧缓存（仍指向第 1 片）追加 → A 再追加。
+// 链不能断、seq 必须唯一。
+func TestCrossProcessInterleave(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	a, err := Open(ctx, Options{Dir: dir, MaxBytes: MinMaxBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := Open(ctx, Options{Dir: dir, MaxBytes: MinMaxBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	// A 写满第 1 片触发轮转（日志行大，几条就够）。
+	big := strings.Repeat("x", int(MinMaxBytes))
+	for a.file == filepath.Join(dir, "audit-0001.db") {
+		e := entry("A", "fill")
+		e.Detail = map[string]any{"pad": big}
+		if _, err := a.Append(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// B 还缓存着第 1 片 + 旧链头。追加时必须发现活动片已换、
+	// 从第 2 片的末条续链。
+	if _, err := b.Append(ctx, entry("B", "stale-append")); err != nil {
+		t.Fatalf("陈旧缓存追加失败: %v", err)
+	}
+	if _, err := a.Append(ctx, entry("A", "after-B")); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := a.Verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.OK {
+		t.Fatalf("交错后链断了: %+v", v.Issues[:3])
+	}
+}
+
+// ★ 轮转后、首条插入前进程退出 → 重开追加的链起点必须取自
+// audit_segment 元数据（空片退回 Genesis 就接不上了）。
+func TestAppendAfterCrashOnEmptySegment(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	st, err := Open(ctx, Options{Dir: dir, MaxBytes: MinMaxBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("x", int(MinMaxBytes))
+	for st.file == filepath.Join(dir, "audit-0001.db") {
+		e := entry("a", "fill")
+		e.Detail = map[string]any{"pad": big}
+		if _, err := st.Append(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 模拟「第 2 片已建、一条都没写进程就退出」：直接关掉。
+	_ = st.Close()
+	// 重开：第 2 片是空的。Append 必须从 audit_segment 的
+	// prev_seq/prev_hash 续链，而不是退回 Genesis。
+	st2, err := Open(ctx, Options{Dir: dir, MaxBytes: MinMaxBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	got, err := st2.Append(ctx, entry("b", "resume"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PrevHash == audit.Genesis() || got.Seq <= 1 {
+		t.Fatalf("空片续链起点错: seq=%d prev=%s", got.Seq, got.PrevHash)
+	}
+	v, err := st2.Verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.OK {
+		t.Fatalf("崩溃后续链断了: %+v", v.Issues[:3])
+	}
+}

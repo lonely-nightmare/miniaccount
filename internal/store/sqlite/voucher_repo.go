@@ -697,6 +697,7 @@ func scanVoucher(rows *sql.Rows) (*voucher.Voucher, error) {
 	v.PostedAt = parseNullTime(postedAt)
 	v.CreatedAt = parseTime(createdAt)
 	v.UpdatedAt = parseTime(updatedAt)
+	v.UpdatedAtText = updatedAt
 	return v, nil
 }
 
@@ -1099,8 +1100,11 @@ func parseTime(s string) time.Time {
 
 // 草稿相关错误。
 var (
-	ErrNotDraft      = errors.New("voucher: 只有草稿可以修改或删除")
-	ErrNotReversible = errors.New("voucher: 该凭证不能红字冲销")
+	ErrNotDraft = errors.New("voucher: 只有草稿可以修改或删除")
+	// ErrVoucherConflict 是乐观锁失败：预期的 updated_at 与库里的
+	// 不一致——这张凭证在读取后被别的窗口/进程改过（§2.5）。
+	ErrVoucherConflict = errors.New("voucher: 凭证已被其他人修改，请刷新后重试")
+	ErrNotReversible   = errors.New("voucher: 该凭证不能红字冲销")
 	// ErrGeneratedVoucher 表示这张凭证由业务单据生成，
 	// 不允许从凭证侧直接删除（会破坏单据的入账链路）。
 	ErrGeneratedVoucher = errors.New("voucher: 该凭证由业务单据生成")
@@ -1233,21 +1237,47 @@ func (r *VoucherRepo) SaveDraftInTx(ctx context.Context, tx *Tx, in DraftInput) 
 	} else {
 		// 只允许改草稿 —— 已过账的凭证只能红字冲销
 		var status string
+		var oldSource string
+		var oldSourceID sql.NullInt64
+		var oldByAI bool
 		if err := tx.QueryRow(ctx,
-			`SELECT status FROM voucher WHERE id = ?`, v.ID).Scan(&status); err != nil {
+			`SELECT status, source, source_id, created_by_ai FROM voucher WHERE id = ?`,
+			v.ID).Scan(&status, &oldSource, &oldSourceID, &oldByAI); err != nil {
 			return nil, translateErr(err)
 		}
 		if voucher.Status(status) != voucher.StatusDraft {
 			return nil, fmt.Errorf("%w（当前状态 %s）", ErrNotDraft, status)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE voucher SET year = ?, month = ?, word = ?, biz_date = ?,
-				attach_count = ?, remark = ?, source = ?, source_id = ?, updated_at = ?
-			 WHERE id = ?`,
+		// ★ 来源字段保留（§2.6 P1）：调用方没带 source 时不能覆写 ——
+		// GUI 原样保存一张 MCP/银行生成的草稿，会把来源刷回空。
+		// 本次调用的来源只进审计日志；created_by_ai 一旦标记不撤销。
+		if v.Source == "" && oldSource != "" {
+			v.Source = voucher.Source(oldSource)
+			if oldSourceID.Valid {
+				v.SourceID = &oldSourceID.Int64
+			}
+		}
+		v.CreatedByAI = v.CreatedByAI || oldByAI
+		// 乐观锁（§2.5）：调用方带来预期的 updated_at 原文时，
+		// 把它并进 UPDATE 条件——0 行即「读后被改」。
+		where := ` WHERE id = ?`
+		args := []any{
 			k.Year, k.Month, string(v.Word), v.BizDate.String(),
 			v.AttachCount, v.Remark, string(v.Source), nullInt64(v.SourceID),
-			nowString(), v.ID); err != nil {
+			nowString(), v.ID}
+		if in.ExpectedUpdatedAt != "" {
+			where += ` AND updated_at = ?`
+			args = append(args, in.ExpectedUpdatedAt)
+		}
+		res, err := tx.Exec(ctx, `
+			UPDATE voucher SET year = ?, month = ?, word = ?, biz_date = ?,
+				attach_count = ?, remark = ?, source = ?, source_id = ?, updated_at = ?`+where,
+			args...)
+		if err != nil {
 			return nil, translateErr(err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, ErrVoucherConflict
 		}
 		// 分录整体替换，理由同 SaveDraft：草稿不占号、无总账，替换没有副作用。
 		if _, err := tx.Exec(ctx,
@@ -1268,6 +1298,10 @@ func (r *VoucherRepo) SaveDraftInTx(ctx context.Context, tx *Tx, in DraftInput) 
 type DraftInput struct {
 	Voucher   *voucher.Voucher
 	CreatedBy string
+	// ExpectedUpdatedAt 是乐观锁（§2.5）：更新已存在草稿时带上
+	// 读取时看到的 updated_at 原文；带了就并进 UPDATE 条件，
+	// 0 行返回 ErrVoucherConflict。新建与内部生成路径留空。
+	ExpectedUpdatedAt string
 	// SkipValidation 仅供迁移与测试使用。
 	SkipValidation bool
 	// Generated 表示这张凭证是**模块算出来的**（工资、报销、发票、银行），
@@ -1308,16 +1342,21 @@ type DeleteResult struct {
 // 「撤销入账」——单据退回生成凭证前的状态，可以重新生成。
 // 工资单生成的凭证例外：删除它会留下「已计提发放却查无凭证」
 // 的工资单，代价太大，直接拒绝。
-func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64) (*DeleteResult, error) {
+func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64, expectedUpdatedAt string) (*DeleteResult, error) {
 	res := &DeleteResult{}
 	err := r.db.WithTx(ctx, func(tx *Tx) error {
-		var status string
+		var status, updatedAt string
 		if err := tx.QueryRow(ctx,
-			`SELECT status FROM voucher WHERE id = ?`, id).Scan(&status); err != nil {
+			`SELECT status, updated_at FROM voucher WHERE id = ?`, id).
+			Scan(&status, &updatedAt); err != nil {
 			return translateErr(err)
 		}
 		if voucher.Status(status) != voucher.StatusDraft {
 			return fmt.Errorf("%w（当前状态 %s）", ErrNotDraft, status)
+		}
+		// 乐观锁（§2.5）：先比对再动关联，失败整个事务回滚。
+		if expectedUpdatedAt != "" && updatedAt != expectedUpdatedAt {
+			return ErrVoucherConflict
 		}
 
 		// 工资凭证不让从凭证页删：计提/发放两张凭证是工资单的
@@ -1638,6 +1677,51 @@ type ListFilter struct {
 	Keyword string
 	// Limit 为 0 时取 200。
 	Limit int
+	// Offset 跳过的行数，分页用；负数按 0 处理。
+	Offset int
+	// AccountPrefix 只留「分录里出现过该前缀科目」的凭证，
+	// 空表示不限。MCP 的 query_vouchers 用它查某科目的凭证。
+	AccountPrefix string
+}
+
+// listWhere 拼 List/ListCount 共用的 WHERE 子句，
+// 保证「分页清单」和「总数」永远按同一口径过滤。
+func listWhere(f ListFilter) (string, []any) {
+	where := ` WHERE 1 = 1`
+	var args []any
+	if f.Year > 0 {
+		where += ` AND year = ?`
+		args = append(args, f.Year)
+	}
+	if f.Month > 0 {
+		where += ` AND month = ?`
+		args = append(args, f.Month)
+	}
+	if f.Status != "" {
+		where += ` AND status = ?`
+		args = append(args, f.Status)
+	}
+	if kw := strings.TrimSpace(f.Keyword); kw != "" {
+		where += ` AND (remark LIKE ? OR no LIKE ?)`
+		like := "%" + kw + "%"
+		args = append(args, like, like)
+	}
+	if p := strings.TrimSpace(f.AccountPrefix); p != "" {
+		where += ` AND EXISTS (SELECT 1 FROM voucher_entry e
+			JOIN account a ON a.id = e.account_id
+			WHERE e.voucher_id = voucher.id AND a.code LIKE ?)`
+		args = append(args, p+"%")
+	}
+	return where, args
+}
+
+// ListCount 返回满足过滤条件的凭证总数（分页 total）。
+func (r *VoucherRepo) ListCount(ctx context.Context, f ListFilter) (int64, error) {
+	where, args := listWhere(f)
+	var n int64
+	err := r.db.sql.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM voucher`+where, args...).Scan(&n)
+	return n, translateErr(err)
 }
 
 // List 按条件查询凭证（不含分录），按日期倒序。
@@ -1646,27 +1730,14 @@ func (r *VoucherRepo) List(ctx context.Context, f ListFilter) ([]*voucher.Vouche
 	if limit <= 0 {
 		limit = 200
 	}
-	sqlText := `SELECT ` + voucherColumns + ` FROM voucher WHERE 1 = 1`
-	var args []any
-	if f.Year > 0 {
-		sqlText += ` AND year = ?`
-		args = append(args, f.Year)
+	where, args := listWhere(f)
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
 	}
-	if f.Month > 0 {
-		sqlText += ` AND month = ?`
-		args = append(args, f.Month)
-	}
-	if f.Status != "" {
-		sqlText += ` AND status = ?`
-		args = append(args, f.Status)
-	}
-	if kw := strings.TrimSpace(f.Keyword); kw != "" {
-		sqlText += ` AND (remark LIKE ? OR no LIKE ?)`
-		like := "%" + kw + "%"
-		args = append(args, like, like)
-	}
-	sqlText += ` ORDER BY biz_date DESC, year DESC, month DESC, seq DESC, id DESC LIMIT ?`
-	args = append(args, limit)
+	sqlText := `SELECT ` + voucherColumns + ` FROM voucher` + where +
+		` ORDER BY biz_date DESC, year DESC, month DESC, seq DESC, id DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
 
 	rows, err := r.db.sql.QueryContext(ctx, sqlText, args...)
 	if err != nil {

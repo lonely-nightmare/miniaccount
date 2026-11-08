@@ -406,3 +406,83 @@ Settings 模型卡 → MCP 服务卡；写工具全开；HTTP 本次实施。
 **验证**：`go build ./...` + `go vet` 干净；`go test ./...` 全绿
 （desktop 105s 全过）；前端 `npm run test` 18/18；`vite build` 通过；
 GUI 套件 39 项全过（AI 相关 5 条已删，路由数断言从 ≥15 维持成立）。
+
+---
+
+## 批 2 实施记录（核心基础设施 + MCP stdio）
+
+按 §2.4–§2.9 实施，顺序与计划一致。
+
+**B2.1 `internal/filelock`**：文件身份（Unix dev+inode / Windows 卷序列+
+文件索引）→ `~/.mini-account/locks/<identity-hash>.lock`；`TryLock`/
+`TryLockExclusive` 非阻塞；锁文件持久不删；无稳定身份的平台拒绝打开
+而非退回路径锁。`LockFile` 另提供目录级锁（审计目录用）。
+
+**B2.2 账套占用**：`service.Open` 共享占用、`service.Restore` 独占占用；
+GUI `RestoreBackup` 改走 `service.Restore`——独占语义在恢复操作两端
+（GUI/CLI/MCP）一致生效。
+
+**B2.3 审计追加临界区**：`auditdb.Append` = 目录文件锁 → 重扫分片与
+链状态 → 追加。空分片也会写元数据行，否则两个进程同时建分片会产出
+两条 genesis。测试 `TestAppendInterleavedAcrossStores` 用两个独立
+Store（模拟两进程）确定性交错验证链连续。
+
+**B2.4 调用方身份**：`WithCaller`/`CallWarnings`/`audit.SourceMCP`/
+`voucher.SourceMCP`；`recordAudit` 返回 error 并写 sink；
+`SaveEmployee`/`DeleteVoucher` 审计缺口补齐；`SaveVoucher` 保留原
+来源（MCP 改一张银行流水生成的凭证，来源仍是 bank）。
+
+**B2.5 凭证乐观锁**：`expectedUpdatedAt` 贯穿
+VoucherEditor→api.js→SaveVoucher/DeleteVoucher→`repo UPDATE/DELETE
+... WHERE updated_at=?`；零行命中 → `ErrVoucherConflict` → GUI
+`FaultBlocked`；`VoucherDetail.UpdatedAt` 暴露原文戳（RFC3339Nano
+存的是原文，重格式化会丢尾零，回传必须原文）。
+
+**B2.6 幂等**：迁移 `0017_mcp_idempotency`（request_id PK、请求 hash、
+voucher_id、initial_updated_at、audit_state）；
+`CreateDraftVoucherIdempotent`——键与凭证同账套事务落库，提交后写
+审计并按成败落 `audit_state`（recorded/failed/pending），重试凭持久化
+状态回答；同键不同内容 → `idempotency_conflict`；目标已删 →
+`idempotent_target_deleted`；被改过 → `modifiedSince`；并发同键由
+主键裁决只建一张。
+
+**B2.7 三态补丁**：`Field[T]{Set,Null,Value}`；抽出 `saveContactTx`/
+`saveDepartmentTx`/`UpsertEmployeeTx`/`EmployeeByIDTx`，
+Patch = WithTx{读旧→合并→校验→写}，审计提交后记录。员工补丁
+白名单仅 name/phone/idCard/bankName/bankAccount/expenseAccountCode/
+companyAccountCode/remark——薪酬基数/部门/离职/启用各有业务动作。
+
+**B2.8 查询下沉**：`VoucherQuery` +`AccountPrefix`/`Offset`；
+`VouchersPage`（{items,total,limit,offset,hasMore}，limit≤500）；
+`LedgerDetail` 从 desktop 下沉到 service（GUI 改别名委托，消除两份
+实现）；`TrialBalance`/`BalanceSheet`/`IncomeStatement` 服务接口；
+`InvalidInput` 错误类型让绑定层映射 `FaultInvalid`、MCP 映射
+`invalid_params`。
+
+**B2.9 `internal/mcpserver`**：go-sdk **v1.7.0**（2026-07-27 发布，
+钉版满足 ≥7 天）。14 读 + 6 写 + 3 资源，无 prompts。金额全部元
+字符串出入（`money.Parse` / `Money.String`）；写工具注入
+`WithCaller{Source:mcp}` 并把 `CallWarnings` 映射为响应里的
+`auditWarnings`；业务错误 → `IsError` + 错误名前缀
+（invalid_params/idempotency_conflict/idempotent_target_deleted/
+conflict/blocked/not_found/readonly/internal），协议层 error 只留给
+调用形态错误。档案三工具用 `map[string]any` 输入以保三态。
+
+**B2.10 stdio**：`miniaccount mcp --db <path> [--readonly]
+[--operator <name>]`；`--db` 必须已存在已初始化，不静默建库；
+stdout 只跑 JSON-RPC，日志一律 stderr。
+
+**冒烟与测试**：真实 stdio 端到端验证——initialize/tools/list
+（恰 20 工具）/resources（3 个）/create_draft_voucher
+（source=mcp、audit_state=recorded）/同键重试（idempotent）/
+同键异内容（idempotency_conflict）/错戳删除（conflict）/对戳删除
+（deleted）。Go 测试：`mcpserver_test`（工具面+元字符串契约+只读）、
+`mcpidem_test`、`patch_test`（三态+白名单）、乐观锁冲突、
+filelock、auditdb 交错追加。
+
+**已知边界**：并发同键只建一张由主键裁决，但**单连接池**下没有真正的
+并发模拟测试；MCP 修改保留凭证原来源（bank 等），来源字段本身
+不可由工具改。
+
+**待批 3**：HTTP 传输（token/Origin/Host 校验、会话世代、SSE）、
+GUI 设置页 MCP 卡、端到端 Wails 构建验证。

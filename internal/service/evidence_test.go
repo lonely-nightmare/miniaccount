@@ -229,7 +229,7 @@ func TestVoucherEvidenceSnapshotAndDangle(t *testing.T) {
 	}
 
 	// 草稿可以删；删掉之后这条依据就悬空了
-	if err := svc.DeleteVoucher(ctx, d.ID); err != nil {
+	if err := svc.DeleteVoucher(ctx, d.ID, ""); err != nil {
 		t.Fatalf("删凭证失败: %v", err)
 	}
 	v2, _ := svc.Evidence(ctx, period.NewKey(2025, 3))
@@ -546,7 +546,7 @@ func TestDeleteDraftVoucherClearsAttachments(t *testing.T) {
 	if _, err := svc.AttachToVoucher(ctx, d.ID, "发票.pdf", []byte("fake pdf")); err != nil {
 		t.Fatalf("挂附件失败: %v", err)
 	}
-	if err := svc.DeleteVoucher(ctx, d.ID); err != nil {
+	if err := svc.DeleteVoucher(ctx, d.ID, ""); err != nil {
 		t.Fatalf("删除草稿失败: %v", err)
 	}
 

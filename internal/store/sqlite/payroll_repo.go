@@ -111,11 +111,43 @@ func scanEmployees(rows *sql.Rows) ([]*payroll.Employee, error) {
 
 // UpsertEmployee 新增或更新员工。
 func (r *PayrollRepo) UpsertEmployee(ctx context.Context, e *payroll.Employee) (int64, error) {
+	var id int64
+	err := r.db.WithTx(ctx, func(tx *Tx) error {
+		var e2 error
+		id, e2 = r.UpsertEmployeeTx(ctx, tx, e)
+		return e2
+	})
+	return id, err
+}
+
+// EmployeeByIDTx 在调用方事务内读单个员工（Patch 的读旧步骤用）。
+func (r *PayrollRepo) EmployeeByIDTx(ctx context.Context, tx *Tx, id int64) (*payroll.Employee, error) {
+	rows, err := tx.Query(ctx, `SELECT `+employeeColumns+`
+		FROM employee e
+		JOIN account a ON a.id = e.expense_account_id
+		LEFT JOIN account ca ON ca.id = e.company_account_id
+		WHERE e.id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list, err := scanEmployees(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("%w: 员工 id=%d", ErrNotFound, id)
+	}
+	return list[0], nil
+}
+
+// UpsertEmployeeTx 在调用方事务内写员工；Patch（读旧→合并→写）与普通保存共用。
+func (r *PayrollRepo) UpsertEmployeeTx(ctx context.Context, tx *Tx, e *payroll.Employee) (int64, error) {
 	if err := e.Validate(); err != nil {
 		return 0, err
 	}
 	var id int64
-	err := r.db.WithTx(ctx, func(tx *Tx) error {
+	err := func() error {
 		accIDs, err := r.db.Accounts().IDsByCodeTx(ctx, tx)
 		if err != nil {
 			return err
@@ -171,7 +203,7 @@ func (r *PayrollRepo) UpsertEmployee(ctx context.Context, e *payroll.Employee) (
 			boolInt(e.IsEnabled), e.Remark, now, e.ID)
 		id = e.ID
 		return err
-	})
+	}()
 	return id, err
 }
 

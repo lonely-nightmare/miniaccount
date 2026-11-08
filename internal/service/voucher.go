@@ -34,6 +34,10 @@ type VoucherQuery struct {
 	Status      string
 	Keyword     string
 	Limit       int
+	// Offset / AccountPrefix 只对分页接口 VouchersPage 生效；
+	// GUI 的整月列表 Vouchers 不用它们。
+	Offset        int
+	AccountPrefix string
 }
 
 // VoucherSummary 是列表里的一张凭证。
@@ -65,6 +69,8 @@ type VoucherSummary struct {
 	PostedBy  string `json:"postedBy"`
 	// Lines 是分录行数。列表上不显示分录，但行数能帮人一眼判断是否完整。
 	Lines int `json:"lines"`
+	// UpdatedAt 是乐观锁戳，删除时回传。
+	UpdatedAt string `json:"updatedAt"`
 }
 
 // Vouchers 返回凭证列表。
@@ -104,7 +110,7 @@ func (s *Service) Vouchers(ctx context.Context, q VoucherQuery) ([]VoucherSummar
 			Amount: v.Amount(), Source: string(v.Source),
 			SourceLabel: v.Source.Label(), CreatedByAI: v.CreatedByAI,
 			CreatedBy: v.CreatedBy, PostedBy: v.PostedBy,
-			Lines: counts[v.ID],
+			Lines: counts[v.ID], UpdatedAt: v.UpdatedAtText,
 		})
 	}
 	return out, nil
@@ -173,6 +179,9 @@ type VoucherDetail struct {
 	TotalCredit money.Money `json:"totalCredit"`
 	// Balanced 为假时界面必须显眼提示。
 	Balanced bool `json:"balanced"`
+	// UpdatedAt 是乐观锁戳（updated_at 存储原文）：改/删这张
+	// 凭证时必须把它回传（expectedUpdatedAt）。
+	UpdatedAt string `json:"updatedAt"`
 
 	// CanEdit / CanDelete / CanPost / CanReverse 由服务层算好，
 	// 界面照着禁用按钮即可 —— 状态机的规则只在一处实现。
@@ -225,7 +234,8 @@ func (s *Service) Voucher(ctx context.Context, id int64) (*VoucherDetail, error)
 
 	d := &VoucherDetail{
 		ID: v.ID, No: v.No, Word: string(v.Word), Date: v.BizDate.String(),
-		Remark: v.Remark, Status: string(v.Status),
+		UpdatedAt: v.UpdatedAtText,
+		Remark:    v.Remark, Status: string(v.Status),
 		StatusLabel: v.Status.Label(), AttachCount: v.AttachCount,
 		Source: string(v.Source), SourceLabel: v.Source.Label(),
 		CreatedByAI: v.CreatedByAI,
@@ -335,6 +345,10 @@ type VoucherInput struct {
 	Source      voucher.Source
 	SourceID    *int64
 	CreatedByAI bool
+	// ExpectedUpdatedAt 是乐观锁：更新已存在草稿时带读取时看到的
+	// updatedAt 原文；与库里不一致时报冲突（§2.5）。新建与内部
+	// 生成路径留空。
+	ExpectedUpdatedAt string
 }
 
 // build 把界面输入转成领域对象，并执行完整校验。
@@ -461,6 +475,7 @@ func (s *Service) SaveVoucher(ctx context.Context, in VoucherInput) (*VoucherDet
 	}
 	res, err := s.db.Vouchers().SaveDraft(ctx, sqlite.DraftInput{
 		Voucher: v, CreatedBy: v.CreatedBy,
+		ExpectedUpdatedAt: in.ExpectedUpdatedAt,
 	})
 	if err != nil {
 		return nil, err
@@ -518,12 +533,12 @@ func auditLines(v *voucher.Voucher) []map[string]any {
 //
 // ★ 规范点名要记「尚未记账凭证的删除」—— 草稿删掉就没了，
 // 日志是它存在过的唯一证据，所以删除前先把内容抄进日志。
-func (s *Service) DeleteVoucher(ctx context.Context, id int64) error {
+func (s *Service) DeleteVoucher(ctx context.Context, id int64, expectedUpdatedAt string) error {
 	before, err := s.Voucher(ctx, id)
 	if err != nil {
 		return err
 	}
-	delRes, err := s.db.Vouchers().DeleteDraft(ctx, id)
+	delRes, err := s.db.Vouchers().DeleteDraft(ctx, id, expectedUpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -557,11 +572,14 @@ func (s *Service) DeleteVoucher(ctx context.Context, id int64) error {
 			}
 		}
 	}
+	// 操作人走 caller：删凭证的人和原制单人未必是同一个 —
+	// 原制单人已在 detail 里（「被删除凭证的署名」是业务事实），
+	// 而日志的 operator 必须回答「谁删的」。
 	s.recordAudit(ctx, AuditEvent{
 		Action:  audit.ActionVoucherDelete,
 		Summary: "删除凭证草稿 " + firstNonEmpty(before.No, "#"+strconv.FormatInt(id, 10)),
 		Entity:  "voucher", EntityID: strconv.FormatInt(id, 10),
-		Operator: before.CreatedBy, Detail: detail,
+		Detail: detail,
 	})
 	return nil
 }

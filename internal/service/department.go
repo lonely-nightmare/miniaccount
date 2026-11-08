@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,6 +93,36 @@ func (s *Service) SaveDepartment(ctx context.Context, d Department) (int64, erro
 
 	var id int64
 	err := s.db.WithTx(ctx, func(tx *sqliteTx) error {
+		var e error
+		id, e = s.saveDepartmentTx(ctx, tx, d)
+		return e
+	})
+	if err != nil {
+		return 0, err
+	}
+	s.recordAudit(ctx, AuditEvent{
+		Action:  audit.ActionDepartmentSave,
+		Summary: fmt.Sprintf("维护部门 %s", name),
+		Entity:  "department", EntityID: strconv.FormatInt(id, 10),
+		Detail: map[string]any{"名称": name, "编码": code, "启用": d.Enabled},
+	})
+	return id, nil
+}
+
+// saveDepartmentTx 在调用方事务内写部门；Patch 路径复用它。
+func (s *Service) saveDepartmentTx(ctx context.Context, tx *sqliteTx, d Department) (int64, error) {
+	name := strings.TrimSpace(d.Name)
+	if name == "" {
+		return 0, fmt.Errorf("部门名称不能为空")
+	}
+	code := strings.TrimSpace(d.Code)
+	if code == "" {
+		// 没给编码时用名称兜底 —— 部门编码对小微企业没有实际意义，
+		// 强制要求填只会增加录入负担
+		code = name
+	}
+	var id int64
+	err := func() error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		if d.ID == 0 {
 			res, err := tx.Exec(ctx, `
@@ -119,7 +150,7 @@ func (s *Service) SaveDepartment(ctx context.Context, d Department) (int64, erro
 		}
 		id = d.ID
 		return nil
-	})
+	}()
 	return id, err
 }
 

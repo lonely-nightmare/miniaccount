@@ -111,7 +111,7 @@ func TestDeleteDraftUnlinksInvoice(t *testing.T) {
 	}
 	vid := vs[0].ID
 	// 以前这一步直接撞外键约束报错；现在删除前先解除单据关联。
-	if err := svc.DeleteVoucher(ctx, vid); err != nil {
+	if err := svc.DeleteVoucher(ctx, vid, ""); err != nil {
 		t.Fatalf("删除生成草稿失败: %v", err)
 	}
 	list, err := svc.Invoices(ctx, service.InvoiceQuery{})

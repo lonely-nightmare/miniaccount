@@ -34,6 +34,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"miniaccount/internal/domain/audit"
+	"miniaccount/internal/filelock"
 )
 
 // 默认分片上限：100MB。
@@ -230,22 +231,36 @@ func (s *Store) openActive(ctx context.Context) error {
 
 // refreshChain 从当前分片重读链头（hash）与全局序号（seq）。
 //
-// 启动时用它接续上次的链；写入撞唯一约束时也用它 ——
-// 另一个写入方（桌面端与 CLI 同开一本账）先进了一条时，
-// 重读链头重算哈希，后到者仍然接得上。
+// 分两种情形（文档 §2.7）：
+//   - 分片非空 → 取本片末条日志的 seq/hash；
+//   - 分片为空 → 取 audit_segment 里的 prev_seq/prev_hash。
+//     空片退回 Genesis 是错的：「第二片已建元数据、首条日志
+//     插入失败或进程退出」后，续链必须从该片声明的起点开始。
+//     元数据缺失或读取失败 → 报错，绝不退回 Genesis。
 func (s *Store) refreshChain(ctx context.Context) error {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(seq),0), COALESCE(MAX(segment_seq),0) FROM audit_log`)
+	var prevHash string
+	var prevSeq int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT prev_hash, prev_seq FROM audit_segment WHERE id = 1`).
+		Scan(&prevHash, &prevSeq); err != nil {
+		return fmt.Errorf("auditdb: 分片元数据缺失或读取失败: %w", err)
+	}
+	s.seq = prevSeq
+	s.head = prevHash
+
 	var seq int64
-	var segSeq int64
-	if err := row.Scan(&seq, &segSeq); err != nil {
+	var h sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT seq, hash FROM audit_log ORDER BY segment_seq DESC LIMIT 1`).
+		Scan(&seq, &h)
+	if err == sql.ErrNoRows {
+		return nil // 空片：停在 audit_segment 声明的起点
+	}
+	if err != nil {
 		return fmt.Errorf("auditdb: 读链头失败: %w", err)
 	}
 	s.seq = seq
-	s.head = audit.Genesis()
-	var h sql.NullString
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT hash FROM audit_log ORDER BY segment_seq DESC LIMIT 1`).Scan(&h); err == nil && h.Valid {
+	if h.Valid {
 		s.head = h.String
 	}
 	return nil
@@ -458,10 +473,39 @@ func (s *Store) Append(ctx context.Context, e audit.Entry) (audit.Entry, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.db == nil {
-		if err := s.openActive(ctx); err != nil {
+	// ★ 跨进程临界区（文档 §2.7：锁 + 状态刷新，缺一不可）。
+	//
+	// seq/head/活动分片是进程内缓存；另一个进程可能已轮转 —
+	// 只套文件锁不刷新的话，A 已写到第 2 片、B 仍对着第 1 片
+	// 的旧链头追加，串行执行也会写错片或断链。
+	lk, err := filelock.LockFile(filepath.Join(s.dir, ".audit.lock"), true)
+	if err != nil {
+		return e, fmt.Errorf("auditdb: 取日志目录锁失败: %w", err)
+	}
+	defer lk.Release()
+
+	// 发现活动分片（max audit-*.db）；活动片 ≠ 缓存片 → 切换句柄。
+	files, err := s.files()
+	if err != nil {
+		return e, err
+	}
+	var active string
+	if len(files) > 0 {
+		active = files[len(files)-1]
+	}
+	switch {
+	case active == "":
+		if err := s.createSegment(ctx, 1, audit.Genesis(), 0); err != nil {
 			return e, err
 		}
+	case s.db == nil || s.file != active:
+		if err := s.openFile(ctx, active); err != nil {
+			return e, err
+		}
+	}
+	// 锁内恢复链状态：另一进程的追加/轮转可能已经改了它。
+	if err := s.refreshChain(ctx); err != nil {
+		return e, err
 	}
 	if err := s.rotateIfNeeded(ctx); err != nil {
 		return e, err

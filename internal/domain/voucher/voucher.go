@@ -112,7 +112,8 @@ const (
 	SourceInvoice Source = "invoice" // 发票
 	SourceClosing Source = "closing" // 期末结转损益
 	SourceOpening Source = "opening" // 期初余额
-	SourceAI      Source = "ai"      // AI 提议后人工确认
+	SourceAI      Source = "ai"      // AI 提议后人工确认（历史数据标记）
+	SourceMCP     Source = "mcp"     // 外部 MCP 工具创建
 	// SourceDepreciation 是固定资产折旧计提。
 	SourceDepreciation Source = "depreciation"
 	// SourceAmortization 是长期待摊费用摊销。
@@ -143,6 +144,8 @@ func (s Source) Label() string {
 		return "期初余额"
 	case SourceAI:
 		return "AI 建议"
+	case SourceMCP:
+		return "MCP"
 	case SourceDepreciation:
 		return "折旧"
 	case SourceAmortization:
@@ -240,6 +243,10 @@ type Voucher struct {
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// UpdatedAtText 是 updated_at 列的**原文**。
+	// 乐观锁比较（WHERE updated_at = ?）必须用存储原文：
+	// time.Time 重格式化 RFC3339Nano 会丢尾零，对不上。
+	UpdatedAtText string
 
 	// Entries 是分录。复用 ledger.Entry —— 本工程里凭证分录
 	// 就是过账分录，不需要中间转换类型。

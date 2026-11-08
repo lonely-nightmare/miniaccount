@@ -909,7 +909,7 @@ func TestNotFoundIsNotReportedAsInternal(t *testing.T) {
 	}
 
 	_, e1 := a.VoucherDetail(999999)
-	e2 := a.DeleteVoucher(999999)
+	e2 := a.DeleteVoucher(999999, "")
 	cases := []struct {
 		name string
 		err  error

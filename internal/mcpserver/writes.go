@@ -1,0 +1,407 @@
+package mcpserver
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"miniaccount/internal/domain/money"
+	"miniaccount/internal/service"
+)
+
+// ---------------------------------------------------------------------------
+// 写工具输入
+// ---------------------------------------------------------------------------
+
+type voucherLineIn struct {
+	AccountCode string `json:"accountCode" jsonschema:"科目编码，如 660201"`
+	Summary     string `json:"summary,omitempty" jsonschema:"分录摘要，留空沿用凭证摘要"`
+	Debit       string `json:"debit,omitempty" jsonschema:"借方金额（元字符串，如 \"1234.56\"）"`
+	Credit      string `json:"credit,omitempty" jsonschema:"贷方金额（元字符串）"`
+	ContactID   *int64 `json:"contactId,omitempty" jsonschema:"往来单位 id（科目要求辅助核算时必填）"`
+	EmployeeID  *int64 `json:"employeeId,omitempty"`
+	DeptID      *int64 `json:"deptId,omitempty"`
+	ProjectID   *int64 `json:"projectId,omitempty"`
+}
+
+type createDraftVoucherIn struct {
+	Date            string          `json:"date" jsonschema:"记账日期 YYYY-MM-DD"`
+	Remark          string          `json:"remark,omitempty" jsonschema:"凭证摘要"`
+	AttachCount     int             `json:"attachCount,omitempty" jsonschema:"附单据数"`
+	Lines           []voucherLineIn `json:"lines" jsonschema:"分录，至少两行且借贷平衡"`
+	ClientRequestID string          `json:"clientRequestId,omitempty" jsonschema:"幂等键：同键同内容重试返回原凭证"`
+}
+
+type updateDraftVoucherIn struct {
+	ID                int64           `json:"id" jsonschema:"凭证 id"`
+	ExpectedUpdatedAt string          `json:"expectedUpdatedAt" jsonschema:"读取时看到的 updatedAt（乐观锁）"`
+	Date              *string         `json:"date,omitempty"`
+	Remark            *string         `json:"remark,omitempty"`
+	AttachCount       *int            `json:"attachCount,omitempty"`
+	Lines             []voucherLineIn `json:"lines,omitempty" jsonschema:"给出时整体替换分录"`
+}
+
+type deleteDraftVoucherIn struct {
+	ID                int64  `json:"id" jsonschema:"凭证 id"`
+	ExpectedUpdatedAt string `json:"expectedUpdatedAt" jsonschema:"读取时看到的 updatedAt（乐观锁）"`
+}
+
+// 档案类写工具用 map 输入 —— 需要区分「缺席 / null / 有值」三态，
+// 结构体输入做不到（缺席和零值看起来一样）。
+// 三态合并规则在服务层 patch.go。
+
+// ---------------------------------------------------------------------------
+// 注册
+// ---------------------------------------------------------------------------
+
+func (s *Server) registerWriteTools() {
+	// create_draft_voucher —— 全量校验 + 幂等键。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "create_draft_voucher",
+		Description: "创建凭证**草稿**（不会过账）。走与界面相同的全部校验；" +
+			"带 clientRequestId 时同键重试返回原凭证。过账请让人在界面确认后操作。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in createDraftVoucherIn) (*mcp.CallToolResult, any, error) {
+		if s.readonly {
+			return readonlyErr()
+		}
+		ctx, warn := s.callCtx(ctx)
+		vin, err := buildVoucherInput(in.Lines, in.Date, in.Remark, in.AttachCount)
+		if err != nil {
+			return toolError(err)
+		}
+		vin.CreatedBy = s.operator
+		hash := hashCreateRequest(vin)
+		d, outcome, err := s.svc.CreateDraftVoucherIdempotent(ctx, *vin, in.ClientRequestID, hash)
+		if err != nil {
+			return toolError(err)
+		}
+		return nil, voucherResult(d, outcome, warn), nil
+	})
+
+	// update_draft_voucher —— 仅草稿 + 乐观锁。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "update_draft_voucher",
+		Description: "修改**草稿**凭证；必须带读取时的 updatedAt。" +
+			"已过账凭证不能改（要改请走红字冲销，MCP 不提供）。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in updateDraftVoucherIn) (*mcp.CallToolResult, any, error) {
+		if s.readonly {
+			return readonlyErr()
+		}
+		ctx, warn := s.callCtx(ctx)
+		d, err := s.svc.Voucher(ctx, in.ID)
+		if err != nil {
+			return toolError(err)
+		}
+		if d.Status != "draft" {
+			return toolError(&service.InvalidInput{Msg: "只能修改草稿凭证"})
+		}
+		vin := service.VoucherInput{
+			ID: in.ID, Date: d.Date, Remark: d.Remark,
+			AttachCount: d.AttachCount, ExpectedUpdatedAt: in.ExpectedUpdatedAt,
+			CreatedBy: d.CreatedBy,
+		}
+		if in.Date != nil {
+			vin.Date = *in.Date
+		}
+		if in.Remark != nil {
+			vin.Remark = *in.Remark
+		}
+		if in.AttachCount != nil {
+			vin.AttachCount = *in.AttachCount
+		}
+		if in.Lines != nil {
+			lines, err := buildLines(in.Lines, vin.Remark)
+			if err != nil {
+				return toolError(err)
+			}
+			vin.Lines = lines
+		} else {
+			for _, l := range d.Lines {
+				vin.Lines = append(vin.Lines, service.VoucherLineInput{
+					AccountCode: l.AccountCode, Summary: l.Summary,
+					Debit: l.Debit, Credit: l.Credit,
+					ContactID: l.ContactID, EmployeeID: l.EmployeeID,
+					DeptID: l.DeptID, ProjectID: l.ProjectID,
+				})
+			}
+		}
+		// 修改保留原来源 —— MCP 改一张银行流水生成的凭证，
+		// 它的来源仍应是 bank，不是 mcp。service 层按此落库。
+		out, err := s.svc.SaveVoucher(ctx, vin)
+		if err != nil {
+			return toolError(err)
+		}
+		return nil, voucherResult(out, nil, warn), nil
+	})
+
+	// delete_draft_voucher —— 仅草稿 + 乐观锁。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "delete_draft_voucher",
+		Description: "删除**草稿**凭证；必须带读取时的 updatedAt。" +
+			"已过账凭证不能删。工资单生成的凭证请从工资模块处理。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in deleteDraftVoucherIn) (*mcp.CallToolResult, any, error) {
+		if s.readonly {
+			return readonlyErr()
+		}
+		ctx, warn := s.callCtx(ctx)
+		d, err := s.svc.Voucher(ctx, in.ID)
+		if err != nil {
+			return toolError(err)
+		}
+		if d.Status != "draft" {
+			return toolError(&service.InvalidInput{Msg: "只能删除草稿凭证"})
+		}
+		if err := s.svc.DeleteVoucher(ctx, in.ID, in.ExpectedUpdatedAt); err != nil {
+			return toolError(err)
+		}
+		return nil, map[string]any{
+			"deleted": true, "id": in.ID,
+			"auditWarnings": warn.All(),
+		}, nil
+	})
+
+	// upsert_contact —— 三态部分更新。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "upsert_contact",
+		Description: "新建或部分更新往来单位。id 缺席=新建；字段缺席=保持原值，" +
+			"字段为 null=清空，字段有值=设置。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+		if s.readonly {
+			return readonlyErr()
+		}
+		ctx, warn := s.callCtx(ctx)
+		var id int64
+		if v, ok := in["id"]; ok && v != nil {
+			f, _ := v.(float64)
+			id = int64(f)
+			delete(in, "id")
+		}
+		p := service.ContactPatch{
+			Kind:          patchStr(in, "kind"),
+			Name:          patchStr(in, "name"),
+			ShortName:     patchStr(in, "shortName"),
+			TaxNo:         patchStr(in, "taxNo"),
+			BankName:      patchStr(in, "bankName"),
+			BankAccount:   patchStr(in, "bankAccount"),
+			ContactPerson: patchStr(in, "contactPerson"),
+			Phone:         patchStr(in, "phone"),
+			Address:       patchStr(in, "address"),
+			Enabled:       patchBool(in, "enabled"),
+			Remark:        patchStr(in, "remark"),
+		}
+		out, err := s.svc.PatchContact(ctx, id, p)
+		if err != nil {
+			return toolError(err)
+		}
+		return nil, map[string]any{"id": out, "auditWarnings": warn.All()}, nil
+	})
+
+	// save_department —— 三态部分更新。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "save_department",
+		Description: "新建或部分更新部门。id 缺席=新建；parentId=null 表示顶层部门。" +
+			"三态规则同 upsert_contact。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+		if s.readonly {
+			return readonlyErr()
+		}
+		ctx, warn := s.callCtx(ctx)
+		var id int64
+		if v, ok := in["id"]; ok && v != nil {
+			f, _ := v.(float64)
+			id = int64(f)
+			delete(in, "id")
+		}
+		p := service.DepartmentPatch{
+			Code:    patchStr(in, "code"),
+			Name:    patchStr(in, "name"),
+			Parent:  patchInt(in, "parentId"),
+			Enabled: patchBool(in, "enabled"),
+			Remark:  patchStr(in, "remark"),
+		}
+		out, err := s.svc.PatchDepartment(ctx, id, p)
+		if err != nil {
+			return toolError(err)
+		}
+		return nil, map[string]any{"id": out, "auditWarnings": warn.All()}, nil
+	})
+
+	// update_employee —— 白名单部分更新。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "update_employee",
+		Description: "部分更新员工档案（仅修改，不建人）。可调字段：name/phone/idCard/" +
+			"bankName/bankAccount/expenseAccountCode/companyAccountCode/remark。" +
+			"薪酬基数、部门、离职、启用各有业务动作，不在此工具内。",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+		if s.readonly {
+			return readonlyErr()
+		}
+		ctx, warn := s.callCtx(ctx)
+		v, ok := in["id"]
+		if !ok || v == nil {
+			return toolError(&service.InvalidInput{Msg: "update_employee 必须提供员工 id"})
+		}
+		f, _ := v.(float64)
+		p := service.EmployeePatch{
+			Name:               patchStr(in, "name"),
+			Phone:              patchStr(in, "phone"),
+			IDCard:             patchStr(in, "idCard"),
+			BankName:           patchStr(in, "bankName"),
+			BankAccount:        patchStr(in, "bankAccount"),
+			ExpenseAccountCode: patchStr(in, "expenseAccountCode"),
+			CompanyAccountCode: patchStr(in, "companyAccountCode"),
+			Remark:             patchStr(in, "remark"),
+		}
+		if err := s.svc.PatchEmployee(ctx, int64(f), p); err != nil {
+			return toolError(err)
+		}
+		return nil, map[string]any{"id": int64(f), "auditWarnings": warn.All()}, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// 装配辅助
+// ---------------------------------------------------------------------------
+
+// buildVoucherInput 把工具输入拼成服务层输入；金额元字符串在这里解析成分。
+func buildVoucherInput(lines []voucherLineIn, date, remark string, attach int) (*service.VoucherInput, error) {
+	ls, err := buildLines(lines, remark)
+	if err != nil {
+		return nil, err
+	}
+	return &service.VoucherInput{
+		Date: date, Remark: remark, AttachCount: attach, Lines: ls,
+	}, nil
+}
+
+func buildLines(in []voucherLineIn, fallbackSummary string) ([]service.VoucherLineInput, error) {
+	if len(in) == 0 {
+		return nil, &service.InvalidInput{Msg: "至少需要一条分录（实际至少要两行且借贷平衡）"}
+	}
+	out := make([]service.VoucherLineInput, 0, len(in))
+	for i, l := range in {
+		var d, c money.Money
+		if l.Debit != "" {
+			var err error
+			if d, err = parseYuan(l.Debit); err != nil {
+				return nil, &service.InvalidInput{Msg: fmt.Sprintf("第 %d 行借方金额: %v", i+1, err)}
+			}
+		}
+		if l.Credit != "" {
+			var err error
+			if c, err = parseYuan(l.Credit); err != nil {
+				return nil, &service.InvalidInput{Msg: fmt.Sprintf("第 %d 行贷方金额: %v", i+1, err)}
+			}
+		}
+		summary := l.Summary
+		if summary == "" {
+			summary = fallbackSummary // 服务层要求分录摘要非空，工具契约允许留空沿用凭证摘要
+		}
+		out = append(out, service.VoucherLineInput{
+			AccountCode: l.AccountCode, Summary: summary,
+			Debit: d, Credit: c,
+			ContactID: l.ContactID, EmployeeID: l.EmployeeID,
+			DeptID: l.DeptID, ProjectID: l.ProjectID,
+		})
+	}
+	return out, nil
+}
+
+// hashCreateRequest 对创建请求做内容指纹；同键不同内容据此识别。
+func hashCreateRequest(in *service.VoucherInput) string {
+	b, _ := json.Marshal(in)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// voucherOut 输出凭证：金额字段换成元字符串（契约：不暴露分）。
+func voucherOut(d *service.VoucherDetail) any {
+	return map[string]any{
+		"id": d.ID, "no": d.No, "word": d.Word, "date": d.Date,
+		"remark": d.Remark, "status": d.Status, "statusLabel": d.StatusLabel,
+		"attachCount": d.AttachCount, "source": d.Source,
+		"createdBy": d.CreatedBy, "postedBy": d.PostedBy, "postedAt": d.PostedAt,
+		"reversesNo": d.ReversesNo, "voidedByNo": d.VoidedByNo,
+		"lines":       voucherLinesOut(d),
+		"totalDebit":  yuanStr(d.TotalDebit),
+		"totalCredit": yuanStr(d.TotalCredit),
+		"balanced":    d.Balanced,
+		"updatedAt":   d.UpdatedAt,
+	}
+}
+
+func voucherLinesOut(d *service.VoucherDetail) []map[string]any {
+	out := make([]map[string]any, 0, len(d.Lines))
+	for _, l := range d.Lines {
+		out = append(out, map[string]any{
+			"lineNo": l.LineNo, "accountCode": l.AccountCode,
+			"accountName": l.AccountName, "summary": l.Summary,
+			"debit": yuanStr(l.Debit), "credit": yuanStr(l.Credit),
+			"auxDesc":   l.AuxDesc,
+			"contactId": l.ContactID, "employeeId": l.EmployeeID,
+			"deptId": l.DeptID, "projectId": l.ProjectID,
+		})
+	}
+	return out
+}
+
+// voucherResult 是写工具的统一返回形。
+func voucherResult(d *service.VoucherDetail, outcome *service.IdemOutcome,
+	warn *service.CallWarnings) map[string]any {
+	res := map[string]any{"voucher": voucherOut(d)}
+	if outcome != nil {
+		res["idempotent"] = outcome.Idempotent
+		res["modifiedSince"] = outcome.ModifiedSince
+		if outcome.AuditState != "" {
+			res["auditState"] = outcome.AuditState
+		}
+		if outcome.AuditError != "" {
+			res["auditError"] = outcome.AuditError
+		}
+	}
+	if w := warn.All(); len(w) > 0 {
+		res["auditWarnings"] = w
+	}
+	return res
+}
+
+// patchStr / patchBool / patchInt 把 map 输入解成三态 Field。
+func patchStr(in map[string]any, key string) service.Field[string] {
+	v, ok := in[key]
+	if !ok {
+		return service.Field[string]{}
+	}
+	if v == nil {
+		return service.Field[string]{Set: true, Null: true}
+	}
+	s, _ := v.(string)
+	return service.Field[string]{Set: true, Value: s}
+}
+
+func patchBool(in map[string]any, key string) service.Field[bool] {
+	v, ok := in[key]
+	if !ok {
+		return service.Field[bool]{}
+	}
+	if v == nil {
+		return service.Field[bool]{Set: true, Null: true}
+	}
+	b, _ := v.(bool)
+	return service.Field[bool]{Set: true, Value: b}
+}
+
+func patchInt(in map[string]any, key string) service.Field[int64] {
+	v, ok := in[key]
+	if !ok {
+		return service.Field[int64]{}
+	}
+	if v == nil {
+		return service.Field[int64]{Set: true, Null: true}
+	}
+	f, _ := v.(float64)
+	return service.Field[int64]{Set: true, Value: int64(f)}
+}

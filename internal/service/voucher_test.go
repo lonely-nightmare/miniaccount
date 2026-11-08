@@ -135,7 +135,7 @@ func TestDraftsDoNotConsumeNumbers(t *testing.T) {
 	ids := []int64{mk("第一笔"), mk("第二笔"), mk("第三笔")}
 
 	// 先删掉中间那张，再过账其余两张
-	if err := svc.DeleteVoucher(ctx, ids[1]); err != nil {
+	if err := svc.DeleteVoucher(ctx, ids[1], ""); err != nil {
 		t.Fatalf("删除草稿失败: %v", err)
 	}
 	res, err := svc.PostPeriodDrafts(ctx, periodKey(2025, 1), "王主管")
@@ -162,7 +162,7 @@ func TestDeletePostedVoucherFails(t *testing.T) {
 	if _, err := svc.PostVoucher(ctx, d.ID, "王主管"); err != nil {
 		t.Fatal(err)
 	}
-	err := svc.DeleteVoucher(ctx, d.ID)
+	err := svc.DeleteVoucher(ctx, d.ID, "")
 	if err == nil {
 		t.Fatal("已过账凭证必须拒绝删除")
 	}
@@ -543,5 +543,65 @@ func TestCheckVoucher(t *testing.T) {
 	}
 	if !strings.Contains(res.Message, "差额") {
 		t.Errorf("应给出差额，实际 %q", res.Message)
+	}
+}
+
+// ★ 乐观锁（§2.5 验收）：两个「窗口」拿同一戳去改同一张草稿，
+// 先提交的成功，后提交的必须报冲突而不是静默覆盖。
+func TestOptimisticLockConflict(t *testing.T) {
+	ctx := context.Background()
+	svc := newSvc(t, 3)
+	sh := mustContact(t, svc, "shareholder", "张三")
+
+	mkIn := func() service.VoucherInput {
+		in := basicInput()
+		in.Lines[1].ContactID = &sh
+		return in
+	}
+	id := saveDraft(t, svc, mkIn()).ID
+
+	stamp := func() string {
+		d, err := svc.Voucher(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.UpdatedAt == "" {
+			t.Fatal("详情没下发 updatedAt —— 乐观锁无从谈起")
+		}
+		return d.UpdatedAt
+	}
+
+	// 窗口 A 与窗口 B 同时打开，拿到同一个戳
+	stale := stamp()
+
+	// 窗口 A 保存成功（服务端换戳）
+	upd := mkIn()
+	upd.ID = id
+	upd.Remark = "A 先提交的修改"
+	upd.ExpectedUpdatedAt = stale
+	if _, err := svc.SaveVoucher(ctx, upd); err != nil {
+		t.Fatalf("首个保存不该冲突: %v", err)
+	}
+
+	// 窗口 B 用旧戳保存 → 冲突
+	updB := mkIn()
+	updB.ID = id
+	updB.Remark = "B 的陈旧修改"
+	updB.ExpectedUpdatedAt = stale
+	if _, err := svc.SaveVoucher(ctx, updB); !errors.Is(err, sqlite.ErrVoucherConflict) {
+		t.Fatalf("陈旧戳保存应报冲突, got %v", err)
+	}
+	// 窗口 B 用旧戳删除 → 冲突
+	if err := svc.DeleteVoucher(ctx, id, stale); !errors.Is(err, sqlite.ErrVoucherConflict) {
+		t.Fatalf("陈旧戳删除应报冲突, got %v", err)
+	}
+	// 确认内容仍是 A 的版本
+	d, _ := svc.Voucher(ctx, id)
+	if d.Remark != "A 先提交的修改" {
+		t.Fatalf("被陈旧写入覆盖了: %s", d.Remark)
+	}
+	// B 刷新后拿新戳可以正常删
+	if err := svc.DeleteVoucher(ctx, id, d.UpdatedAt); err != nil {
+		t.Fatalf("新戳删除应成功: %v", err)
 	}
 }

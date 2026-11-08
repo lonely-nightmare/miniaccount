@@ -528,7 +528,7 @@ func TestBookedAdjustmentIsLocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读底稿失败: %v", err)
 	}
-	if err := svc.DeleteVoucher(ctx, *adj.Adjustments[0].VoucherID); err != nil {
+	if err := svc.DeleteVoucher(ctx, *adj.Adjustments[0].VoucherID, ""); err != nil {
 		t.Fatalf("删除草稿凭证失败: %v", err)
 	}
 	after, err := svc.Workpaper(ctx, period.NewKey(2025, 3))

@@ -42,6 +42,7 @@ import (
 	"miniaccount/internal/domain/period"
 	"miniaccount/internal/domain/report"
 	"miniaccount/internal/domain/vat"
+	"miniaccount/internal/filelock"
 	"miniaccount/internal/store/sqlite"
 )
 
@@ -50,6 +51,9 @@ type Service struct {
 	db       *sqlite.DB
 	path     string
 	filesDir string
+	// occup 是跨进程占用锁（filelock，文档 §2.4）。
+	// ":memory:" 账套无文件身份，为空。
+	occup *filelock.Lock
 }
 
 // Options 打开账套的参数。
@@ -63,12 +67,48 @@ type Options struct {
 }
 
 // Open 打开（或创建）一个账套。
+//
+// 打开前先按文档 §2.4 协议取**共享占用**：有进程正在恢复
+// （独占锁）时报「恢复中」而不是打开一个正被替换的文件。
+// 新建账套文件尚不存在，先取路径锁占位，文件落位后换身份锁。
 func Open(ctx context.Context, opts Options) (*Service, error) {
+	var occ *filelock.Lock
+	pathOnly := false
+	if opts.Path != ":memory:" {
+		var err error
+		if _, statErr := os.Stat(opts.Path); errors.Is(statErr, os.ErrNotExist) {
+			id, ierr := filelock.PathIdentity(opts.Path)
+			if ierr != nil {
+				return nil, ierr
+			}
+			occ, err = filelock.AcquireIdentity(id, false)
+			pathOnly = true
+		} else {
+			occ, err = filelock.AcquireShared(opts.Path)
+		}
+		if err != nil {
+			if errors.Is(err, filelock.ErrOccupied) {
+				return nil, errors.New("账套正在恢复中，请稍后重试")
+			}
+			return nil, err
+		}
+	}
 	db, err := sqlite.Open(ctx, sqlite.Options{
 		Path: opts.Path, ReadOnly: opts.ReadOnly,
 	})
 	if err != nil {
+		if occ != nil {
+			occ.Release()
+		}
 		return nil, err
+	}
+	if pathOnly {
+		// 文件已落位，换身份锁；换不到就继续持路径锁——
+		// 路径锁同样挡得住同路径的 opener 与 restore。
+		if lk, err := filelock.AcquireShared(opts.Path); err == nil {
+			occ.Release()
+			occ = lk
+		}
 	}
 	if opts.ReadOnly {
 		// 只读打开不跑迁移（迁移要写库），但版本校验不能省：
@@ -81,7 +121,7 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	s := &Service{db: db, path: opts.Path, filesDir: strings.TrimSpace(opts.FilesDir)}
+	s := &Service{db: db, path: opts.Path, filesDir: strings.TrimSpace(opts.FilesDir), occup: occ}
 	if !opts.ReadOnly {
 		s.migrateLegacyFilesDir(ctx)
 	}
@@ -92,7 +132,15 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 //
 // 名字刻意不叫 Close —— 本类型还有一个 Close(ctx, period, by) 是「结账」。
 // 两者混在一个名字上，调用点稍不留神就会把「关软件」写成「结账」。
-func (s *Service) Shutdown() error { return s.db.Close() }
+func (s *Service) Shutdown() error {
+	err := s.db.Close()
+	// 顺序固定：连接彻底关闭后才释放占用锁（文档 §2.4）。
+	if s.occup != nil {
+		s.occup.Release()
+		s.occup = nil
+	}
+	return err
+}
 
 // DB 暴露底层仓储，供高级用法与测试使用。
 //
@@ -105,6 +153,13 @@ func (s *Service) Path() string { return s.path }
 
 // ErrNoBook 表示这个文件还不是一个账套（尚未建账）。
 var ErrNoBook = errors.New("账套尚未初始化")
+
+// InvalidInput 标记「调用方传了非法参数」：绑定层把它映射成
+// FaultInvalid，MCP 层把它映射成工具的参数错误码，
+// 而不是笼统的内部错误。
+type InvalidInput struct{ Msg string }
+
+func (e *InvalidInput) Error() string { return e.Msg }
 
 // ---------------------------------------------------------------------------
 // 账套
@@ -886,6 +941,25 @@ type RestoreOptions struct {
 // 损坏都在 Restore 的回滚守卫内触发，原账套自动放回，
 // 而不是留给打开阶段再失败、让用户手工翻暂存目录。
 func (s *Service) Restore(ctx context.Context, o RestoreOptions) (*backup.RestoreResult, error) {
+	// 恢复全程持独占占用（§2.4）：任何进程持共享打开着就拒绝，
+	// 而不是让它对着已被替换的文件继续写。
+	var lk *filelock.Lock
+	var err error
+	if _, statErr := os.Stat(o.DBPath); errors.Is(statErr, os.ErrNotExist) {
+		var id filelock.Identity
+		if id, err = filelock.PathIdentity(o.DBPath); err == nil {
+			lk, err = filelock.AcquireIdentity(id, true)
+		}
+	} else {
+		lk, err = filelock.AcquireExclusive(o.DBPath)
+	}
+	if err != nil {
+		if errors.Is(err, filelock.ErrOccupied) {
+			return nil, errors.New("账套正被使用（界面/命令行/MCP 服务），请先断开再恢复")
+		}
+		return nil, err
+	}
+	defer lk.Release()
 	return backup.Restore(ctx, o.Archive, o.DBPath, o.FilesDir,
 		sqlite.VerifyOpenable)
 }
