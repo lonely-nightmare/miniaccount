@@ -187,8 +187,12 @@ func (s *Service) SaveInvoice(ctx context.Context, in InvoiceInput) (*InvoiceVie
 		AmountExTax: in.AmountExTax, TaxRate: money.Rate(in.TaxRatePPM),
 		TaxAmount: in.TaxAmount, TotalAmount: in.TotalAmount,
 		Category: in.Category, ContactID: in.ContactID, Remark: in.Remark,
+		// ★ 费用归集科目与部门随发票入库：它们是「生成凭证时用」的
+		// 参数，而列表页过账时拿不到当时表单里的值 —— 不落库就等于
+		// 让用户白填，过账时再被「费用科目要求部门」拒回来。
+		ExpenseAccount: strings.TrimSpace(in.ExpenseAccount),
+		DeptID:         in.DeptID,
 	}
-	_ = in.DeptID // 部门在生成凭证时用；保存时不入发票表
 	d, err := parseDate(in.InvoiceDate)
 	if err != nil {
 		return nil, fmt.Errorf("开票日期 %q 格式不对，应为 YYYY-MM-DD", in.InvoiceDate)

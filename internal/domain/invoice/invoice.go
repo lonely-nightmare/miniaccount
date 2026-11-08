@@ -178,6 +178,13 @@ type Invoice struct {
 	ContactID *int64
 	VoucherID *int64
 
+	// ExpenseAccount 是进项票的费用归集科目（生成凭证时用，
+	// 留空走默认科目）。DeptID 是费用归集到的部门 ——
+	// 绝大多数费用科目都声明了按部门辅助核算，不填会被
+	// 过账校验拒绝，所以它与发票一起入库而不是过账时再问一遍。
+	ExpenseAccount string
+	DeptID         *int64
+
 	Remark string
 	// AttachmentHashes 是随票附件的 sha256 列表（发票 PDF / 照片）。
 	AttachmentHashes []string

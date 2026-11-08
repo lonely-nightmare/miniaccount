@@ -166,6 +166,54 @@ func TestPostInvoiceCreatesVoucher(t *testing.T) {
 	}
 }
 
+// ★ 录入表单选的费用科目/部门要随发票入库，列表页过账不再传参
+// —— 否则默认科目 560206 要求部门，必被过账校验拒回来。
+func TestPostInvoiceUsesStoredPostParams(t *testing.T) {
+	ctx := context.Background()
+	svc := newSvc(t, 3)
+	sup := mustContact(t, svc, "supplier", "宁波恒信办公用品")
+	dept := mustDepartment(t, svc, "管理部门")
+
+	v, err := svc.SaveInvoice(ctx, service.InvoiceInput{
+		Direction: "input", Kind: "special",
+		Number: "N-IN-STORED", InvoiceDate: "2025-01-09",
+		SellerName: "宁波恒信办公用品", ContactID: &sup,
+		AmountExTax: money100(5000), TaxRatePPM: 130000,
+		ExpenseAccount: "560206", DeptID: &dept,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 不传费用科目/部门：应从发票档案取，而不是落空被 560206 拒绝。
+	posted, err := svc.PostInvoice(ctx, v.ID, "王主管", "", nil)
+	if err != nil {
+		t.Fatalf("按档案参数生成凭证失败: %v", err)
+	}
+	if !posted.Posted {
+		t.Fatal("应标记为已生成凭证")
+	}
+	vouchers, _ := svc.Vouchers(ctx, service.VoucherQuery{Year: 2025, Month: 1})
+	if len(vouchers) != 1 {
+		t.Fatalf("凭证数 = %d，期望 1", len(vouchers))
+	}
+	d, err := svc.Voucher(ctx, vouchers[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expLine *service.VoucherLine
+	for i := range d.Lines {
+		if d.Lines[i].AccountCode == "560206" {
+			expLine = &d.Lines[i]
+		}
+	}
+	if expLine == nil {
+		t.Fatal("费用分录缺失")
+	}
+	if expLine.DeptID == nil || *expLine.DeptID != dept {
+		t.Errorf("费用分录部门 = %v，期望 %d", expLine.DeptID, dept)
+	}
+}
+
 func TestPostOutputInvoice(t *testing.T) {
 	ctx := context.Background()
 	svc := newSvc(t, 3)

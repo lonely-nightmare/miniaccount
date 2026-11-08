@@ -30,7 +30,8 @@ var (
 const invoiceColumns = `i.id, i.direction, i.kind, i.code, i.number, i.invoice_date,
 	i.seller_name, i.seller_tax_no, i.buyer_name, i.buyer_tax_no,
 	i.amount_ex_tax, i.tax_rate, i.tax_amount, i.total_amount,
-	i.category, i.status, i.contact_id, i.voucher_id, i.remark`
+	i.category, i.status, i.contact_id, i.voucher_id, i.remark,
+	i.expense_account, i.dept_id`
 
 // ListInvoices 按方向与日期范围查询发票。
 func (r *InvoiceRepo) ListInvoices(ctx context.Context, dir invoice.Direction,
@@ -75,11 +76,13 @@ func scanInvoices(rows *sql.Rows) ([]*invoice.Invoice, error) {
 			taxAmt, totalAmt  int64
 			contactID         sql.NullInt64
 			voucherID         sql.NullInt64
+			deptID            sql.NullInt64
 		)
 		if err := rows.Scan(&inv.ID, &dir, &kind, &inv.Code, &inv.Number, &dateStr,
 			&inv.SellerName, &inv.SellerTaxNo, &inv.BuyerName, &inv.BuyerTaxNo,
 			&amountEx, &taxRate, &taxAmt, &totalAmt,
-			&inv.Category, &status, &contactID, &voucherID, &inv.Remark); err != nil {
+			&inv.Category, &status, &contactID, &voucherID, &inv.Remark,
+			&inv.ExpenseAccount, &deptID); err != nil {
 			return nil, err
 		}
 		d, err := calendar.Parse(dateStr)
@@ -96,6 +99,7 @@ func scanInvoices(rows *sql.Rows) ([]*invoice.Invoice, error) {
 		inv.TotalAmount = money.Money(totalAmt)
 		inv.ContactID = toNullInt64(contactID)
 		inv.VoucherID = toNullInt64(voucherID)
+		inv.DeptID = toNullInt64(deptID)
 		out = append(out, inv)
 	}
 	return out, rows.Err()
@@ -139,14 +143,16 @@ func (r *InvoiceRepo) CreateInvoice(ctx context.Context, inv *invoice.Invoice) (
 			INSERT INTO invoice (direction, kind, code, number, invoice_date,
 				seller_name, seller_tax_no, buyer_name, buyer_tax_no,
 				amount_ex_tax, tax_rate, tax_amount, total_amount,
-				category, status, contact_id, remark, created_at, updated_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				category, status, contact_id, expense_account, dept_id,
+				remark, created_at, updated_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			string(inv.Direction), string(inv.Kind), inv.Code, inv.Number,
 			inv.InvoiceDate.String(), inv.SellerName, inv.SellerTaxNo,
 			inv.BuyerName, inv.BuyerTaxNo,
 			int64(inv.AmountExTax), int64(inv.TaxRate), int64(inv.TaxAmount),
 			int64(inv.TotalAmount), inv.Category, string(inv.Status),
-			nullInt64(inv.ContactID), inv.Remark, nowString(), nowString())
+			nullInt64(inv.ContactID), inv.ExpenseAccount, nullInt64(inv.DeptID),
+			inv.Remark, nowString(), nowString())
 		if err != nil {
 			return err
 		}
@@ -909,6 +915,15 @@ func (r *InvoiceRepo) PostInvoice(ctx context.Context, invoiceID int64,
 	}
 
 	vc := DefaultInvoiceVoucherAccounts()
+	// ★ 显式传参优先，其次发票档案里存的值，最后才是默认科目。
+	// 录入时选的费用科目/部门随发票入库，列表页「生成凭证」
+	// 不需要再把它们问一遍 —— 否则 560206 必求部门，必被拒。
+	if expenseAccount == "" {
+		expenseAccount = inv.ExpenseAccount
+	}
+	if deptID == nil {
+		deptID = inv.DeptID
+	}
 	if expenseAccount != "" {
 		vc.DefaultExpense = expenseAccount
 	}

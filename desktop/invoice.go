@@ -107,9 +107,11 @@ type PostInvoiceRequest struct {
 	ID int64 `json:"id"`
 	// PostingBy 是记账人。
 	PostingBy string `json:"postingBy"`
-	// ExpenseAccount 是进项票的费用归集科目。
+	// ExpenseAccount 是进项票的费用归集科目。留空时用发票档案里
+	// 存的值（录入表单收集、0016 起入库），仍空再落默认科目。
 	ExpenseAccount string `json:"expenseAccount"`
 	// DeptID 是费用归集部门 —— 费用科目大多要求部门辅助核算。
+	// nil 时同样先取发票档案里的值。
 	DeptID *int64 `json:"deptId"`
 }
 
