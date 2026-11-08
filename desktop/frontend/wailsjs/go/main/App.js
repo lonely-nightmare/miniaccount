@@ -218,8 +218,8 @@ export function DeleteMateriality(arg1) {
   return window['go']['main']['App']['DeleteMateriality'](arg1);
 }
 
-export function DeleteVoucher(arg1) {
-  return window['go']['main']['App']['DeleteVoucher'](arg1);
+export function DeleteVoucher(arg1, arg2) {
+  return window['go']['main']['App']['DeleteVoucher'](arg1, arg2);
 }
 
 export function DepartmentUsageOf(arg1) {

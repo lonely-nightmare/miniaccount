@@ -1,10 +1,10 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   Users, Plus, Pencil, Save, Building2, UserRound, Truck, Store,
   Landmark, Handshake,
 } from 'lucide-vue-next'
-import { api, notify } from '@/lib/api'
+import { api, notify, onMcpChanged } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
 import { fmtMoney, centsToYuanInput, todayISO } from '@/lib/format'
 import Card from '@/components/ui/Card.vue'
@@ -70,6 +70,18 @@ async function load() {
 onMounted(async () => {
   await Promise.all([load(), loadBookkeeper()])
 })
+
+// MCP 外部改动：弹窗未开时自动重查；编辑中只提示不覆盖（§2.11）。
+// 本页覆盖 contact/department/employee 三类实体。
+const offMcpChanged = onMcpChanged((payload) => {
+  if (!['contact', 'department', 'employee'].includes(payload?.entity)) return
+  if (contactOpen.value || deptOpen.value || empOpen.value || moveOpen.value) {
+    notify('数据已被外部修改 —— 当前编辑中的表单不受影响', 'warn')
+    return
+  }
+  load()
+})
+onUnmounted(offMcpChanged)
 
 /** 四个往来标签页各自展示哪些 kind —— 与后端 auxMatchesContact 的口径一致：
  * 客户/供应商页把「客户与供应商（both）」这种双重身份也带上；

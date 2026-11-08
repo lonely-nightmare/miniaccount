@@ -1148,106 +1148,17 @@ export namespace main {
 	        this.deptId = source["deptId"];
 	    }
 	}
-	export class LedgerRequest {
-	    accountPrefix: string;
-	    from: string;
-	    to: string;
-	    limit: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new LedgerRequest(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.accountPrefix = source["accountPrefix"];
-	        this.from = source["from"];
-	        this.to = source["to"];
-	        this.limit = source["limit"];
-	    }
-	}
-	export class LedgerRow {
-	    date: string;
-	    voucher: string;
-	    summary: string;
-	    debit: number;
-	    credit: number;
-	    balance: number;
-	    dir: string;
-	    contra: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new LedgerRow(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.date = source["date"];
-	        this.voucher = source["voucher"];
-	        this.summary = source["summary"];
-	        this.debit = source["debit"];
-	        this.credit = source["credit"];
-	        this.balance = source["balance"];
-	        this.dir = source["dir"];
-	        this.contra = source["contra"];
-	    }
-	}
-	export class LedgerResult {
-	    accountPrefix: string;
-	    accountName: string;
-	    from: string;
-	    to: string;
-	    rows: LedgerRow[];
-	    openingBalance: number;
-	    closingBalance: number;
-	    truncated: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new LedgerResult(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.accountPrefix = source["accountPrefix"];
-	        this.accountName = source["accountName"];
-	        this.from = source["from"];
-	        this.to = source["to"];
-	        this.rows = this.convertValues(source["rows"], LedgerRow);
-	        this.openingBalance = source["openingBalance"];
-	        this.closingBalance = source["closingBalance"];
-	        this.truncated = source["truncated"];
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
-	
 	export class MCPServiceStatus {
 	    running: boolean;
 	    port: number;
 	    operator: string;
 	    token: string;
 	    url: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new MCPServiceStatus(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.running = source["running"];
@@ -1260,11 +1171,11 @@ export namespace main {
 	export class MCPStartRequest {
 	    port: number;
 	    operator: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new MCPStartRequest(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.port = source["port"];
@@ -1908,6 +1819,7 @@ export namespace main {
 	    lines: VoucherLineRequest[];
 	    createdBy: string;
 	    postedBy: string;
+	    expectedUpdatedAt: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new VoucherRequest(source);
@@ -1923,6 +1835,7 @@ export namespace main {
 	        this.lines = this.convertValues(source["lines"], VoucherLineRequest);
 	        this.createdBy = source["createdBy"];
 	        this.postedBy = source["postedBy"];
+	        this.expectedUpdatedAt = source["expectedUpdatedAt"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -4326,6 +4239,95 @@ export namespace service {
 	        this.label = source["label"];
 	    }
 	}
+	export class LedgerDetailQuery {
+	    accountPrefix: string;
+	    from: string;
+	    to: string;
+	    limit: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LedgerDetailQuery(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.accountPrefix = source["accountPrefix"];
+	        this.from = source["from"];
+	        this.to = source["to"];
+	        this.limit = source["limit"];
+	    }
+	}
+	export class LedgerRow {
+	    date: string;
+	    voucher: string;
+	    summary: string;
+	    debit: number;
+	    credit: number;
+	    balance: number;
+	    dir: string;
+	    contra: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new LedgerRow(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.date = source["date"];
+	        this.voucher = source["voucher"];
+	        this.summary = source["summary"];
+	        this.debit = source["debit"];
+	        this.credit = source["credit"];
+	        this.balance = source["balance"];
+	        this.dir = source["dir"];
+	        this.contra = source["contra"];
+	    }
+	}
+	export class LedgerResult {
+	    accountPrefix: string;
+	    accountName: string;
+	    from: string;
+	    to: string;
+	    rows: LedgerRow[];
+	    openingBalance: number;
+	    closingBalance: number;
+	    truncated: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new LedgerResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.accountPrefix = source["accountPrefix"];
+	        this.accountName = source["accountName"];
+	        this.from = source["from"];
+	        this.to = source["to"];
+	        this.rows = this.convertValues(source["rows"], LedgerRow);
+	        this.openingBalance = source["openingBalance"];
+	        this.closingBalance = source["closingBalance"];
+	        this.truncated = source["truncated"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
 	export class LogSettings {
 	    recordViews: boolean;
 	    viewIntervalSeconds: number;
@@ -5692,6 +5694,7 @@ export namespace service {
 	    totalDebit: number;
 	    totalCredit: number;
 	    balanced: boolean;
+	    updatedAt: string;
 	    canEdit: boolean;
 	    canDelete: boolean;
 	    canPost: boolean;
@@ -5725,6 +5728,7 @@ export namespace service {
 	        this.totalDebit = source["totalDebit"];
 	        this.totalCredit = source["totalCredit"];
 	        this.balanced = source["balanced"];
+	        this.updatedAt = source["updatedAt"];
 	        this.canEdit = source["canEdit"];
 	        this.canDelete = source["canDelete"];
 	        this.canPost = source["canPost"];
@@ -5767,6 +5771,7 @@ export namespace service {
 	    createdBy: string;
 	    postedBy: string;
 	    lines: number;
+	    updatedAt: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new VoucherSummary(source);
@@ -5789,6 +5794,7 @@ export namespace service {
 	        this.createdBy = source["createdBy"];
 	        this.postedBy = source["postedBy"];
 	        this.lines = source["lines"];
+	        this.updatedAt = source["updatedAt"];
 	    }
 	}
 	export class WorksheetRowView {

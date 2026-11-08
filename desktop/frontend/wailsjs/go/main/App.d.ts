@@ -113,7 +113,7 @@ export function DeleteEvidence(arg1:main.DeleteEvidenceRequest):Promise<service.
 
 export function DeleteMateriality(arg1:main.PeriodRequest):Promise<service.WorkpaperView>;
 
-export function DeleteVoucher(arg1:number):Promise<void>;
+export function DeleteVoucher(arg1:number,arg2:string):Promise<void>;
 
 export function DepartmentUsageOf(arg1:number):Promise<service.DepartmentUsage>;
 
@@ -163,7 +163,7 @@ export function Invoices(arg1:main.InvoiceQueryRequest):Promise<Array<service.In
 
 export function JudgeDeduction(arg1:service.DeductionRequest):Promise<service.DeductionView>;
 
-export function LedgerDetail(arg1:main.LedgerRequest):Promise<main.LedgerResult>;
+export function LedgerDetail(arg1:service.LedgerDetailQuery):Promise<service.LedgerResult>;
 
 export function ListBooks():Promise<main.BookList>;
 
