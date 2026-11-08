@@ -2113,3 +2113,97 @@ test('回归：凭证可选股东、其他往来和双重身份，各维度显�
     await page.goto('/dashboard')
   }
 })
+
+test('回归：调节表校验失败后可重试，旧请求作废，导出使用已显示的查询', async () => {
+  const app = win.go.main.App
+  const original = {
+    BankAccounts: app.BankAccounts,
+    BankReconciliation: app.BankReconciliation,
+    SuggestedReconciliationName: app.SuggestedReconciliationName,
+    ExportReconciliation: app.ExportReconciliation,
+  }
+  const pending = []
+  let exported
+  app.BankAccounts = async () => [
+    { code: 'A', name: '回归账户 A' },
+    { code: 'B', name: '回归账户 B' },
+  ]
+  app.BankReconciliation = (query) => new Promise((resolve) => pending.push({ query, resolve }))
+  app.SuggestedReconciliationName = async (code) => `${code}.xlsx`
+  app.ExportReconciliation = async (query) => { exported = query; return { path: 'B.xlsx' } }
+  function resolveAccount({ query, resolve }) {
+    resolve({
+      status: 'balanced', statusLabel: `账户 ${query.accountCode} 的结果`,
+      accountCode: query.accountCode, openingDiff: 0,
+    })
+  }
+  try {
+    await page.goto('/recon')
+    assert.ok(pending.length > 0)
+    assert.ok(pending.every(({ query }) => query.accountCode === 'A' && query.bankBalance === null))
+    pending.splice(0).forEach(resolveAccount)
+    await settle()
+    assert.match(page.text(), /账户 A 的结果/)
+    await page.clickExact('生成')
+    const balance = page.input('input[placeholder="留空 = 取流水末笔余额"]')
+    await page.type(balance, '无效余额')
+    changeSelect(page.input('select'), 'B')
+    await settle()
+    assert.equal(pending.length, 1)
+    assert.equal(pending[0].query.accountCode, 'A')
+    pending.splice(0).forEach(resolveAccount)
+    await settle()
+    assert.equal(page.button('生成').disabled, false)
+    assert.doesNotMatch(page.text(), /账户 A 的结果/)
+    await page.type(balance, '0')
+    await page.clickExact('生成')
+    assert.equal(pending[0].query.accountCode, 'B')
+    assert.equal(pending[0].query.bankBalance, 0)
+    const displayed = pending[0].query
+    pending.splice(0).forEach(resolveAccount)
+    await settle()
+    assert.match(page.text(), /账户 B 的结果/)
+    await page.type(balance, '999')
+    await page.clickExact('导出 Excel')
+    assert.deepEqual(exported, displayed)
+  } finally {
+    Object.assign(app, original)
+    await page.goto('/dashboard')
+  }
+})
+
+test('回归：跨期和同一期重开弹窗都只显示当前的体检结果', async () => {
+  const app = win.go.main.App
+  const health = app.Health
+  const pending = []
+  app.Health = (query) => new Promise((resolve) => pending.push({ query, resolve }))
+  const report = (summary) => ({ summary, canClose: true, items: [] })
+  try {
+    await page.goto('/periods')
+    const buttons = [...win.document.querySelectorAll('button[title="结账前体检"]')]
+    assert.ok(buttons.length >= 2)
+    async function open(index) {
+      buttons[index].click()
+      await settle()
+      return pending.shift()
+    }
+    const previousPeriod = await open(0)
+    await page.clickExact('取消')
+    const firstOpen = await open(1)
+    await page.clickExact('取消')
+    const secondOpen = await open(1)
+    assert.notDeepEqual(previousPeriod.query, secondOpen.query)
+    assert.deepEqual(firstOpen.query, secondOpen.query)
+    secondOpen.resolve(report('当前体检结果'))
+    await settle()
+    firstOpen.resolve(report('同一期过期结果'))
+    previousPeriod.resolve(report('其他账期过期结果'))
+    await settle()
+    assert.match(win.document.body.textContent, /当前体检结果/)
+    assert.doesNotMatch(win.document.body.textContent, /过期结果/)
+    await page.clickExact('取消')
+  } finally {
+    app.Health = health
+    await page.goto('/dashboard')
+  }
+})

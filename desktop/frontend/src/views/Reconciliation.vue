@@ -21,9 +21,7 @@ const data = ref(null)
 const loading = ref(false)
 const accounts = ref([])
 const filter = ref({ accountCode: '', asOf: '', from: '', bankBalance: '' })
-// 手工输入的银行余额是「元」，后端要「分」——
-// 在这里转而不是让用户算，避免会计对着 10000000 数零。
-const bankCents = ref(null)
+let displayedQuery = null
 
 async function loadAccounts() {
   const r = await api.bankAccounts()
@@ -36,42 +34,33 @@ async function loadAccounts() {
 
 // ★ 请求序号：快速切换银行科目时旧响应后到，
 // 会把上一个账户的调节表铺在新账户下 —— 过期响应直接丢弃。
-const reqSeq = ref(0)
+let reqSeq = 0
 
 async function load() {
-  if (!filter.value.accountCode) {
-    // ★ 提前返回也要清 loading：上一个在飞的请求回来时
-    // 会因序号过期直接丢弃、不再复位 loading —— 若这里不清，
-    // 「生成」按钮就一直停在禁用态。
-    loading.value = false
+  const seq = ++reqSeq
+  const { accountCode, asOf, from, bankBalance } = filter.value
+  // 切换查询时先清结果，校验失败也不会留下另一个账户的调节表。
+  loading.value = false
+  data.value = null
+  displayedQuery = null
+  if (!accountCode) {
     notify('请先选择要核对的银行科目', 'error')
     return
   }
-  const seq = ++reqSeq.value
-  // 余额留空 → 自动取对账单最后一笔余额；填 0 是合法值（账户清零），
-  // 所以这里用「字符串非空」判断而不是真值判断。
-  if (filter.value.bankBalance === '') {
-    bankCents.value = null
-  } else {
-    const n = Number(String(filter.value.bankBalance).replace(/,/g, ''))
-    if (!Number.isFinite(n)) {
-      loading.value = false
-      notify('银行对账单余额不是有效数字', 'error')
-      return
-    }
-    bankCents.value = Math.round(n * 100)
+  // 留空由后端取流水余额，显式输入 0 时传 0 分。
+  const balance = bankBalance === '' ? null : Math.round(Number(String(bankBalance).replace(/,/g, '')) * 100)
+  if (balance !== null && !Number.isSafeInteger(balance)) {
+    notify('银行对账单余额不是有效数字', 'error')
+    return
   }
 
+  const query = { accountCode, asOf, from, bankBalance: balance }
   loading.value = true
-  const r = await api.bankReconciliation({
-    accountCode: filter.value.accountCode,
-    asOf: filter.value.asOf,
-    from: filter.value.from,
-    bankBalance: bankCents.value,
-  })
-  if (seq !== reqSeq.value) return
+  const r = await api.bankReconciliation(query)
+  if (seq !== reqSeq) return
   loading.value = false
-  if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); data.value = null; return }
+  if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
+  displayedQuery = query
   data.value = r.data
 }
 
@@ -124,16 +113,12 @@ const tone = computed(() => {
 // 前端只负责把参数传过去。
 const exporting = ref(false)
 async function exportExcel() {
-  if (!data.value) return
+  const query = displayedQuery
+  if (!query || exporting.value) return
   exporting.value = true
-  const n = await api.suggestReconciliationName(filter.value.accountCode)
+  const n = await api.suggestReconciliationName(query.accountCode)
   const dest = n.ok ? n.data : '银行余额调节表.xlsx'
-  const r = await api.exportReconciliation({
-    accountCode: filter.value.accountCode,
-    asOf: filter.value.asOf,
-    from: filter.value.from,
-    bankBalance: bankCents.value,
-  }, dest)
+  const r = await api.exportReconciliation(query, dest)
   exporting.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
   notify(`已导出：${r.data.path}`, 'success')
