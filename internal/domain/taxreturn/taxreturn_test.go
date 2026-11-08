@@ -159,7 +159,7 @@ func TestVATRejectsAbsurdSurchargeRates(t *testing.T) {
 
 func citBase() taxreturn.CITInput {
 	return taxreturn.CITInput{
-		Period: "2025 年第 1 季度",
+		Period:  "2025 年第 1 季度",
 		Revenue: y(1_000_000), Cost: y(600_000), Profit: y(200_000),
 	}
 }
