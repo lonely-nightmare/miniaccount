@@ -53,7 +53,7 @@ func (s *Service) VouchersPage(ctx context.Context, q VoucherQuery) (*VoucherPag
 	if err != nil {
 		return nil, err
 	}
-	counts, err := s.lineCounts(ctx, rows)
+	stats, err := s.lineStats(ctx, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -63,10 +63,12 @@ func (s *Service) VouchersPage(ctx context.Context, q VoucherQuery) (*VoucherPag
 			ID: v.ID, No: v.No, Word: string(v.Word), Date: v.BizDate.String(),
 			Remark: v.Remark, Status: string(v.Status),
 			StatusLabel: v.Status.Label(), AttachCount: v.AttachCount,
-			Amount: v.Amount(), Source: string(v.Source),
+			// 列表只读凭证头，金额必须取分录合计——
+			// 用 v.Amount() 永远是 0（分录没加载）。
+			Amount: stats[v.ID].sum, Source: string(v.Source),
 			SourceLabel: v.Source.Label(), CreatedByAI: v.CreatedByAI,
 			CreatedBy: v.CreatedBy, PostedBy: v.PostedBy,
-			Lines: counts[v.ID], UpdatedAt: v.UpdatedAtText,
+			Lines: stats[v.ID].count, UpdatedAt: v.UpdatedAtText,
 		})
 	}
 	return &VoucherPage{
@@ -75,10 +77,16 @@ func (s *Service) VouchersPage(ctx context.Context, q VoucherQuery) (*VoucherPag
 	}, nil
 }
 
-// lineCounts 只数返回页里这几张凭证的分录行数；
+// lineStat 是一张凭证的分录行数与借方合计（分）。
+type lineStat struct {
+	count int
+	sum   money.Money
+}
+
+// lineStats 只统计返回页里这几张凭证的分录；
 // 跨期间分页时按月统计会把整月几百张的行数全扫一遍，没必要。
-func (s *Service) lineCounts(ctx context.Context, vs []*voucher.Voucher) (map[int64]int, error) {
-	out := map[int64]int{}
+func (s *Service) lineStats(ctx context.Context, vs []*voucher.Voucher) (map[int64]lineStat, error) {
+	out := map[int64]lineStat{}
 	if len(vs) == 0 {
 		return out, nil
 	}
@@ -89,19 +97,19 @@ func (s *Service) lineCounts(ctx context.Context, vs []*voucher.Voucher) (map[in
 		args[i] = v.ID
 	}
 	rows, err := s.db.SQL().QueryContext(ctx,
-		`SELECT voucher_id, COUNT(*) FROM voucher_entry WHERE voucher_id IN (`+ph+`) GROUP BY voucher_id`,
+		`SELECT voucher_id, COUNT(*), COALESCE(SUM(debit),0) FROM voucher_entry WHERE voucher_id IN (`+ph+`) GROUP BY voucher_id`,
 		args...)
 	if err != nil {
 		return nil, translate(err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var id int64
+		var id, sum int64
 		var n int
-		if err := rows.Scan(&id, &n); err != nil {
+		if err := rows.Scan(&id, &n, &sum); err != nil {
 			return nil, err
 		}
-		out[id] = n
+		out[id] = lineStat{count: n, sum: money.Money(sum)}
 	}
 	return out, rows.Err()
 }
@@ -181,13 +189,15 @@ func (s *Service) LedgerDetail(ctx context.Context, q LedgerDetailQuery) (*Ledge
 	}
 	result.OpeningBalance = int64(opening)
 
+	// 余额必须跑完整个区间 —— 在 limit 处停下会让
+	// closingBalance 变成「截断位置的余额」，不是期末余额。
 	balance := opening
 	for _, r := range rows {
+		balance = balance.Add(r.Debit).Sub(r.Credit)
 		if len(result.Rows) >= limit {
 			result.Truncated = true
-			break
+			continue
 		}
-		balance = balance.Add(r.Debit).Sub(r.Credit)
 		result.Rows = append(result.Rows, LedgerRow{
 			Date: r.BizDate.String(), Voucher: r.VoucherNo, Summary: r.Summary,
 			Debit: int64(r.Debit), Credit: int64(r.Credit),

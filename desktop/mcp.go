@@ -185,11 +185,12 @@ func (a *App) MCPStart(req MCPStartRequest) (out MCPServiceStatus, err error) {
 }
 
 // MCPStop 关闭服务并按文档吊销凭据（关闭即失效）。
+//
+// 顺序是「先吊销、后关停」：Shutdown 要等 SSE 长连接排空，
+// 可能超时返回——吊销若放在后面，服务已标记停止但旧凭据
+// 还留在 mcp.json 里，下次开启会继续用。
 func (a *App) MCPStop() (err error) {
 	defer recoverTo(&err, "MCPStop")()
-	if err := a.stopMCP(); err != nil {
-		return classify(err)
-	}
 	st, serr := a.configStore()
 	if serr != nil {
 		return classify(serr)
@@ -198,11 +199,34 @@ func (a *App) MCPStop() (err error) {
 	if cfg == nil {
 		cfg = &mcpserver.MCPConfig{}
 	}
-	cfg.Token = "" // 吊销：下次开启时重新签发
+	// 1. 持久化吊销：mcp.json 的 token 清空，下次开启重签。
+	//    这步失败就停下来——继续关停会留下「文件里还是旧
+	//    凭据」的状态，重启后旧凭据复活。
+	cfg.Token = ""
 	if err := st.Save(cfg); err != nil {
 		return classify(err)
 	}
+	// 2. 运行中的实例立刻换值（旧凭据当即不可用）；
+	//    随机值失败时退空串——空 token 比对任何 Bearer 都不等。
+	if rt := a.currentMCP(); rt != nil {
+		if tok, terr := mcpserver.GenerateToken(); terr == nil {
+			rt.svc.SetToken(tok)
+		} else {
+			rt.svc.SetToken("")
+		}
+	}
+	// 3. 关停排空；超时被拒的连接已在第 2 步死了。
+	if err := a.stopMCP(); err != nil {
+		return classify(err)
+	}
 	return nil
+}
+
+// currentMCP 读当前运行句柄（不摘指针）。
+func (a *App) currentMCP() *mcpRuntime {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.mcp
 }
 
 // stopMCP 停掉运行中的服务；未运行是空操作。
@@ -225,6 +249,8 @@ func (a *App) takeMCPLocked() *mcpRuntime {
 }
 
 // shutdownMCP 等 HTTP 服务排空退出；不持任何锁。
+// SSE 长连接可能拖过 3s 排空窗口 —— 超时后强制 Close，
+// 不让残留连接把「已停止」拖成半开状态。
 func shutdownMCP(rt *mcpRuntime) error {
 	if rt == nil {
 		return nil
@@ -232,6 +258,7 @@ func shutdownMCP(rt *mcpRuntime) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := rt.srv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		_ = rt.srv.Close()
 		return err
 	}
 	return nil

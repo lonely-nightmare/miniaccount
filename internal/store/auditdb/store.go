@@ -463,6 +463,30 @@ BEGIN
 END;
 `
 
+// lockWithRetry 在有限窗口内退避重试取目录锁。
+//
+// 锁的临界区只有几条 SQL（毫秒级），短暂竞争就放弃会把
+// 一条业务操作永久记成「日志写失败」（幂等重试还会回放
+// 这个 failed），比等多花 2 秒糟得多。超过窗口仍占用才是
+// 真冲突，原样报错。
+func lockWithRetry(ctx context.Context, path string) (*filelock.Lock, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		lk, err := filelock.LockFile(path, true)
+		if err == nil {
+			return lk, nil
+		}
+		if !errors.Is(err, filelock.ErrOccupied) || time.Now().After(deadline) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
 // Append 追加一条日志，返回补全了 Seq/Hash 的条目。
 //
 // 写入前会检查分片大小，超过上限就先封存再开新片 —— 链跨片接续。
@@ -478,7 +502,7 @@ func (s *Store) Append(ctx context.Context, e audit.Entry) (audit.Entry, error) 
 	// seq/head/活动分片是进程内缓存；另一个进程可能已轮转 —
 	// 只套文件锁不刷新的话，A 已写到第 2 片、B 仍对着第 1 片
 	// 的旧链头追加，串行执行也会写错片或断链。
-	lk, err := filelock.LockFile(filepath.Join(s.dir, ".audit.lock"), true)
+	lk, err := lockWithRetry(ctx, filepath.Join(s.dir, ".audit.lock"))
 	if err != nil {
 		return e, fmt.Errorf("auditdb: 取日志目录锁失败: %w", err)
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"miniaccount/internal/domain/audit"
+	"miniaccount/internal/filelock"
 )
 
 func newStore(t *testing.T, maxBytes int64) *Store {
@@ -519,5 +520,32 @@ func TestAppendAfterCrashOnEmptySegment(t *testing.T) {
 	}
 	if !v.OK {
 		t.Fatalf("崩溃后续链断了: %+v", v.Issues[:3])
+	}
+}
+
+// 短暂的目录锁竞争不该把一条业务操作永久记成「日志写失败」：
+// Append 对 ErrOccupied 做有限退避重试，2 秒窗口内让位即可成功。
+func TestAppendRetriesBriefLockContention(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := Open(ctx, Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	lk, err := filelock.LockFile(filepath.Join(dir, ".audit.lock"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := st.Append(ctx, entry("王五", "voucher.create"))
+		done <- err
+	}()
+	time.Sleep(150 * time.Millisecond)
+	lk.Release()
+	if err := <-done; err != nil {
+		t.Fatalf("锁让位后 Append 应成功: %v", err)
 	}
 }

@@ -156,6 +156,8 @@ func toolError(err error) (*mcp.CallToolResult, any, error) {
 		code = "conflict"
 	case errors.Is(err, sqlite.ErrNotFound), errors.Is(err, service.ErrNoBook):
 		code = "not_found"
+	case errors.Is(err, errStaleSession):
+		code = "session_stale"
 	case errors.Is(err, sqlite.ErrAlreadyClosed),
 		errors.Is(err, sqlite.ErrNotClosed),
 		errors.Is(err, sqlite.ErrPriorOpen),

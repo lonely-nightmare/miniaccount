@@ -9,11 +9,19 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"miniaccount/internal/domain/money"
 	"miniaccount/internal/mcpserver"
 	"miniaccount/internal/service"
 )
 
 func newPair(t *testing.T, readonly bool) *mcp.ClientSession {
+	_, cs := newPairSvc(t, readonly)
+	return cs
+}
+
+// newPairSvc 与 newPair 相同，但把底层 service 一并返回，
+// 供需要先造业务数据再调工具的测试用。
+func newPairSvc(t *testing.T, readonly bool) (*service.Service, *mcp.ClientSession) {
 	t.Helper()
 	ctx := context.Background()
 	svc, err := service.Open(ctx, service.Options{
@@ -41,7 +49,7 @@ func newPair(t *testing.T, readonly bool) *mcp.ClientSession {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cs.Close() })
-	return cs
+	return svc, cs
 }
 
 // 契约面：恰好 14 读 + 6 写工具，3 个资源，无 prompts。
@@ -328,5 +336,74 @@ func TestReportsHaveBalancedFlag(t *testing.T) {
 		if issues, has := sc["issues"].([]any); has && len(issues) > 0 && bal {
 			t.Fatalf("%s 有 issues 时 balanced 应为 false: %v", name, sc)
 		}
+	}
+}
+
+// 复查发现：update_draft_voucher 不带回 word，保存时
+// 「付」字凭证被改成默认「记」。
+func TestUpdatePreservesVoucherWord(t *testing.T) {
+	ctx := context.Background()
+	svc, cs := newPairSvc(t, false)
+
+	d, err := svc.SaveVoucher(ctx, service.VoucherInput{
+		Word: "付", Date: "2025-01-15", Remark: "原摘要", CreatedBy: "李会计",
+		Lines: []service.VoucherLineInput{
+			{AccountCode: "1002", Summary: "借", Debit: money.Money(10000)},
+			{AccountCode: "5001", Summary: "贷", Credit: money.Money(10000)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "update_draft_voucher",
+		Arguments: map[string]any{
+			"id": float64(d.ID), "expectedUpdatedAt": d.UpdatedAt,
+			"remark": "新摘要",
+		},
+	})
+	if res == nil || res.IsError {
+		b, _ := json.Marshal(res)
+		t.Fatalf("更新失败: %s", b)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	v, _ := sc["voucher"].(map[string]any)
+	if v["word"] != "付" {
+		t.Fatalf("word = %v，期望保留「付」", v["word"])
+	}
+}
+
+// 复查发现：list_invoices 公布 in|out 而底层用 input|output，
+// 按文档传值返回空表。现在 in|out 映射、非法值报错。
+func TestInvoiceDirectionMapping(t *testing.T) {
+	ctx := context.Background()
+	svc, cs := newPairSvc(t, false)
+
+	if _, err := svc.SaveInvoice(ctx, service.InvoiceInput{
+		Direction: "input", Kind: "special",
+		Number: "DIR-1", InvoiceDate: "2025-01-08",
+		SellerName: "供应商甲", AmountExTax: money.Money(100000),
+		TaxRatePPM: 130000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "list_invoices",
+		Arguments: map[string]any{"direction": "in"},
+	})
+	if res == nil || res.IsError {
+		b, _ := json.Marshal(res)
+		t.Fatalf("direction=in 调用失败: %s", b)
+	}
+	if sc := res.StructuredContent.(map[string]any); sc["total"] != float64(1) {
+		t.Fatalf("direction=in 应查到 1 条进项: %v", sc)
+	}
+	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "list_invoices",
+		Arguments: map[string]any{"direction": "bogus"},
+	})
+	if res == nil || !res.IsError {
+		t.Fatal("非法 direction 应报错而非返回空表")
 	}
 }

@@ -64,7 +64,7 @@ type listEmployeesIn struct {
 }
 
 type listInvoicesIn struct {
-	Direction string `json:"direction,omitempty" jsonschema:"in|out，空表示全部"`
+	Direction string `json:"direction,omitempty" jsonschema:"input|output（可缩写 in|out），空表示全部"`
 	Status    string `json:"status,omitempty" jsonschema:"pending|verified|booked|voided，空表示全部"`
 	From      string `json:"from,omitempty" jsonschema:"开票日期起 YYYY-MM-DD"`
 	To        string `json:"to,omitempty" jsonschema:"开票日期止 YYYY-MM-DD"`
@@ -258,9 +258,22 @@ func (s *Server) registerTools() {
 		Name:        "list_invoices",
 		Description: "发票列表（进项/销项，按日期区间与状态过滤）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listInvoicesIn) (*mcp.CallToolResult, any, error) {
+		// 底层域值是 input|output；文档缩写 in|out 也收，
+		// 其余值显式报错——静默不匹配会返回空表，比报错难查。
+		dir := in.Direction
+		switch dir {
+		case "in":
+			dir = "input"
+		case "out":
+			dir = "output"
+		}
+		if dir != "" && dir != "input" && dir != "output" {
+			return toolError(&service.InvalidInput{
+				Msg: fmt.Sprintf("direction 只接受 input|output（缩写 in|out），收到 %q", in.Direction)})
+		}
 		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
 			v, err := svc.Invoices(ctx, service.InvoiceQuery{
-				Direction: in.Direction, Status: in.Status, From: in.From, To: in.To,
+				Direction: dir, Status: in.Status, From: in.From, To: in.To,
 			})
 			if err != nil {
 				return nil, err

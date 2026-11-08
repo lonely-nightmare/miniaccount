@@ -109,7 +109,9 @@ func (s *Server) registerWriteTools() {
 				return nil, &service.InvalidInput{Msg: "只能修改草稿凭证"}
 			}
 			vin := service.VoucherInput{
-				ID: in.ID, Date: d.Date, Remark: d.Remark,
+				// Word 必须回填：留空在服务层会套用默认
+				// 「记」字——只改摘要就把「付」字凭证改成「记」。
+				ID: in.ID, Word: d.Word, Date: d.Date, Remark: d.Remark,
 				AttachCount: d.AttachCount, ExpectedUpdatedAt: in.ExpectedUpdatedAt,
 				CreatedBy: d.CreatedBy,
 			}

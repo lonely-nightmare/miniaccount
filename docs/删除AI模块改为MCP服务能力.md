@@ -621,3 +621,48 @@ URL:  http://127.0.0.1:<端口>/mcp
 
 **注意**：App 重启后 MCP 服务**不会自动重开**，需再到
 设置卡开启（已知边界，非缺陷）。
+
+### 复查修复记录（外部验收前实测发现的 9 项）
+
+**锁与占用（3 项）**
+
+- **写者锁**：读写打开在共享占用之外再占一把 `w-<身份>`
+  独占锁 —— 硬链接/符号链接别名归并同一文件身份，第二个
+  读写进程被拒「正被读写」；只读打开不取写者锁，可与一个
+  读写进程共存（WAL 多读单写安全）。`Open` 的
+  `CheckSchemaVersion`/`Migrate` 失败路径此前泄漏占用锁，
+  现统一 `release()`。
+- **恢复闸门全程持有**：`acquire` 独占获取改为「身份锁 +
+  路径闸门」复合锁直到 Release —— 恢复替换文件换 inode
+  期间，身份锁只锁旧 inode，闸门不放手让同路径 opener
+  整段被拒；释放顺序 i→p。共享获取维持「过闸门即放」。
+- **会话世代锁内复核**：HTTP 中间件把钉住的
+  `generation` 放进请求 ctx；`providerSource.call` 在
+  BookProvider 读锁临界区内再比一次——中间件检查与取锁
+  之间的换账窗口被堵死，旧会话写不进新账套（报
+  `session_stale`，下次请求 404）。
+
+**停止与凭据（1 项）**
+
+- `MCPStop` 改「先吊销、后关停」：先持久化清空
+  `mcp.json` 的 token，再给运行中实例 `SetToken` 随机值，
+  最后 `Shutdown`；SSE 排空超时改为兜底 `srv.Close()`。
+  旧顺序是先关停后吊销，超时让旧凭据留在文件里复活。
+
+**查询与写入（4 项）**
+
+- `query_vouchers` 的 `amount` 改由 `lineStats` 一次
+  `SUM(debit)` 聚合（凭证头不载分录，`v.Amount()` 恒 0）。
+- `update_draft_voucher` 回填原 `word` —— 留空会被服务层
+  默认成「记」，只改摘要会把「付」字改掉。
+- `get_ledger` 的 `closingBalance` 跑完整个日期区间，不再
+  停在 `limit` 截断位置；`Truncated` 语义不变。
+- `list_invoices` 的 `direction` 公布值修正为
+  `input|output`，`in`/`out` 作缩写映射，其余值显式
+  `invalid_params`（此前静默不匹配返回空表）。
+
+**审计（1 项）**
+
+- `auditdb.Append` 的目录锁竞争改 2 秒退避重试（25ms 步进）
+  —— 临界区只有几条 SQL，短暂占用就失败会把业务操作永久
+  记成 `failed`，幂等重试还回放这个结果。

@@ -54,6 +54,9 @@ type Service struct {
 	// occup 是跨进程占用锁（filelock，文档 §2.4）。
 	// ":memory:" 账套无文件身份，为空。
 	occup *filelock.Lock
+	// wlock 是写者锁：仅读写打开持有，挡住第二个读写进程；
+	// 只读打开为 nil。
+	wlock *filelock.Lock
 }
 
 // Options 打开账套的参数。
@@ -68,11 +71,26 @@ type Options struct {
 
 // Open 打开（或创建）一个账套。
 //
-// 打开前先按文档 §2.4 协议取**共享占用**：有进程正在恢复
-// （独占锁）时报「恢复中」而不是打开一个正被替换的文件。
+// 打开前的占用协议（文档 §2.4）分两把锁：
+//   - **占用锁（共享）**：所有 opener 都取，挡住恢复中的独占。
+//   - **写者锁（独占）**：只有读写打开再取——硬链接/符号链接
+//     别名归并到同一文件身份，两个进程经不同路径打开同一
+//     账套时，第二个在这里被拒。只读打开不取它，可与一个
+//     读写进程共存（WAL 下多读单写安全）。
+//
 // 新建账套文件尚不存在，先取路径锁占位，文件落位后换身份锁。
 func Open(ctx context.Context, opts Options) (*Service, error) {
-	var occ *filelock.Lock
+	var occ, wlock *filelock.Lock
+	release := func() {
+		if wlock != nil {
+			wlock.Release()
+			wlock = nil
+		}
+		if occ != nil {
+			occ.Release()
+			occ = nil
+		}
+	}
 	pathOnly := false
 	if opts.Path != ":memory:" {
 		var err error
@@ -92,14 +110,23 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 			}
 			return nil, err
 		}
+		if !opts.ReadOnly {
+			var werr error
+			wlock, werr = writerLock(opts.Path, !pathOnly)
+			if werr != nil {
+				release()
+				if errors.Is(werr, filelock.ErrOccupied) {
+					return nil, errors.New("账套正被其它进程以读写方式打开")
+				}
+				return nil, werr
+			}
+		}
 	}
 	db, err := sqlite.Open(ctx, sqlite.Options{
 		Path: opts.Path, ReadOnly: opts.ReadOnly,
 	})
 	if err != nil {
-		if occ != nil {
-			occ.Release()
-		}
+		release()
 		return nil, err
 	}
 	if pathOnly {
@@ -109,23 +136,47 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 			occ.Release()
 			occ = lk
 		}
+		if wlock != nil {
+			if wl, err := writerLock(opts.Path, true); err == nil {
+				wlock.Release()
+				wlock = wl
+			}
+		}
 	}
 	if opts.ReadOnly {
 		// 只读打开不跑迁移（迁移要写库），但版本校验不能省：
 		// 比程序新的库读出来是错的，比程序旧的会撞「列不存在」。
 		if err := db.CheckSchemaVersion(ctx); err != nil {
 			_ = db.Close()
+			release()
 			return nil, err
 		}
 	} else if err := db.Migrate(ctx); err != nil {
 		_ = db.Close()
+		release()
 		return nil, err
 	}
-	s := &Service{db: db, path: opts.Path, filesDir: strings.TrimSpace(opts.FilesDir), occup: occ}
+	s := &Service{db: db, path: opts.Path, filesDir: strings.TrimSpace(opts.FilesDir), occup: occ, wlock: wlock}
 	if !opts.ReadOnly {
 		s.migrateLegacyFilesDir(ctx)
 	}
 	return s, nil
+}
+
+// writerLock 按文件身份（real=true）或路径身份（文件未落位）
+// 取写者锁——独占，第二个读写进程在这里被拒。
+func writerLock(path string, real bool) (*filelock.Lock, error) {
+	var id filelock.Identity
+	var err error
+	if real {
+		id, err = filelock.IdentityOf(path)
+	} else {
+		id, err = filelock.PathIdentity(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return filelock.AcquireIdentity(filelock.WriterKey(id), true)
 }
 
 // Shutdown 关闭账套，释放数据库连接。
@@ -135,6 +186,11 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 func (s *Service) Shutdown() error {
 	err := s.db.Close()
 	// 顺序固定：连接彻底关闭后才释放占用锁（文档 §2.4）。
+	// 写者锁先放（本进程不再写），占用锁后放。
+	if s.wlock != nil {
+		s.wlock.Release()
+		s.wlock = nil
+	}
 	if s.occup != nil {
 		s.occup.Release()
 		s.occup = nil

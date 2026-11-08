@@ -56,12 +56,29 @@ type BookProvider interface {
 	Generation() int64
 }
 
+// pinnedGenKey 是会话钉住世代的请求上下文键：
+// HTTP 中间件写入，providerSource 在账套读锁内复核。
+type pinnedGenKey struct{}
+
+// errStaleSession 表示请求到达时账套已切换（中间件检查
+// 之后、持锁执行之前的窗口里 generation 已递增）。
+var errStaleSession = errors.New("账套已切换，会话失效，请重新 initialize")
+
 // providerSource 把 BookProvider 适配成 bookSource。
 type providerSource struct{ p BookProvider }
 
 func (p providerSource) call(ctx context.Context,
 	fn func(ctx context.Context, svc *service.Service) (any, error)) (any, error) {
-	return p.p.Call(ctx, fn)
+	return p.p.Call(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+		// 世代在持读锁的临界区内复核 —— BookProvider.Call 的
+		// 读锁与换账的写锁互斥，比过之后这次调用钉死在这本
+		// 账上，旧会话不可能把凭证写进新账套。
+		if g, ok := ctx.Value(pinnedGenKey{}).(int64); ok &&
+			g != p.p.Generation() {
+			return nil, errStaleSession
+		}
+		return fn(ctx, svc)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -181,18 +198,18 @@ func (t *sessionTable) put(id string, meta sessMeta) {
 	t.mu.Unlock()
 }
 
-// check 返回 true 表示会话与当前账套一致；不一致（或已注销）
-// 的会话被移除并返回 false。
-func (t *sessionTable) check(id string, p BookProvider) bool {
+// check 返回会话钉住的账套快照与一致性结论；不一致（或已
+// 注销）的会话被移除并返回 false。
+func (t *sessionTable) check(id string, p BookProvider) (sessMeta, bool) {
 	t.mu.Lock()
 	meta, ok := t.m[id]
 	if !ok || meta.bookID != p.BookID() || meta.generation != p.Generation() {
 		delete(t.m, id)
 		t.mu.Unlock()
-		return false
+		return sessMeta{}, false
 	}
 	t.mu.Unlock()
-	return true
+	return meta, true
 }
 
 // bufferWriter 完整缓冲 initialize 响应：
@@ -377,11 +394,17 @@ func NewHTTPService(opts HTTPOpts) (*HTTPService, error) {
 		}
 		// 4. 会话世代 —— 带会话 ID 的请求先过注册表。
 		if sid := r.Header.Get(sessionHeader); sid != "" {
-			if !h.table.check(sid, opts.Provider) {
+			meta, ok := h.table.check(sid, opts.Provider)
+			if !ok {
 				// 世代不符 → 按规范 404，客户端重新 initialize。
 				http.Error(w, "session expired", http.StatusNotFound)
 				return
 			}
+			// 钉住的世代随请求上下文走：中间件检查与真正取
+			// 账套读锁之间存在换账窗口，业务调用在锁内复核
+			// （providerSource.call），旧会话写不进新账套。
+			r = r.WithContext(context.WithValue(r.Context(),
+				pinnedGenKey{}, meta.generation))
 			inner.ServeHTTP(w, r)
 			return
 		}

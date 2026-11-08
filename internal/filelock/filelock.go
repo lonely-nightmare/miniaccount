@@ -40,9 +40,11 @@ var ErrOccupied = errors.New("账套正被其它进程使用")
 var ErrNoIdentity = errors.New("无法确定账套文件身份")
 
 // Lock 是一把已持有的文件锁。进程崩溃由 OS 释放；
-// 正常路径必须 Release。
+// 正常路径必须 Release。gate 是独占获取时连带持有的
+// 路径闸门锁，Release 时先放主锁再放闸门。
 type Lock struct {
-	f *os.File
+	f    *os.File
+	gate *Lock
 }
 
 // Identity 是文件系统级别的文件身份，跨路径别名稳定。
@@ -142,10 +144,14 @@ func LockFile(path string, exclusive bool) (*Lock, error) {
 // acquire 是 Open/Restore 的统一入口。
 //
 // ★ 路径锁是「闸门」：双方必经同一把 p-锁，再在它的保护下
-// 解析身份、取身份锁、放闸门。这堵死了「路径锁→身份锁」的
-// 换锁窗口——没有闸门时，建账方持 p-锁占位、另一个进程用
-// 身份锁直接进来，两把不同的锁文件互斥不到一起。
+// 解析身份、取身份锁。这堵死了「路径锁→身份锁」的换锁窗口。
 // 顺序固定 p→i，绝不反向，不会死锁。
+//
+// 共享获取：身份锁落手即放闸门（闸门只管「换锁」这一刻）。
+// 独占获取：闸门随返回的 Lock 一直持有到 Release ——
+// 恢复要替换文件，身份锁只锁旧 inode；闸门不放手，其它
+// opener 就过不了路径这一道，换不掉 inode 也进不来。
+// 释放顺序固定 i→p。
 func acquire(path string, exclusive bool) (*Lock, error) {
 	pid, err := PathIdentity(path)
 	if err != nil {
@@ -155,32 +161,59 @@ func acquire(path string, exclusive bool) (*Lock, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer gate.Release()
+	keepGate := exclusive
+	if !keepGate {
+		defer gate.Release()
+	}
 
 	for i := 0; i < maxRetries; i++ {
 		id, err := IdentityOf(path)
 		if err != nil {
+			if keepGate {
+				gate.Release()
+			}
 			return nil, err
 		}
 		lk, err := AcquireIdentity(id, exclusive)
 		if err != nil {
+			if keepGate {
+				gate.Release()
+			}
 			return nil, err
 		}
 		id2, err := IdentityOf(path)
 		if err != nil {
 			// 复核时文件被删/换掉：释放锁，按错误处理
 			lk.Release()
+			if keepGate {
+				gate.Release()
+			}
 			return nil, err
 		}
 		if id2.Key == id.Key {
+			if keepGate {
+				lk.gate = gate
+			}
 			return lk, nil
 		}
 		lk.Release()
 	}
+	if keepGate {
+		gate.Release()
+	}
 	return nil, fmt.Errorf("账套文件身份在取锁间隙反复变化：%s", path)
 }
 
+// WriterKey 由账套身份推导「写者锁」的身份：读写打开在
+// 共享占用之外再占一把独占锁，挡住第二个读写进程（硬链接/
+// 符号链接别名归并到同一身份）；只读打开不取它，可与一个
+// 读写进程共存——SQLite WAL 下多读单写是安全的。
+func WriterKey(id Identity) Identity {
+	return Identity{Key: "w-" + id.Key, raw: "writer:" + id.raw}
+}
+
 // Release 放锁并关闭锁文件句柄。文件不删除。
+// 持有闸门时按取锁逆序释放：先身份锁，后路径闸门。
 func (l *Lock) Release() {
 	if l == nil || l.f == nil {
 		return
@@ -188,4 +221,8 @@ func (l *Lock) Release() {
 	_ = unlock(l.f)
 	_ = l.f.Close()
 	l.f = nil
+	if l.gate != nil {
+		l.gate.Release()
+		l.gate = nil
+	}
 }
