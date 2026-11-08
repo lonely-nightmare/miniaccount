@@ -911,9 +911,6 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		}
 		dbPath = curPath
 	}
-	filesDir := filepath.Join(filepath.Dir(dbPath),
-		strings.TrimSuffix(filepath.Base(dbPath), filepath.Ext(dbPath))+".files")
-
 	// 关掉当前连接再动文件：先把指针摘掉，后到的调用
 	// 直接报「未打开账套」，而不是打到一个半关的连接上。
 	// database/sql 会等已在途的查询走完再真正关连接，安全。
@@ -924,8 +921,10 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 
 	// 经 service.Restore：内部持跨进程独占占用（§2.4），
 	// 别处开着这个账套的 CLI/MCP/另一实例都会挡住恢复。
+	// FilesDir 留空 —— 由它按规约后的 DBPath 推导，
+	// 符号链接目标才不至于 DB/附件分家。
 	res, rerr := (&service.Service{}).Restore(a.context(), service.RestoreOptions{
-		Archive: req.Archive, DBPath: dbPath, FilesDir: filesDir,
+		Archive: req.Archive, DBPath: dbPath,
 	})
 	if rerr != nil {
 		// 恢复失败后把原来的账套重新打开，让用户至少还能用
@@ -949,7 +948,7 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 	rememberBookPath(dbPath)
 
 	out = &RestoreResult{
-		DBPath: dbPath, FilesDir: filesDir,
+		DBPath: dbPath, FilesDir: res.FilesDir,
 		Restored: res.FilesRestored, CompanyName: m.CompanyName,
 		Stashed: res.BackupDir,
 	}

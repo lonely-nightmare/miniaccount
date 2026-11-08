@@ -1072,7 +1072,7 @@ func cmdBackup(ctx context.Context, args []string) error {
 func cmdRestore(ctx context.Context, args []string) error {
 	fs := newFlagSet("restore")
 	archive := fs.String("from", "", "备份文件（.mabak，必填）")
-	filesDir := fs.String("files", "", "附件目录（默认 <账套名>.files）")
+	filesDir := fs.String("files", "", "附件目录（默认 <账套文件名>.files）")
 	// --db 由 newFlagSet 统一注册（与其它命令一致），这里只取它的值。
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1098,21 +1098,19 @@ func cmdRestore(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("\n目标账套：%s\n", dest)
 
-	fd := *filesDir
-	if fd == "" {
-		fd = strings.TrimSuffix(dest, filepath.Ext(dest)) + ".files"
-	}
-
+	// FilesDir 留空：由 service.Restore 按规约后的目标推导。
+	// 这里自己按 dest 推导会在「dest 是符号链接」时和实际
+	// 落库位置分家 —— DB 进真实路径、附件进链接名目录。
 	svc := &service.Service{}
 	rr, err := svc.Restore(ctx, service.RestoreOptions{
-		Archive: *archive, DBPath: dest, FilesDir: fd,
+		Archive: *archive, DBPath: dest, FilesDir: *filesDir,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Printf("\n✓ 已恢复\n")
 	fmt.Printf("  账套：%s\n", dest)
-	fmt.Printf("  附件：%d 个 → %s\n", rr.FilesRestored, fd)
+	fmt.Printf("  附件：%d 个 → %s\n", rr.FilesRestored, rr.FilesDir)
 	if rr.BackupDir != "" {
 		// ★ 这个路径必须打出来。恢复错了备份时它是唯一的退路，
 		// 不打出来等于没有 —— 用户不会知道原来的账被挪到哪儿去了。

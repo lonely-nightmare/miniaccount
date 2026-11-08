@@ -934,3 +934,48 @@ invalid_params），避免解码出几百 MB 的内存申请。
   `AttachToVoucher` 委托 + `DeleteAttachment` 补删除审计。
 - 输出契约：金额键规则不变；hash/size/mime/missing 按原样，
   path 不外发。
+
+### 附件链路复查修复（验收实测 9 项）
+
+**账套隔离与路径（P1，5 项）**
+
+- `buildDSN` 按 `file:`+path+`?`+参数拼接：文件名含 `?` 被当
+  参数分隔，MCP 打开的是另一份库。修法：路径段先转义
+  `%`→`%25`、`?`→`%3F`、`#`→`%23`（SQLite URI 允许百分号
+  编码），`file:` 开头的显式 DSN 不动。
+- `FilesDir` 剥扩展名取 `<stem>.files`：`same.db` 与
+  `same.sqlite` 共用 `same.files`，互相列孤儿、互相打进
+  备份。修法：改为 `<完整文件名>.files`（`same.db.files` /
+  `same.sqlite.files`），`migrateLegacyFilesDir` 扩展为遍历
+  两个旧布局——共享 `<dir>/.files` 与 `<stem>.files`——
+  只复制本账套引用的文件。
+- `service.Restore` 规约了 DB 目标但 `FilesDir` 由调用方按
+  原路径推导：恢复到符号链接 → DB 落真实路径、附件落链接
+  名目录。修法：`o.FilesDir` 为空时由规约后的 dbPath 推导
+  （`dbPath+".files"`）；`RestoreResult` 新增 `FilesDir`
+  回传实际落点；CLI/GUI 改为留空由它推导。
+- 备份只按「磁盘内容 hash」记清单：内容与文件名 hash 不符
+  的坏附件原样打进包、恢复也接受。修法：`collectFiles` 对
+  「文件名是 64 位 hex 的 sha256」强制 `内容hash==文件名`；
+  恢复侧对每个解出的文件同样校验文件名 hash 与 manifest
+  记录一致——两处都报 `ErrChecksumFail`，不让坏件过手。
+- `migrateLegacyFilesDir` 只查 `attachment` 表，漏掉
+  `audit_evidence` 引用的原件。修法：查询改
+  `UNION audit_evidence`（与 OrphanAttachments 同口径）。
+
+**边界与口径（P2，4 项）**
+
+- HTTP `MaxRequestBodyBytes` 默认 4MiB：base64 上传 20MB
+  文件需要 ~27MB。修法：显式设 `32<<20`，与工具声明的
+  单文件上限一致。
+- `AttachDocument` 先 `store.Put` 落盘再查 owner：归属不
+  存在时文件已写成孤儿。修法：Put 前先做一次归属存在
+  检查（事务内复查保留——挡住「检查后归属被删」的窄窗）。
+- `AttachmentCoverage` 只查关联行：文件全丢的凭证仍被计
+  「有附件」。修法：改为逐 hash `store.Exists` 判定——
+  有任一文件实体在才算 withAttach。
+- `SaveClaim` 覆盖草稿删明细不删旧 attachment 行（悬空、
+  AUTOINCREMENT 复用 id 还会错挂到新明细），重新关联只
+  写 hash 丢 file_name/mime/size/kind。修法：删明细前先
+  快照旧附件行并按 hash 保留元数据，删旧行，重新关联时
+  用 `linkTx` 的元数据版把名字/类型/大小/kind 带回来。

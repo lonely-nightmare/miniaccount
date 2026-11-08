@@ -959,6 +959,18 @@ func (s *Service) AttachDocument(ctx context.Context, ownerType string,
 			Msg: fmt.Sprintf("附件归属类型 %q 非法（只接受 voucher|invoice|expense_claim|expense_item）", ownerType)}
 	}
 
+	// ★ 先查归属再落盘：顺序反过来时，往不存在的 id 上传会
+	// 把文件写进 .files/ 再报「归属不存在」—— 调用方拿到错误，
+	// 磁盘上却多了一个能读、能进孤儿清单、能进备份的实物文件。
+	var n int
+	if err := s.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM `+own.table+` WHERE id = ?`, ownerID).Scan(&n); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%w: %s id=%d", sqlite.ErrNotFound, ownerType, ownerID)
+	}
+
 	store, err := s.Attachments()
 	if err != nil {
 		return nil, err
@@ -970,9 +982,9 @@ func (s *Service) AttachDocument(ctx context.Context, ownerType string,
 
 	err = s.db.WithTx(ctx, func(tx *sqliteTx) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		// ★ 先校验归属存在：原来不校验，往一个不存在的 id 上
-		// 挂附件会静默成功 —— 文件写进了 .files/、attachment 表
-		// 有了归属记录，但单据那行是空的，变成永远挂着的孤儿。
+		// 事务内复查：上面那次检查到落库之间归属可能被删掉，
+		// 仍按「不存在」处理 —— 此时文件已落盘，会留孤儿文件，
+		// 但那属于删除方的并发代价，孤儿清理可以收拾它。
 		var n int
 		if err := tx.QueryRow(ctx,
 			`SELECT COUNT(*) FROM `+own.table+` WHERE id = ?`, ownerID).Scan(&n); err != nil {
@@ -1186,17 +1198,53 @@ func (s *Service) AttachmentCoverage(ctx context.Context,
 		where = " AND year = ? AND month = ?"
 		args = []any{year, month}
 	}
-	audit := &AttachmentAudit{}
-	err := s.db.SQL().QueryRowContext(ctx, `
-		SELECT COUNT(*),
-		       COALESCE(SUM(CASE WHEN EXISTS (
-		           SELECT 1 FROM attachment a
-		            WHERE a.owner_type = 'voucher' AND a.owner_id = voucher.id
-		       ) THEN 1 ELSE 0 END), 0)
-		  FROM voucher
-		 WHERE status = 'posted'`+where, args...).
-		Scan(&audit.Posted, &audit.WithAttach)
+	// ★ 「有附件」必须算上文件实体：只查关联行时，原件被删
+	// 的凭证仍被计进 withAttach —— 覆盖率虚高，审计拿它当
+	// 「原始单据齐全」的证据就错了。逐 hash 校验 store.Exists，
+	// 有任一附件实体在才算有附件。
+	store, err := s.Attachments()
 	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.SQL().QueryContext(ctx, `
+		SELECT v.id, a.sha256
+		  FROM voucher v
+		  LEFT JOIN attachment a
+		    ON a.owner_type = 'voucher' AND a.owner_id = v.id
+		 WHERE v.status = 'posted'`+where, args...)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+
+	audit := &AttachmentAudit{}
+	seen := map[int64]bool{}    // 已计进 Posted 的凭证
+	hasFile := map[int64]bool{} // 已计进 WithAttach 的凭证
+	present := map[string]bool{}
+	for rows.Next() {
+		var vid int64
+		var hash *string
+		if err := rows.Scan(&vid, &hash); err != nil {
+			return nil, translate(err)
+		}
+		if !seen[vid] {
+			seen[vid] = true
+			audit.Posted++
+		}
+		if hash == nil || hasFile[vid] {
+			continue
+		}
+		exists, ok := present[*hash]
+		if !ok {
+			exists = store.Exists(*hash)
+			present[*hash] = exists
+		}
+		if exists {
+			hasFile[vid] = true
+			audit.WithAttach++
+		}
+	}
+	if err := rows.Err(); err != nil {
 		return nil, translate(err)
 	}
 	audit.Without = audit.Posted - audit.WithAttach

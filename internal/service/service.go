@@ -63,7 +63,7 @@ type Service struct {
 type Options struct {
 	// Path 是 .db 文件路径。传 ":memory:" 可用于演示与测试。
 	Path string
-	// FilesDir 是附件目录。留空时取 db 同级的 <名字>.files。
+	// FilesDir 是附件目录。留空时取 db 同级的 <完整文件名>.files。
 	FilesDir string
 	// ReadOnly 为真时以只读方式打开（查看备份、只读审计等场景）。
 	ReadOnly bool
@@ -911,13 +911,12 @@ func (s *Service) Reopen(ctx context.Context, k period.Key, postingBy string) (*
 
 // FilesDir 返回附件目录。
 //
-// ★ 按账套隔离，取 db 同级的 <账套名>.files。
+// ★ 按账套隔离，取 db 同级的 <完整文件名>.files。
 //
-// 曾经是 <db目录>/.files —— 同目录下的所有账套共用一个附件目录：
-// 备份 A 会把 B 的附件一并打包，恢复 A 时 stashExisting 挪走整个
-// 共享目录，B 的附件就物理消失了。CLI 恢复本来就按 <账套名>.files
-// 落附件，结果 GUI 打开时读的是共享目录、一个附件也看不见 ——
-// 两条路径对不上是同一个根因。
+// 曾经是 <db目录>/.files —— 同目录下的所有账套共用一个附件目录；
+// 后来改成剥扩展名的 <stem>.files —— same.db 与 same.sqlite 又撞回
+// 同一个目录，互相列孤儿、互相打进备份。用完整文件名派生才没有
+// 歧义：same.db → same.db.files，same.sqlite → same.sqlite.files。
 func (s *Service) FilesDir() string {
 	if s.filesDir != "" {
 		return s.filesDir
@@ -926,12 +925,16 @@ func (s *Service) FilesDir() string {
 	if base == ":memory:" || base == "" {
 		return filepath.Join(".", ".files")
 	}
-	name := strings.TrimSuffix(filepath.Base(base), filepath.Ext(base))
-	return filepath.Join(filepath.Dir(base), name+".files")
+	return base + ".files"
 }
 
-// migrateLegacyFilesDir 把旧版共享 .files 目录里、本账套引用的附件
-// 复制到按账套隔离的新目录。
+// filesDirFor 按与 FilesDir 相同的规则给任意 db 路径推导附件目录。
+func filesDirFor(dbPath string) string { return dbPath + ".files" }
+
+// migrateLegacyFilesDir 把旧布局附件目录里、本账套引用的附件复制到
+// 按账套隔离的新目录。历史布局有两代：
+//   - <db目录>/.files（最初的全局共享目录）
+//   - <stem>.files（剥扩展名，same.db 与 same.sqlite 撞名那代）
 //
 // 只复制、不移动：内容寻址意味着同一 hash 文件可能被同目录下其他
 // 账套引用，移走了别人就丢。单文件失败不阻断打开 —— 文件还留在旧
@@ -942,31 +945,50 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 		return
 	}
 	newDir := s.FilesDir()
-	legacy := filepath.Join(filepath.Dir(s.path), ".files")
-	if legacy == newDir {
-		return
+	stem := strings.TrimSuffix(filepath.Base(s.path), filepath.Ext(s.path))
+	legacies := []string{
+		filepath.Join(filepath.Dir(s.path), ".files"),
+		filepath.Join(filepath.Dir(s.path), stem+".files"),
 	}
-	if st, err := os.Stat(legacy); err != nil || !st.IsDir() {
-		return
-	}
-	// ★ 只查 attachment：0013 迁移把 attachment_v2 改名回 attachment，
-	// 两张表名同时出现在 UNION 里会因后者不存在而整句失败。
-	rows, err := s.db.SQL().QueryContext(ctx,
-		`SELECT sha256 FROM attachment`)
-	if err != nil {
-		// 查不出清单就无从迁移 —— 静默返回会让老附件「看起来
-		// 凭空消失」，至少要留下可查的痕迹。
-		_, _ = os.Stderr.WriteString("[files] 附件清单读取失败，旧附件未迁移: " + err.Error() + "\n")
-		return
-	}
-	var hashes []string
-	for rows.Next() {
-		var h string
-		if rows.Scan(&h) == nil {
-			hashes = append(hashes, h)
+	var legacyDirs []string
+	for _, d := range legacies {
+		if d == newDir {
+			continue
+		}
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			legacyDirs = append(legacyDirs, d)
 		}
 	}
-	rows.Close()
+	if len(legacyDirs) == 0 {
+		return
+	}
+	// 按表存在性分别查：attachment_v2 时代的账套可能缺
+	// audit_evidence，UNION 整句失败反而什么都不迁。
+	var hashes []string
+	for _, table := range []string{"attachment", "audit_evidence"} {
+		var one int
+		err := s.db.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`,
+			table).Scan(&one)
+		if err != nil || one == 0 {
+			continue
+		}
+		rows, err := s.db.SQL().QueryContext(ctx,
+			`SELECT sha256 FROM `+table)
+		if err != nil {
+			// 查不出清单就无从迁移 —— 静默返回会让老附件「看起来
+			// 凭空消失」，至少要留下可查的痕迹。
+			_, _ = os.Stderr.WriteString("[files] 附件清单读取失败，旧附件未迁移: " + err.Error() + "\n")
+			return
+		}
+		for rows.Next() {
+			var h string
+			if rows.Scan(&h) == nil {
+				hashes = append(hashes, h)
+			}
+		}
+		rows.Close()
+	}
 	for _, h := range hashes {
 		if len(h) < 4 {
 			continue
@@ -975,9 +997,14 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 		if _, err := os.Stat(dst); err == nil {
 			continue
 		}
-		src := filepath.Join(legacy, h[:2], h)
-		data, err := os.ReadFile(src)
-		if err != nil {
+		var data []byte
+		for _, legacy := range legacyDirs {
+			if d, err := os.ReadFile(filepath.Join(legacy, h[:2], h)); err == nil {
+				data = d
+				break
+			}
+		}
+		if data == nil {
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -1022,8 +1049,12 @@ func (s *Service) Backup(ctx context.Context, opts BackupOptions) (*backup.Manif
 
 // RestoreOptions 是恢复参数。
 type RestoreOptions struct {
-	Archive  string
-	DBPath   string
+	Archive string
+	DBPath  string
+	// FilesDir 是附件目录；留空时按规约后的 DBPath 推导
+	// （<完整文件名>.files，与 FilesDir() 同规则）。
+	// 恢复到符号链接时若由调用方按链接名推导，DB 会落在
+	// 真实路径而附件落进链接名目录 —— 两侧对不上。
 	FilesDir string
 }
 
@@ -1056,7 +1087,11 @@ func (s *Service) Restore(ctx context.Context, o RestoreOptions) (*backup.Restor
 		return nil, err
 	}
 	defer lk.Release()
-	return backup.Restore(ctx, o.Archive, dbPath, o.FilesDir,
+	filesDir := strings.TrimSpace(o.FilesDir)
+	if filesDir == "" {
+		filesDir = filesDirFor(dbPath)
+	}
+	return backup.Restore(ctx, o.Archive, dbPath, filesDir,
 		sqlite.VerifyOpenable)
 }
 

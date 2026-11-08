@@ -257,6 +257,9 @@ type RestoreResult struct {
 	// 为免无限堆积，同一目录下只保留最近一份，建新暂存时清掉旧的。
 	// 界面必须把这个路径告诉用户，否则等于没有。
 	BackupDir string
+	// FilesDir 是附件实际恢复到的目录 —— 调用方传空时由
+	// 规约后的 dbPath 推导，回传让界面/CLI 能如实报告。
+	FilesDir string
 }
 
 // Restore 从一个 .mabak 恢复账套。
@@ -312,7 +315,7 @@ func Restore(ctx context.Context, archivePath, dbPath, filesDir string,
 		return nil, err
 	}
 
-	res = &RestoreResult{Manifest: manifest}
+	res = &RestoreResult{Manifest: manifest, FilesDir: filesDir}
 
 	// 2) 暂存现有文件
 	stash, serr := stashExisting(dbPath, filesDir)
@@ -449,13 +452,22 @@ func Restore(ctx context.Context, archivePath, dbPath, filesDir string,
 			if err := extractOne(zr, filesPrefix+rel, target); err != nil {
 				return nil, err
 			}
-			if want != "" {
+			// 校验两关：manifest 记的 hash、文件名自身携带的 hash。
+			// 只验 manifest 不够 —— 制作备份时磁盘内容若已损坏，
+			// manifest 会忠实记下坏内容的 hash，两边一核对全错着
+			// 通过。文件名是 hash 形态时，内容必须对得上它。
+			base := filepath.Base(rel)
+			if want != "" || attachment.ValidateHash(base) == nil {
 				got, _, err := fileSHA256(target)
 				if err != nil {
 					return nil, err
 				}
-				if got != want {
+				if want != "" && got != want {
 					return nil, fmt.Errorf("%w: 附件 %s", ErrChecksumFail, rel)
+				}
+				if attachment.ValidateHash(base) == nil && got != base {
+					return nil, fmt.Errorf("%w: 附件 %s 内容与文件名不符",
+						ErrChecksumFail, rel)
 				}
 			}
 			res.FilesRestored++
@@ -783,6 +795,14 @@ func collectFiles(filesDir string, include bool) ([]fileEntry, int64, error) {
 		hash, size, err := fileSHA256(path)
 		if err != nil {
 			return err
+		}
+		// ★ 内容寻址不变式：文件名本身就是 sha256。文件名像 hash
+		// 但内容对不上 = 附件已被改坏 —— 之前照样算 hash 记进
+		// manifest，恢复也照收，等 MCP/界面读取时才发现损坏。
+		// 备份就该在这里明确失败，而不是把坏件打包封存。
+		if b := filepath.Base(rel); attachment.ValidateHash(b) == nil && b != hash {
+			return fmt.Errorf("%w: 附件 %s 内容与文件名不符（期望 %s，实际 %s）",
+				ErrChecksumFail, rel, b, hash)
 		}
 		out = append(out, fileEntry{abs: path, rel: rel, hash: hash})
 		total += size

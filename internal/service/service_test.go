@@ -260,7 +260,7 @@ func TestFilesDirAndBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := svc.FilesDir(), filepath.Join(rd, "b.files"); got != want {
+	if got, want := svc.FilesDir(), filepath.Join(rd, "b.db.files"); got != want {
 		t.Errorf("附件目录 = %s，期望 %s", got, want)
 	}
 	st, err := svc.Attachments()

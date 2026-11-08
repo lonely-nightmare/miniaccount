@@ -2,14 +2,17 @@ package mcpserver_test
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	"miniaccount/internal/domain/money"
 	"miniaccount/internal/mcpserver"
 	"miniaccount/internal/service"
 )
@@ -206,6 +209,62 @@ func TestHTTPSessionGeneration(t *testing.T) {
 	rec = do(t, h.Handler, func(r *http.Request) { r.Header.Set("Mcp-Session-Id", sid) })
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("过期会话应持续 404，实际 %d", rec.Code)
+	}
+}
+
+// 请求体上限：工具声明单文件可传 20 MiB；SDK 默认 4 MiB
+// 会把合法上传拦成 413（base64 膨胀后实际不到 3 MiB 文件）。
+// 实测复现：4 MiB 文件走 HTTP 返回 413、走 stdio 成功。
+func TestHTTPLargeUploadNotRejected(t *testing.T) {
+	svc := openTestBook(t)
+	p := &fakeProvider{svc: svc}
+	h := newHTTPTestService(t, p, "tok")
+
+	init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8765/mcp", strings.NewReader(init))
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rec := httptest.NewRecorder()
+	h.Handler.ServeHTTP(rec, req)
+	sid := rec.Header().Get("Mcp-Session-Id")
+	if sid == "" {
+		t.Fatalf("initialize 应签发会话: %s", rec.Body.String())
+	}
+
+	// 建一张凭证作归属。
+	d, err := svc.SaveVoucher(context.Background(), service.VoucherInput{
+		Word: "记", Date: "2025-01-10", Remark: "x", CreatedBy: "会计",
+		Lines: []service.VoucherLineInput{
+			{AccountCode: "1002", Summary: "借", Debit: money.Money(10000)},
+			{AccountCode: "5001", Summary: "贷", Credit: money.Money(10000)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 4 MiB 文件 → base64 ~5.6 MiB —— 旧默认 4 MiB 必然 413。
+	payload := make([]byte, 4<<20)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	call := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"upload_attachment","arguments":{"ownerType":"voucher","ownerId":` +
+		strconv.FormatInt(d.ID, 10) +
+		`,"fileName":"big.bin","dataBase64":"` + base64.StdEncoding.EncodeToString(payload) + `"}}}`
+	req = httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8765/mcp", strings.NewReader(call))
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", sid)
+	rec = httptest.NewRecorder()
+	h.Handler.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatal("4 MiB 文件上传不应被 413 拒收 —— 请求体上限要与工具声明对齐")
+	}
+	if !strings.Contains(rec.Body.String(), `"hash"`) {
+		t.Fatalf("上传应成功返回 hash，实际 %d: %.300s", rec.Code, rec.Body.String())
 	}
 }
 

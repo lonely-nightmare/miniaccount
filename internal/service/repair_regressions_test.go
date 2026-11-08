@@ -48,11 +48,11 @@ func TestFilesDirIsolatedPerBook(t *testing.T) {
 	if svcA.FilesDir() == svcB.FilesDir() {
 		t.Fatalf("同目录两本账共用附件目录 %s，备份会互相污染", svcA.FilesDir())
 	}
-	if got := filepath.Base(svcA.FilesDir()); got != "a.files" {
-		t.Errorf("甲账套附件目录 = %s，期望 a.files", got)
+	if got := filepath.Base(svcA.FilesDir()); got != "a.db.files" {
+		t.Errorf("甲账套附件目录 = %s，期望 a.db.files", got)
 	}
-	if got := filepath.Base(svcB.FilesDir()); got != "b.files" {
-		t.Errorf("乙账套附件目录 = %s，期望 b.files", got)
+	if got := filepath.Base(svcB.FilesDir()); got != "b.db.files" {
+		t.Errorf("乙账套附件目录 = %s，期望 b.db.files", got)
 	}
 }
 

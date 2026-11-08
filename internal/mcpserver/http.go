@@ -407,6 +407,11 @@ func NewHTTPService(opts HTTPOpts) (*HTTPService, error) {
 			// 世代层删掉的会话在 SDK 内部就成孤儿了，
 			// 空闲超时负责把它们扫掉，免得越积越多。
 			SessionTimeout: 30 * time.Minute,
+			// ★ 工具声明单文件可传 20 MiB；base64 膨胀 4/3 后
+			// ~27 MiB，再加 JSON-RPC 包装与参数开销。SDK 默认
+			// 4 MiB 会把合法上传拦成 413 —— 必须对齐口径。
+			// 取 32 MiB：覆盖 20 MiB 负载且仍把异常大包挡在外。
+			MaxRequestBodyBytes: 32 << 20,
 		})
 
 	h := &HTTPService{

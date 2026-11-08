@@ -480,6 +480,54 @@ func TestRestoreDetectsCorruptAttachment(t *testing.T) {
 	}
 }
 
+// 制作备份时磁盘上的附件已损坏：文件名（内容寻址 hash）与
+// 内容对不上，必须明确失败 —— 之前照样打包，坏件被带进归档，
+// 恢复也照收，要等读取时才发现（实测复现）。
+func TestBackupRejectsContentNameMismatch(t *testing.T) {
+	f := newFixture(t)
+
+	// 原地改坏第一个附件：路径不变，内容换了。
+	for rel := range f.Attachments {
+		p := filepath.Join(f.FilesDir, filepath.FromSlash(rel))
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[0] ^= 0xFF
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		break
+	}
+
+	dest := filepath.Join(f.Dir, "corrupt.mabak")
+	b := &Backup{DBPath: f.DBPath, FilesDir: f.FilesDir}
+	_, err := b.Create(context.Background(), dest, Options{IncludeFiles: true})
+	if !errors.Is(err, ErrChecksumFail) {
+		t.Fatalf("文件名与内容不符的附件应让备份报 ErrChecksumFail，得到 %v", err)
+	}
+}
+
+// manifest 忠实记录坏 hash 的归档（旧版备份程序对坏件的产物）：
+// manifest 与内容自洽，但内容对不上文件名 —— 恢复也必须拒收。
+func TestRestoreRejectsFaithfulCorruptManifest(t *testing.T) {
+	f := newFixture(t)
+
+	dest := filepath.Join(f.Dir, "faithful.mabak")
+	b := &Backup{DBPath: f.DBPath, FilesDir: f.FilesDir}
+	if _, err := b.Create(context.Background(), dest, Options{IncludeFiles: true}); err != nil {
+		t.Fatal(err)
+	}
+	faithfulCorruptArchive(t, dest, f)
+
+	target := filepath.Join(f.Dir, "restored.db")
+	_, err := Restore(context.Background(), dest, target,
+		filepath.Join(f.Dir, "restored.files"), nil)
+	if !errors.Is(err, ErrChecksumFail) {
+		t.Fatalf("manifest 自洽但文件名不符的归档应报 ErrChecksumFail，得到 %v", err)
+	}
+}
+
 // manifest 缺失或损坏应报 ErrBadArchive
 func TestRestoreBadArchive(t *testing.T) {
 	dir := t.TempDir()
@@ -585,6 +633,84 @@ func corruptArchive(t *testing.T, archivePath string, f *fixture) {
 		items = append(items, item{ze.Name, buf})
 	}
 	src.Close()
+
+	out, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	zw := zip.NewWriter(out)
+	for _, it := range items {
+		w, err := zw.Create(it.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(it.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// faithfulCorruptArchive 重写归档：翻转第一个附件的首字节，
+// 且把 manifest.Files 里该校验和改成坏内容的 sha256 ——
+// 模拟「备份程序忠实打包了已损坏的磁盘文件」：manifest 与
+// 内容自洽，但文件名（即内容寻址 hash）对不上。
+func faithfulCorruptArchive(t *testing.T, archivePath string, f *fixture) {
+	t.Helper()
+	src, err := zip.OpenReader(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type item struct {
+		name string
+		data []byte
+	}
+	var items []item
+	var manifestRaw []byte
+	var corruptRel, corruptHash string
+	for _, ze := range src.File {
+		rc, err := ze.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, ze.UncompressedSize64)
+		n, _ := rc.Read(buf)
+		rc.Close()
+		buf = buf[:n]
+		if ze.Name == manifestName {
+			manifestRaw = buf
+		}
+		// 翻转第一个附件的首字节，记其归档路径与新内容 hash
+		if corruptRel == "" && len(buf) > 0 && strings.HasPrefix(ze.Name, filesPrefix) {
+			buf[0] ^= 0xFF
+			corruptRel = strings.TrimPrefix(ze.Name, filesPrefix)
+			corruptHash = SHA256Of(buf)
+		}
+		items = append(items, item{ze.Name, buf})
+	}
+	src.Close()
+	if corruptRel == "" {
+		t.Fatal("归档里没有附件可改")
+	}
+
+	// manifest 改成「忠实记录坏 hash」的形态。
+	var m Manifest
+	if err := json.Unmarshal(manifestRaw, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.Files[corruptRel] = corruptHash
+	raw, err := json.Marshal(&m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, it := range items {
+		if it.name == manifestName {
+			items[i].data = raw
+		}
+	}
 
 	out, err := os.Create(archivePath)
 	if err != nil {

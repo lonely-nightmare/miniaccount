@@ -324,6 +324,81 @@ func TestSaveAndLoadClaim(t *testing.T) {
 	}
 }
 
+// 重存草稿报销单：旧明细的附件行必须清走、新明细重挂同一
+// hash 时元数据（文件名/类型/大小/kind）要带回来。
+// 实测复现：删明细不删关联 → 悬空行 + id 复用后错挂；
+// 重新关联只写 hash → 文件还在，名字/大小全没了。
+func TestReSaveClaimKeepsAttachmentMeta(t *testing.T) {
+	ctx := context.Background()
+	f := setupIE(t)
+	c := f.buildClaim(t)
+
+	id, err := f.DB.Claims().SaveClaim(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟上传路径：给首条明细的附件补上元数据（linkTx 只写 hash）。
+	oldItem := c.Items[0]
+	if err := f.DB.Attachments().LinkDetailed(ctx, "expense_item",
+		oldItem.ID, "高铁票.pdf", oldItem.AttachmentHashes[0],
+		"application/pdf", 128, "invoice"); err != nil {
+		t.Fatal(err)
+	}
+	oldItemID := oldItem.ID
+
+	// 重存同一单号：明细行换了内容，附件 hash 仍引用同一文件。
+	c2, err := f.DB.Claims().GetClaim(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.Items[0].Summary = "高铁往返（改签）"
+	if _, err := f.DB.Claims().SaveClaim(ctx, c2); err != nil {
+		t.Fatalf("重存报销单失败: %v", err)
+	}
+
+	// ① 不能留悬空关联：旧明细 id 下的行应已被清走。
+	if metas, err := f.DB.Attachments().ListOf(ctx, "expense_item", oldItemID); err != nil {
+		t.Fatal(err)
+	} else if len(metas) != 0 {
+		t.Fatalf("旧明细 %d 下不应残留附件关联，实际 %d 行", oldItemID, len(metas))
+	}
+	// 全表也不该有指向已删明细的悬空行。
+	var dangling int
+	if err := f.DB.SQL().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM attachment
+		 WHERE owner_type = 'expense_item' AND owner_id NOT IN (
+		       SELECT id FROM expense_item)`).Scan(&dangling); err != nil {
+		t.Fatal(err)
+	}
+	if dangling != 0 {
+		t.Fatalf("不应有悬空附件关联，实际 %d 行", dangling)
+	}
+
+	// ② 新明细的关联要把元数据带回来。
+	reloaded, err := f.DB.Claims().GetClaim(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Items) != 3 {
+		t.Fatalf("明细数 = %d，期望 3", len(reloaded.Items))
+	}
+	metas, err := f.DB.Attachments().ListOf(ctx, "expense_item", reloaded.Items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metas) != 1 {
+		t.Fatalf("新明细应有 1 个附件，实际 %d", len(metas))
+	}
+	m := metas[0]
+	if m.SHA256 != c2.Items[0].AttachmentHashes[0] {
+		t.Errorf("附件 hash = %s", m.SHA256)
+	}
+	if m.FileName != "高铁票.pdf" || m.Mime != "application/pdf" ||
+		m.Size != 128 || m.Kind != "invoice" {
+		t.Errorf("元数据应保留 {高铁票.pdf application/pdf 128 invoice}，实际 %+v", m)
+	}
+}
+
 // 报销单号应逐月递增
 func TestClaimCodeSequence(t *testing.T) {
 	ctx := context.Background()
