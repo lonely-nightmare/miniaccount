@@ -71,7 +71,10 @@ const currentPeriod = computed(() => {
 </script>
 
 <template>
-  <div class="flex h-full">
+  <!-- ★ overflow-hidden：应用外壳绝不产生窗口级滚动。
+       菜单或某页内容意外撑高时只会被裁掉 —— 窗口滚动会把
+       侧栏顶部（logo、前几个菜单项）一起滚出屏幕。 -->
+  <div class="flex h-full overflow-hidden">
     <!-- 侧栏 -->
     <aside
       :class="[
@@ -97,7 +100,12 @@ const currentPeriod = computed(() => {
       <!-- ★ 没建账套时菜单不可点。
            「点得动但进去是空的 / 报错」比「点不动」糟糕得多：
            用户会以为软件坏了，而不是以为自己还没建账。 -->
-      <nav class="flex flex-1 flex-col gap-0.5 px-2 py-2">
+      <!-- ★ min-h-0 + overflow-y-auto：窗口不够高、菜单放不下时
+           在侧栏**内部**滚动 —— 没有它菜单会溢出撑高整个文档，
+           窗口级滚动把 logo 和顶部菜单项一起滚出屏幕。
+           （flex 子项默认 min-height:auto，缺了 min-h-0 不收缩，
+           overflow 永远不触发。） -->
+      <nav class="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-2 py-2">
         <template v-for="r in nav" :key="r.path">
           <RouterLink
             v-if="canNavigate"
