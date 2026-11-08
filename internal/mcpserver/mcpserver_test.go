@@ -128,12 +128,27 @@ func TestAmountContractIsYuan(t *testing.T) {
 	}
 }
 
-// 只读模式：写工具返回 readonly 错误，读工具正常。
+// 只读模式：写工具根本不注册（协议层报工具不存在），读工具正常。
 func TestReadonlyMode(t *testing.T) {
 	ctx := context.Background()
 	cs := newPair(t, true)
 
-	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+	tl, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tl.Tools {
+		if strings.HasPrefix(tool.Name, "create_") ||
+			strings.HasPrefix(tool.Name, "update_") ||
+			strings.HasPrefix(tool.Name, "delete_") ||
+			strings.HasPrefix(tool.Name, "upsert_") ||
+			strings.HasPrefix(tool.Name, "save_") {
+			t.Fatalf("只读模式不应注册写工具 %s", tool.Name)
+		}
+	}
+
+	// 写工具不存在 → CallTool 直接是协议层错误。
+	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{
 		Name: "create_draft_voucher",
 		Arguments: map[string]any{
 			"date": "2025-03-15", "lines": []map[string]any{
@@ -141,16 +156,8 @@ func TestReadonlyMode(t *testing.T) {
 				{"accountCode": "1002", "credit": "1"},
 			},
 		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.IsError {
-		t.Fatal("只读模式下写工具应报错")
-	}
-	tc, _ := json.Marshal(res.Content)
-	if !strings.Contains(string(tc), "readonly") {
-		t.Fatalf("错误应为 readonly: %s", tc)
+	}); err == nil {
+		t.Fatal("只读模式调用不存在的写工具应报协议错误")
 	}
 
 	if res, err := cs.CallTool(ctx, &mcp.CallToolParams{

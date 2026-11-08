@@ -20,7 +20,7 @@ func cmdMCP(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	db := fs.String("db", "miniaccount.db", "账套文件路径（必须已初始化）")
-	readonly := fs.Bool("readonly", false, "只读模式：写工具注册但调用即报错")
+	readonly := fs.Bool("readonly", false, "只读模式：以 mode=ro 打开账套，只注册读工具")
 	operator := fs.String("operator", "mcp", "写操作在审计日志里的操作人署名")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -34,7 +34,8 @@ func cmdMCP(ctx context.Context, args []string) error {
 		return fmt.Errorf("账套文件 %q 不存在（mcp 不会替你建账，请先用 init/界面建账）", *db)
 	}
 
-	svc, err := service.Open(ctx, service.Options{Path: *db})
+	// readonly 用只读连接打开：不写库、不跑迁移（设计文档 §2.12）。
+	svc, err := service.Open(ctx, service.Options{Path: *db, ReadOnly: *readonly})
 	if err != nil {
 		return fmt.Errorf("打开账套失败: %w", err)
 	}

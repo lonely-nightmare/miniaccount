@@ -54,6 +54,16 @@ export function hasWails() {
   return typeof window !== 'undefined' && !!window.go?.main?.App
 }
 
+/**
+ * 订阅 MCP 外部改动通知（Go 侧在写工具成功后 EventsEmit）。
+ * 返回退订函数；非 Wails 环境返回空操作。
+ * payload 形状：{ entity: 'voucher'|'contact'|'department'|'employee', id: number }
+ */
+export function onMcpChanged(fn) {
+  if (!hasWails() || !window.runtime?.EventsOn) return () => {}
+  return window.runtime.EventsOn('mcp:changed', (payload) => fn(payload))
+}
+
 /** 开发态（vite dev / 直接开浏览器）才允许退回假数据。 */
 const DEV = typeof import.meta !== 'undefined' && !!import.meta.env?.DEV
 
@@ -403,6 +413,12 @@ export const api = {
 
   today: () => call(A().Today),
   appVersion: () => call(A().AppVersion),
+
+  // MCP 对外服务（HTTP 传输）—— 设置页「MCP 服务」卡。
+  mcpStatus: () => call(A().MCPStatus),
+  mcpStart: (req) => call(A().MCPStart, req),
+  mcpStop: () => call(A().MCPStop),
+  mcpRegenerateToken: () => call(A().MCPRegenerateToken),
 }
 
 
@@ -1014,4 +1030,10 @@ export const mockApp = {
   AuditAttachments: async () => ({ posted: 16, withAttach: 3, without: 13, orphanFiles: 0 }),
   InspectBackup: async () => ({ path: '', companyName: '演示', dbSize: 120000, fileCount: 3, fileBytes: 40000, voucherCount: 16, accountCount: 190 }),
   Today: async () => '2025-03-11',
-  AppVersion: async () => '0.1.0-dev',}
+  AppVersion: async () => '0.1.0-dev',
+
+  // MCP 服务卡（mock 下始终未运行）
+  MCPStatus: async () => ({ running: false, port: 8765, operator: 'mcp', token: '', url: '' }),
+  MCPStart: async () => ({ running: true, port: 8765, operator: 'mcp', token: 'mock-token', url: 'http://127.0.0.1:8765/mcp' }),
+  MCPStop: async () => null,
+  MCPRegenerateToken: async () => ({ running: true, port: 8765, operator: 'mcp', token: 'mock-token-2', url: 'http://127.0.0.1:8765/mcp' }),}

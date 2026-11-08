@@ -56,6 +56,53 @@ async function load() {
 const bookkeeperDraft = ref('')
 const savingBookkeeper = ref(false)
 
+// MCP 对外服务（HTTP 传输）
+const mcp = ref(null)
+const mcpPort = ref(8765)
+const mcpOperator = ref('')
+const mcpBusy = ref(false)
+const mcpTokenShown = ref(false)
+
+async function loadMcp() {
+  const r = await api.mcpStatus()
+  if (r.ok) {
+    mcp.value = r.data
+    if (r.data.port) mcpPort.value = r.data.port
+    if (r.data.operator) mcpOperator.value = r.data.operator
+  }
+}
+
+async function mcpToggle() {
+  mcpBusy.value = true
+  const r = mcp.value?.running
+    ? await api.mcpStop()
+    : await api.mcpStart({ port: mcpPort.value, operator: mcpOperator.value.trim() })
+  mcpBusy.value = false
+  if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
+  await loadMcp()
+  notify(mcp.value?.running
+    ? `MCP 服务已开启：${mcp.value.url}`
+    : 'MCP 服务已关闭，凭据已吊销', 'success')
+}
+
+async function mcpRegen() {
+  const r = await api.mcpRegenerateToken()
+  if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
+  mcp.value = r.data
+  mcpTokenShown.value = true
+  notify('已重新生成凭据 —— 旧凭据立即失效，请更新所有客户端配置', 'success')
+}
+
+async function mcpCopyToken() {
+  if (!mcp.value?.token) return
+  try {
+    await navigator.clipboard.writeText(mcp.value.token)
+    notify('凭据已复制', 'success')
+  } catch {
+    notify('复制失败，请手动选择复制', 'warn')
+  }
+}
+
 async function saveBookkeeper() {
   savingBookkeeper.value = true
   const r = await rememberBookkeeper(bookkeeperDraft.value)
@@ -71,6 +118,7 @@ onMounted(async () => {
   await load()
   await loadBookkeeper()
   bookkeeperDraft.value = bookkeeper.value
+  await loadMcp()
 })
 
 async function doBackup() {
@@ -176,6 +224,69 @@ function suggestPath() {
           存在账套里（<code class="font-mono">setting</code> 表），
           命令行 <code class="font-mono">--by</code> 不传时也用它。
         </p>
+      </CardContent>
+    </Card>
+
+    <!-- MCP 对外服务 -->
+    <Card>
+      <CardHeader>
+        <CardTitle class="flex items-center gap-2">
+          MCP 服务
+          <Badge v-if="mcp?.running" variant="debit">运行中</Badge>
+          <Badge v-else variant="muted">未开启</Badge>
+        </CardTitle>
+        <CardDescription>
+          对外暴露账套的 MCP（Model Context Protocol）能力：让外部客户端
+          直接查账、建档、起草凭证 —— 校验规则与界面录入完全一致。
+          <br />
+          两种方式：<b>HTTP</b>（本页开启，供本机客户端连接）与
+          <b>stdio</b>（客户端拉起
+          <code class="font-mono">miniaccount mcp --db 账套.db</code> 子进程）。
+          stdio 子进程做的改动本界面感知不到，请手动刷新页面。
+        </CardDescription>
+      </CardHeader>
+      <CardContent class="flex flex-col gap-4">
+        <div class="flex items-end gap-3">
+          <div class="w-32">
+            <Label>端口</Label>
+            <Input v-model.number="mcpPort" type="number" min="1" max="65535"
+                   class="mt-1.5" :disabled="mcp?.running" />
+          </div>
+          <div class="w-48">
+            <Label>MCP 操作人</Label>
+            <Input v-model="mcpOperator" class="mt-1.5" placeholder="写进操作日志的署名" />
+          </div>
+          <Button :disabled="mcpBusy" @click="mcpToggle">
+            {{ mcpBusy ? '处理中…' : (mcp?.running ? '停止服务' : '开启服务') }}
+          </Button>
+        </div>
+
+        <template v-if="mcp?.running">
+          <div class="rounded-md border bg-[var(--surface-alt)] p-3 text-sm">
+            <div class="flex justify-between py-1">
+              <span class="text-muted-foreground">接入地址</span>
+              <code class="font-mono text-xs">{{ mcp.url }}</code>
+            </div>
+            <div class="flex items-center justify-between gap-3 py-1">
+              <span class="text-muted-foreground">Bearer 凭据</span>
+              <span class="flex items-center gap-2">
+                <code class="font-mono text-xs">
+                  {{ mcpTokenShown ? mcp.token : '••••••••••••••••' }}
+                </code>
+                <Button variant="outline" size="sm" @click="mcpTokenShown = !mcpTokenShown">
+                  {{ mcpTokenShown ? '隐藏' : '显示' }}
+                </Button>
+                <Button variant="outline" size="sm" @click="mcpCopyToken">复制</Button>
+                <Button variant="outline" size="sm" @click="mcpRegen">重新生成</Button>
+              </span>
+            </div>
+            <p class="mt-2 text-xs text-muted-foreground">
+              每个请求需带 <code class="font-mono">Authorization: Bearer &lt;凭据&gt;</code>；
+              凭据存放在 <code class="font-mono">~/.mini-account/mcp.json</code>（0600）。
+              「重新生成」立即吊销旧凭据；切换/关闭账套后旧会话一律失效需重新初始化。
+            </p>
+          </div>
+        </template>
       </CardContent>
     </Card>
 

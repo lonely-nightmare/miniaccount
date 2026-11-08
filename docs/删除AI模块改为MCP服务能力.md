@@ -508,3 +508,71 @@ GUI 设置页 MCP 卡、端到端 Wails 构建验证。
    以及 Restore「stat 时不存在、取锁时已存在」的同类竞态——两个
    不同锁身份无法互斥。需要把「路径锁持有期间就完成文件落位+换锁
    为原子协议」才能根除，列入批 3 讨论项。
+
+### 批 3 实施记录（HTTP 传输 + GUI 卡 + 锁闸门补齐）
+
+**锁闸门（批 2 遗留协议竞态，先修）**：`filelock.acquire` 现在对所有
+调用方（Open 共享 / Restore 独占）统一先取**路径锁 `p-`**，再在
+其保护下解析文件身份、取身份锁 `i-`，最后才放 `p-` —— 「建文件→
+拿身份锁」全程在共享闸门内完成，另一进程想用身份锁抢跑必须先过
+同一个 `p-` 文件，窗口关闭。锁顺序固定 `p → i`。确定性回归：
+`TestGateBlocksAcrossIdentities`（不同身份不能绕过共享闸门）、
+`TestSharedGateStillBlocksExclusive`（共享闸门挡住独占恢复）。
+
+**架构调整**：`mcpserver.Server` 的 `svc *service.Service` 字段换成
+`bookSource` 接口（`call(ctx, fn)`）；stdio 用 `directSource` 直通，
+HTTP 用 `providerSource` → `mcpserver.BookProvider`（desktop.App
+实现：`Call` = `App.mu.RLock` 覆盖一次业务调用，`BookID` = 当前
+账套路径，`Generation` = `bookGen` 原子计数）。所有 20 个工具与
+3 个资源改经 `s.run`/`s.src.call` 统一入口，写工具成功后触发
+`OnChange` 回调。
+
+**世代推进点**：`desktop.App` 新增 `bookGen atomic.Int64`，所有
+`a.svc` 交换点改走 `setBookLocked`（OpenBook / CloseBook /
+shutdown / RestoreBackup 三处换账点）—— 每次换账世代加一。
+
+**HTTP 层（internal/mcpserver/http.go）**：
+- 四层拦截顺序 Host → Origin → Bearer → 会话世代，全部在 SDK
+  streamable handler 之前的中间件完成。
+- Host：由监听地址推导精确白名单 `{127.0.0.1:<port>,
+  localhost:<port>}`，其余 403。
+- Origin：无头放行（非浏览器客户端）；有头解析 hostname 只放行
+  `localhost`/`127.0.0.1`。
+- Token：`Authorization: Bearer <tok>` 常数时间比对；凭据存
+  `~/.mini-account/mcp.json`（ConfigStore：临时文件 + rename +
+  0600），`SetToken` 原子格即时换值 —— 重新生成不重启服务。
+- 会话世代：`sessionTable` 记录 `MCP-Session-Id → {bookID,
+  generation}`；initialize 响应头里的会话 ID 在 ServeHTTP 返回后
+  从响应头读出钉入（SSE 路径可能绕过 WriteHeader，故不包装
+  writer）。带会话 ID 的请求先 `check`：世代/账套不符或未知 →
+  移出注册表 + HTTP 404。SDK 内部孤儿会话由
+  `SessionTimeout: 30min` 清扫。
+- **SSE 说明**：本服务不主动向流推事件，过期 GET 流为空转；
+  下一次带旧会话 ID 的请求在世代层 404 后客户端按规范重建。
+
+**desktop 绑定**：`MCPStatus` / `MCPStart`（幂等：先停再开；
+无凭据则签发）/ `MCPStop`（关闭即吊销：mcp.json 的 token 清空，
+下次开启重签）/ `MCPRegenerateToken`（新值立即生效于运行中的
+服务）。`OnChange` → `wails EventsEmit("mcp:changed",
+{entity,id})`。
+
+**前端**：Settings 新增「MCP 服务」卡（开关、端口、操作人、
+凭据显示/复制/重新生成、接入说明）；api.js 加 4 个绑定 +
+`onMcpChanged` 订阅（`window.runtime.EventsOn`）；Vouchers 页
+订阅 `mcp:changed`：编辑器/弹窗未开自动重查，编辑中只弹
+「数据已被外部修改」不覆盖表单；wailsjs 手工按生成格式补齐
+（wails CLI 不在 PATH）。
+
+**stdio 对齐 §2.12**：`--readonly` 现在 `service.Open{ReadOnly:
+true}`（mode=ro 不跑迁移）且**只注册读工具**（写工具不在工具
+表里，调用即协议层 tool-not-found）；`TestReadonlyMode` 改判
+工具缺席。
+
+**测试**：`http_test.go` 覆盖 Host/Origin/Token 四层、会话世代
+失效 404、重生成即时生效、mcp.json 0600 与坏文件报错；
+`TestHTTPSessionGeneration` 走真实 initialize → 会话 → 世代
+递增 → 404 的完整链路。
+
+**已知边界**：SDK 会话表是内部的，世代失效无法主动 kill 已建
+SSE 流（上面 SSE 说明即后果）；`yuanize` 键名白名单仍待显式
+DTO 化。

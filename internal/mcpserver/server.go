@@ -35,21 +35,44 @@ type Options struct {
 	Version string
 }
 
+// bookSource 抽象「这次调用落在哪本账上」：
+// stdio 进程直挂一个固定 service；HTTP 经 BookProvider 在每次
+// 调用上持读锁 + 复核账套世代（§2.3）。
+type bookSource interface {
+	call(ctx context.Context, fn func(ctx context.Context, svc *service.Service) (any, error)) (any, error)
+}
+
+// directSource 是 stdio 用的直通实现。
+type directSource struct{ svc *service.Service }
+
+func (d directSource) call(ctx context.Context,
+	fn func(ctx context.Context, svc *service.Service) (any, error)) (any, error) {
+	return fn(ctx, d.svc)
+}
+
 // Server 是一个绑定了账套的 MCP 服务。
 type Server struct {
-	svc      *service.Service
+	src      bookSource
 	readonly bool
 	operator string
 	core     *mcp.Server
+	// OnChange 在写工具成功后回调（HTTP 同进程用来发
+	// mcp:changed 通知前端刷新；stdio 为 nil）。
+	OnChange func(entity string, id int64)
 }
 
 // New 构造服务并注册全部工具与资源。
 func New(svc *service.Service, opts Options) *Server {
+	return NewWithSource(directSource{svc: svc}, opts)
+}
+
+// NewWithSource 以自定义 bookSource 构造（HTTP BookProvider 用）。
+func NewWithSource(src bookSource, opts Options) *Server {
 	version := opts.Version
 	if version == "" {
 		version = "dev"
 	}
-	s := &Server{svc: svc, readonly: opts.ReadOnly, operator: opts.Operator}
+	s := &Server{src: src, readonly: opts.ReadOnly, operator: opts.Operator}
 	s.core = mcp.NewServer(&mcp.Implementation{
 		Name:    "miniaccount",
 		Version: version,
@@ -57,6 +80,25 @@ func New(svc *service.Service, opts Options) *Server {
 	s.registerTools()
 	s.registerResources()
 	return s
+}
+
+// run 执行一次业务调用：经 bookSource 持锁 → 业务错误统一
+// 走 toolError 映射，成功输出直通 StructuredContent。
+func (s *Server) run(ctx context.Context,
+	fn func(ctx context.Context, svc *service.Service) (any, error)) (*mcp.CallToolResult, any, error) {
+	out, err := s.src.call(ctx, fn)
+	if err != nil {
+		return toolError(err)
+	}
+	return nil, out, nil
+}
+
+// changed 在写工具成功后通知前端（HTTP 同进程 → mcp:changed；
+// stdio 跨进程通知不到，OnChange 为 nil 时静默跳过）。
+func (s *Server) changed(entity string, id int64) {
+	if s.OnChange != nil {
+		s.OnChange(entity, id)
+	}
 }
 
 // Run 在给定 Transport 上服务，直到对端断开或 ctx 结束。
@@ -115,16 +157,6 @@ func toolError(err error) (*mcp.CallToolResult, any, error) {
 		IsError: true,
 		Content: []mcp.Content{
 			&mcp.TextContent{Text: code + ": " + err.Error()},
-		},
-	}, nil, nil
-}
-
-// readonlyErr 是 --readonly 模式下写工具的回答。
-func readonlyErr() (*mcp.CallToolResult, any, error) {
-	return &mcp.CallToolResult{
-		IsError: true,
-		Content: []mcp.Content{
-			&mcp.TextContent{Text: "readonly: 服务以只读模式启动，写操作不可用"},
 		},
 	}, nil, nil
 }

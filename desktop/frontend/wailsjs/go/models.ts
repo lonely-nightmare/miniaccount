@@ -1237,6 +1237,40 @@ export namespace main {
 		}
 	}
 	
+	export class MCPServiceStatus {
+	    running: boolean;
+	    port: number;
+	    operator: string;
+	    token: string;
+	    url: string;
+
+	    static createFrom(source: any = {}) {
+	        return new MCPServiceStatus(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.running = source["running"];
+	        this.port = source["port"];
+	        this.operator = source["operator"];
+	        this.token = source["token"];
+	        this.url = source["url"];
+	    }
+	}
+	export class MCPStartRequest {
+	    port: number;
+	    operator: string;
+
+	    static createFrom(source: any = {}) {
+	        return new MCPStartRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.port = source["port"];
+	        this.operator = source["operator"];
+	    }
+	}
 	export class MaterialityRequest {
 	    year: number;
 	    month: number;

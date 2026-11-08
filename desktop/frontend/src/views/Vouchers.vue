@@ -1,11 +1,11 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Plus, Search, RefreshCw, Trash2, Undo2, FileText,
   Sparkles, Landmark, Paperclip, Pencil,
 } from 'lucide-vue-next'
-import { api, notify, DRAFT_HINT } from '@/lib/api'
+import { api, notify, onMcpChanged, DRAFT_HINT } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
 import { fmtMoney } from '@/lib/format'
 import Card from '@/components/ui/Card.vue'
@@ -80,6 +80,18 @@ onMounted(async () => {
   await loadPeriods()
   await Promise.all([load(), loadBookkeeper()])
 })
+
+// MCP 外部改动：编辑器/弹窗未开时自动重查；
+// 编辑中不覆盖在录表单，只提示用户数据已被外部修改（§2.11）。
+const offMcpChanged = onMcpChanged((payload) => {
+  if (payload?.entity !== 'voucher') return
+  if (editorOpen.value || detailOpen.value || reverseOpen.value) {
+    notify('数据已被外部修改 —— 当前编辑中的表单不受影响，保存前请留意乐观锁提示', 'warn')
+    return
+  }
+  load()
+})
+onUnmounted(offMcpChanged)
 watch(() => [filter.value.period, filter.value.status], () => {
   router.replace({ query: { period: filter.value.period } })
   load()

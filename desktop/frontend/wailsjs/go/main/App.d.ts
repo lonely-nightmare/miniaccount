@@ -167,6 +167,14 @@ export function LedgerDetail(arg1:main.LedgerRequest):Promise<main.LedgerResult>
 
 export function ListBooks():Promise<main.BookList>;
 
+export function MCPRegenerateToken():Promise<main.MCPServiceStatus>;
+
+export function MCPStart(arg1:main.MCPStartRequest):Promise<main.MCPServiceStatus>;
+
+export function MCPStatus():Promise<main.MCPServiceStatus>;
+
+export function MCPStop():Promise<void>;
+
 export function MatchBankFlows():Promise<service.BankMatchResult>;
 
 export function OpenAttachment(arg1:string):Promise<void>;

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"miniaccount/internal/service"
 )
 
 // registerResources 注册三个只读资源；内容是工具返回的 JSON 快照，
@@ -34,19 +36,29 @@ func (s *Server) registerResources() {
 
 	read("book://info", "账套信息",
 		"账套名称、公司、纳税人身份与会计期间一览",
-		func(ctx context.Context) (any, error) { return s.svc.Book(ctx) })
+		func(ctx context.Context) (any, error) {
+			return s.src.call(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+				return svc.Book(ctx)
+			})
+		})
 
 	read("book://accounts", "科目表",
 		"全部会计科目：编码、名称、类别与辅助核算要求",
-		func(ctx context.Context) (any, error) { return s.svc.Accounts(ctx) })
+		func(ctx context.Context) (any, error) {
+			return s.src.call(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+				return svc.Accounts(ctx)
+			})
+		})
 
 	read("book://periods", "会计期间",
 		"各会计期间的起止与状态（未启用/启用/已结账）",
 		func(ctx context.Context) (any, error) {
-			b, err := s.svc.Book(ctx)
-			if err != nil {
-				return nil, err
-			}
-			return b.Periods, nil
+			return s.src.call(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+				b, err := svc.Book(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return b.Periods, nil
+			})
 		})
 }

@@ -326,6 +326,22 @@ export function ListBooks() {
   return window['go']['main']['App']['ListBooks']();
 }
 
+export function MCPRegenerateToken() {
+  return window['go']['main']['App']['MCPRegenerateToken']();
+}
+
+export function MCPStart(arg1) {
+  return window['go']['main']['App']['MCPStart'](arg1);
+}
+
+export function MCPStatus() {
+  return window['go']['main']['App']['MCPStatus']();
+}
+
+export function MCPStop() {
+  return window['go']['main']['App']['MCPStop']();
+}
+
 export function MatchBankFlows() {
   return window['go']['main']['App']['MatchBankFlows']();
 }

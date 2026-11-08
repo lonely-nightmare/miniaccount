@@ -139,7 +139,24 @@ func LockFile(path string, exclusive bool) (*Lock, error) {
 // acquire 按「stat 身份 → 取锁 → 复核身份」时序取锁。
 // 取锁间隙里账套文件被换掉（恢复完成）时，手里的锁锁的是
 // 旧身份——释放并按新身份重取，有界重试防乒乓。
+// acquire 是 Open/Restore 的统一入口。
+//
+// ★ 路径锁是「闸门」：双方必经同一把 p-锁，再在它的保护下
+// 解析身份、取身份锁、放闸门。这堵死了「路径锁→身份锁」的
+// 换锁窗口——没有闸门时，建账方持 p-锁占位、另一个进程用
+// 身份锁直接进来，两把不同的锁文件互斥不到一起。
+// 顺序固定 p→i，绝不反向，不会死锁。
 func acquire(path string, exclusive bool) (*Lock, error) {
+	pid, err := PathIdentity(path)
+	if err != nil {
+		return nil, err
+	}
+	gate, err := AcquireIdentity(pid, exclusive)
+	if err != nil {
+		return nil, err
+	}
+	defer gate.Release()
+
 	for i := 0; i < maxRetries; i++ {
 		id, err := IdentityOf(path)
 		if err != nil {

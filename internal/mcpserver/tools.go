@@ -83,169 +83,199 @@ func (s *Server) registerTools() {
 		Name:        "book_info",
 		Description: "账套信息：名称、公司、纳税人身份、会计期间列表",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ bookInfoIn) (*mcp.CallToolResult, any, error) {
-		b, err := s.svc.Book(ctx)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, mustJSON(b), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			b, err := svc.Book(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return mustJSON(b), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_accounts",
 		Description: "科目表：编码、名称、类别、辅助核算要求",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ listAccountsIn) (*mcp.CallToolResult, any, error) {
-		v, err := s.svc.Accounts(ctx)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, mustJSON(v), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			v, err := svc.Accounts(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return mustJSON(v), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_periods",
 		Description: "会计期间列表及各期间状态（未启用/启用/已结账）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listPeriodsIn) (*mcp.CallToolResult, any, error) {
-		b, err := s.svc.Book(ctx)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, pageOf(b.Periods, in.pageIn), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			b, err := svc.Book(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return pageOf(b.Periods, in.pageIn), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "query_vouchers",
 		Description: "分页查凭证（不含分录）；可按期间/状态/关键字/科目前缀过滤",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in queryVouchersIn) (*mcp.CallToolResult, any, error) {
-		p, err := s.svc.VouchersPage(ctx, service.VoucherQuery{
-			Year: in.Year, Month: in.Month, Status: in.Status,
-			Keyword: in.Keyword, AccountPrefix: in.AccountPrefix,
-			Limit: in.Limit, Offset: in.Offset,
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			p, err := svc.VouchersPage(ctx, service.VoucherQuery{
+				Year: in.Year, Month: in.Month, Status: in.Status,
+				Keyword: in.Keyword, AccountPrefix: in.AccountPrefix,
+				Limit: in.Limit, Offset: in.Offset,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return yuanize(p), nil
 		})
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, yuanize(p), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "get_voucher",
 		Description: "一张凭证的完整内容：分录、辅助核算、乐观锁戳 updatedAt",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in getVoucherIn) (*mcp.CallToolResult, any, error) {
-		d, err := s.svc.Voucher(ctx, in.ID)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, mustJSON(voucherOut(d)), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			d, err := svc.Voucher(ctx, in.ID)
+			if err != nil {
+				return nil, err
+			}
+			return mustJSON(voucherOut(d)), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "get_ledger",
 		Description: "某科目的明细账（仅已过账分录），含逐行累计余额",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in getLedgerIn) (*mcp.CallToolResult, any, error) {
-		r, err := s.svc.LedgerDetail(ctx, service.LedgerDetailQuery{
-			AccountPrefix: in.AccountPrefix, From: in.From, To: in.To, Limit: in.Limit,
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			r, err := svc.LedgerDetail(ctx, service.LedgerDetailQuery{
+				AccountPrefix: in.AccountPrefix, From: in.From, To: in.To, Limit: in.Limit,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return yuanize(r), nil
 		})
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, yuanize(r), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "trial_balance",
 		Description: "某期间的试算平衡表（仅已过账分录）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in periodIn) (*mcp.CallToolResult, any, error) {
-		r, err := s.svc.TrialBalance(ctx, in.Year, in.Month)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, yuanize(r), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			r, err := svc.TrialBalance(ctx, in.Year, in.Month)
+			if err != nil {
+				return nil, err
+			}
+			return yuanize(r), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "balance_sheet",
 		Description: "截至某日的资产负债表，附勾稽检查问题清单",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in balanceSheetIn) (*mcp.CallToolResult, any, error) {
-		closing, opening, issues, err := s.svc.BalanceSheet(ctx, in.AsOf)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, yuanize(map[string]any{
-			"closing": closing, "opening": opening, "issues": issues,
-		}), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			closing, opening, issues, err := svc.BalanceSheet(ctx, in.AsOf)
+			if err != nil {
+				return nil, err
+			}
+			return yuanize(map[string]any{
+				"closing": closing, "opening": opening, "issues": issues,
+			}), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "income_statement",
 		Description: "某期间的利润表（本期+本年累计），附勾稽问题清单",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in periodIn) (*mcp.CallToolResult, any, error) {
-		cur, ytd, issues, err := s.svc.IncomeStatement(ctx, in.Year, in.Month)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, yuanize(map[string]any{
-			"current": cur, "ytd": ytd, "issues": issues,
-		}), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			cur, ytd, issues, err := svc.IncomeStatement(ctx, in.Year, in.Month)
+			if err != nil {
+				return nil, err
+			}
+			return yuanize(map[string]any{
+				"current": cur, "ytd": ytd, "issues": issues,
+			}), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_contacts",
 		Description: "往来单位档案（客户/供应商/股东等）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listContactsIn) (*mcp.CallToolResult, any, error) {
-		v, err := s.svc.Contacts(ctx, in.Kind)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, pageOf(v, in.pageIn), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			v, err := svc.Contacts(ctx, in.Kind)
+			if err != nil {
+				return nil, err
+			}
+			return pageOf(v, in.pageIn), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_departments",
 		Description: "部门列表",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listDepartmentsIn) (*mcp.CallToolResult, any, error) {
-		v, err := s.svc.Departments(ctx)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, pageOf(v, in.pageIn), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			v, err := svc.Departments(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return pageOf(v, in.pageIn), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_employees",
 		Description: "员工列表（含工资科目、社保方案等薪酬口径字段）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listEmployeesIn) (*mcp.CallToolResult, any, error) {
-		v, err := s.svc.Employees(ctx, in.OnlyEnabled)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, pageOf(yuanize(v), in.pageIn), nil
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			v, err := svc.Employees(ctx, in.OnlyEnabled)
+			if err != nil {
+				return nil, err
+			}
+			return pageOf(yuanize(v), in.pageIn), nil
+		})
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_invoices",
 		Description: "发票列表（进项/销项，按日期区间与状态过滤）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listInvoicesIn) (*mcp.CallToolResult, any, error) {
-		v, err := s.svc.Invoices(ctx, service.InvoiceQuery{
-			Direction: in.Direction, Status: in.Status, From: in.From, To: in.To,
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			v, err := svc.Invoices(ctx, service.InvoiceQuery{
+				Direction: in.Direction, Status: in.Status, From: in.From, To: in.To,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return pageOf(yuanize(v), in.pageIn), nil
 		})
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, pageOf(yuanize(v), in.pageIn), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_bank_flows",
 		Description: "银行流水列表（导入的逐笔流水及匹配状态）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listBankFlowsIn) (*mcp.CallToolResult, any, error) {
-		v, err := s.svc.BankFlows(ctx, service.BankFlowQuery{
-			Status: in.Status, From: in.From, To: in.To,
+		return s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			v, err := svc.BankFlows(ctx, service.BankFlowQuery{
+				Status: in.Status, From: in.From, To: in.To,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return pageOf(yuanize(v), in.pageIn), nil
 		})
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, pageOf(yuanize(v), in.pageIn), nil
 	})
 
-	s.registerWriteTools()
+	if !s.readonly {
+		s.registerWriteTools()
+	}
 }

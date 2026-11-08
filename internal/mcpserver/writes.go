@@ -66,9 +66,6 @@ func (s *Server) registerWriteTools() {
 		Description: "创建凭证**草稿**（不会过账）。走与界面相同的全部校验；" +
 			"带 clientRequestId 时同键重试返回原凭证。过账请让人在界面确认后操作。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in createDraftVoucherIn) (*mcp.CallToolResult, any, error) {
-		if s.readonly {
-			return readonlyErr()
-		}
 		ctx, warn := s.callCtx(ctx)
 		vin, err := buildVoucherInput(in.Lines, in.Date, in.Remark, in.AttachCount)
 		if err != nil {
@@ -76,11 +73,20 @@ func (s *Server) registerWriteTools() {
 		}
 		vin.CreatedBy = s.operator
 		hash := hashCreateRequest(vin)
-		d, outcome, err := s.svc.CreateDraftVoucherIdempotent(ctx, *vin, in.ClientRequestID, hash)
-		if err != nil {
-			return toolError(err)
+		var voucherID int64
+		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			d, outcome, err := svc.CreateDraftVoucherIdempotent(ctx, *vin, in.ClientRequestID, hash)
+			if err != nil {
+				return nil, err
+			}
+			voucherID = d.ID
+			return voucherResult(d, outcome, warn), nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
 		}
-		return nil, voucherResult(d, outcome, warn), nil
+		s.changed("voucher", voucherID)
+		return nil, out, nil
 	})
 
 	// update_draft_voucher —— 仅草稿 + 乐观锁。
@@ -89,58 +95,62 @@ func (s *Server) registerWriteTools() {
 		Description: "修改**草稿**凭证；必须带读取时的 updatedAt。" +
 			"已过账凭证不能改（要改请走红字冲销，MCP 不提供）。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in updateDraftVoucherIn) (*mcp.CallToolResult, any, error) {
-		if s.readonly {
-			return readonlyErr()
-		}
 		ctx, warn := s.callCtx(ctx)
 		if strings.TrimSpace(in.ExpectedUpdatedAt) == "" {
 			return toolError(&service.InvalidInput{
 				Msg: "expectedUpdatedAt 不能为空：先 get_voucher 取 updatedAt 再回传"})
 		}
-		d, err := s.svc.Voucher(ctx, in.ID)
-		if err != nil {
-			return toolError(err)
-		}
-		if d.Status != "draft" {
-			return toolError(&service.InvalidInput{Msg: "只能修改草稿凭证"})
-		}
-		vin := service.VoucherInput{
-			ID: in.ID, Date: d.Date, Remark: d.Remark,
-			AttachCount: d.AttachCount, ExpectedUpdatedAt: in.ExpectedUpdatedAt,
-			CreatedBy: d.CreatedBy,
-		}
-		if in.Date != nil {
-			vin.Date = *in.Date
-		}
-		if in.Remark != nil {
-			vin.Remark = *in.Remark
-		}
-		if in.AttachCount != nil {
-			vin.AttachCount = *in.AttachCount
-		}
-		if in.Lines != nil {
-			lines, err := buildLines(in.Lines, vin.Remark)
+		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			d, err := svc.Voucher(ctx, in.ID)
 			if err != nil {
-				return toolError(err)
+				return nil, err
 			}
-			vin.Lines = lines
-		} else {
-			for _, l := range d.Lines {
-				vin.Lines = append(vin.Lines, service.VoucherLineInput{
-					AccountCode: l.AccountCode, Summary: l.Summary,
-					Debit: l.Debit, Credit: l.Credit,
-					ContactID: l.ContactID, EmployeeID: l.EmployeeID,
-					DeptID: l.DeptID, ProjectID: l.ProjectID,
-				})
+			if d.Status != "draft" {
+				return nil, &service.InvalidInput{Msg: "只能修改草稿凭证"}
 			}
+			vin := service.VoucherInput{
+				ID: in.ID, Date: d.Date, Remark: d.Remark,
+				AttachCount: d.AttachCount, ExpectedUpdatedAt: in.ExpectedUpdatedAt,
+				CreatedBy: d.CreatedBy,
+			}
+			if in.Date != nil {
+				vin.Date = *in.Date
+			}
+			if in.Remark != nil {
+				vin.Remark = *in.Remark
+			}
+			if in.AttachCount != nil {
+				vin.AttachCount = *in.AttachCount
+			}
+			if in.Lines != nil {
+				lines, err := buildLines(in.Lines, vin.Remark)
+				if err != nil {
+					return nil, err
+				}
+				vin.Lines = lines
+			} else {
+				for _, l := range d.Lines {
+					vin.Lines = append(vin.Lines, service.VoucherLineInput{
+						AccountCode: l.AccountCode, Summary: l.Summary,
+						Debit: l.Debit, Credit: l.Credit,
+						ContactID: l.ContactID, EmployeeID: l.EmployeeID,
+						DeptID: l.DeptID, ProjectID: l.ProjectID,
+					})
+				}
+			}
+			// 修改保留原来源 —— MCP 改一张银行流水生成的凭证，
+			// 它的来源仍应是 bank，不是 mcp。service 层按此落库。
+			out, err := svc.SaveVoucher(ctx, vin)
+			if err != nil {
+				return nil, err
+			}
+			return voucherResult(out, nil, warn), nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
 		}
-		// 修改保留原来源 —— MCP 改一张银行流水生成的凭证，
-		// 它的来源仍应是 bank，不是 mcp。service 层按此落库。
-		out, err := s.svc.SaveVoucher(ctx, vin)
-		if err != nil {
-			return toolError(err)
-		}
-		return nil, voucherResult(out, nil, warn), nil
+		s.changed("voucher", in.ID)
+		return nil, out, nil
 	})
 
 	// delete_draft_voucher —— 仅草稿 + 乐观锁。
@@ -149,28 +159,32 @@ func (s *Server) registerWriteTools() {
 		Description: "删除**草稿**凭证；必须带读取时的 updatedAt。" +
 			"已过账凭证不能删。工资单生成的凭证请从工资模块处理。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in deleteDraftVoucherIn) (*mcp.CallToolResult, any, error) {
-		if s.readonly {
-			return readonlyErr()
-		}
 		ctx, warn := s.callCtx(ctx)
 		if strings.TrimSpace(in.ExpectedUpdatedAt) == "" {
 			return toolError(&service.InvalidInput{
 				Msg: "expectedUpdatedAt 不能为空：先 get_voucher 取 updatedAt 再回传"})
 		}
-		d, err := s.svc.Voucher(ctx, in.ID)
-		if err != nil {
-			return toolError(err)
+		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			d, err := svc.Voucher(ctx, in.ID)
+			if err != nil {
+				return nil, err
+			}
+			if d.Status != "draft" {
+				return nil, &service.InvalidInput{Msg: "只能删除草稿凭证"}
+			}
+			if err := svc.DeleteVoucher(ctx, in.ID, in.ExpectedUpdatedAt); err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"deleted": true, "id": in.ID,
+				"auditWarnings": warn.All(),
+			}, nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
 		}
-		if d.Status != "draft" {
-			return toolError(&service.InvalidInput{Msg: "只能删除草稿凭证"})
-		}
-		if err := s.svc.DeleteVoucher(ctx, in.ID, in.ExpectedUpdatedAt); err != nil {
-			return toolError(err)
-		}
-		return nil, map[string]any{
-			"deleted": true, "id": in.ID,
-			"auditWarnings": warn.All(),
-		}, nil
+		s.changed("voucher", in.ID)
+		return nil, out, nil
 	})
 
 	// upsert_contact —— 三态部分更新。
@@ -179,9 +193,6 @@ func (s *Server) registerWriteTools() {
 		Description: "新建或部分更新往来单位。id 缺席=新建；字段缺席=保持原值，" +
 			"字段为 null=清空，字段有值=设置。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
-		if s.readonly {
-			return readonlyErr()
-		}
 		ctx, warn := s.callCtx(ctx)
 		var id int64
 		if v, ok := in["id"]; ok && v != nil {
@@ -206,11 +217,22 @@ func (s *Server) registerWriteTools() {
 		if err := pe.err(); err != nil {
 			return toolError(err)
 		}
-		out, err := s.svc.PatchContact(ctx, id, p)
-		if err != nil {
-			return toolError(err)
+		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			newID, err := svc.PatchContact(ctx, id, p)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"id": newID, "auditWarnings": warn.All()}, nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
 		}
-		return nil, map[string]any{"id": out, "auditWarnings": warn.All()}, nil
+		if m, ok := out.(map[string]any); ok {
+			if vid, ok := m["id"].(int64); ok {
+				s.changed("contact", vid)
+			}
+		}
+		return nil, out, nil
 	})
 
 	// save_department —— 三态部分更新。
@@ -219,9 +241,6 @@ func (s *Server) registerWriteTools() {
 		Description: "新建或部分更新部门。id 缺席=新建；parentId=null 表示顶层部门。" +
 			"三态规则同 upsert_contact。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
-		if s.readonly {
-			return readonlyErr()
-		}
 		ctx, warn := s.callCtx(ctx)
 		var id int64
 		if v, ok := in["id"]; ok && v != nil {
@@ -240,11 +259,22 @@ func (s *Server) registerWriteTools() {
 		if err := pe.err(); err != nil {
 			return toolError(err)
 		}
-		out, err := s.svc.PatchDepartment(ctx, id, p)
-		if err != nil {
-			return toolError(err)
+		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			newID, err := svc.PatchDepartment(ctx, id, p)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"id": newID, "auditWarnings": warn.All()}, nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
 		}
-		return nil, map[string]any{"id": out, "auditWarnings": warn.All()}, nil
+		if m, ok := out.(map[string]any); ok {
+			if did, ok := m["id"].(int64); ok {
+				s.changed("department", did)
+			}
+		}
+		return nil, out, nil
 	})
 
 	// update_employee —— 白名单部分更新。
@@ -254,9 +284,6 @@ func (s *Server) registerWriteTools() {
 			"bankName/bankAccount/expenseAccountCode/companyAccountCode/remark。" +
 			"薪酬基数、部门、离职、启用各有业务动作，不在此工具内。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
-		if s.readonly {
-			return readonlyErr()
-		}
 		ctx, warn := s.callCtx(ctx)
 		v, ok := in["id"]
 		if !ok || v == nil {
@@ -277,10 +304,17 @@ func (s *Server) registerWriteTools() {
 		if err := pe.err(); err != nil {
 			return toolError(err)
 		}
-		if err := s.svc.PatchEmployee(ctx, int64(f), p); err != nil {
-			return toolError(err)
+		res, out, err := s.run(ctx, func(ctx context.Context, svc *service.Service) (any, error) {
+			if err := svc.PatchEmployee(ctx, int64(f), p); err != nil {
+				return nil, err
+			}
+			return map[string]any{"id": int64(f), "auditWarnings": warn.All()}, nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
 		}
-		return nil, map[string]any{"id": int64(f), "auditWarnings": warn.All()}, nil
+		s.changed("employee", int64(f))
+		return nil, out, nil
 	})
 }
 

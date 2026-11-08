@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"miniaccount/internal/backup"
 	"miniaccount/internal/domain/account"
@@ -50,6 +51,12 @@ type App struct {
 	mu   sync.RWMutex
 	svc  *service.Service
 	path string
+
+	// bookGen 是账套世代计数：每次换账套（Open/Close/Restore/
+	// shutdown）加一；MCP HTTP 会话据此判定失效（§2.3）。
+	bookGen atomic.Int64
+	// mcp 是运行中的 MCP HTTP 服务（未开启为 nil）。
+	mcp *mcpRuntime
 }
 
 // NewApp 创建应用。
@@ -78,11 +85,15 @@ func (a *App) startup(ctx context.Context) {
 // 对记账软件来说，用户看到「数据库需要恢复」的提示会直接怀疑数据丢了。
 func (a *App) shutdown(ctx context.Context) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.svc != nil {
 		_ = a.svc.Shutdown()
-		a.svc = nil
+		a.setBookLocked(nil, "")
 	}
+	// 进程结束，MCP HTTP 服务一并收掉 —— 摘指针在锁内，
+	// 关停（等连接排空）必须放锁外做，否则自锁。
+	rt := a.takeMCPLocked()
+	a.mu.Unlock()
+	_ = shutdownMCP(rt)
 }
 
 func (a *App) context() context.Context {
@@ -359,7 +370,7 @@ func (a *App) OpenBook(path string) (out BookStatus, err error) {
 	if a.svc != nil {
 		_ = a.svc.Shutdown() // 先关旧的，避免单文件被两个连接同时持有
 	}
-	a.svc, a.path = svc, abs
+	a.setBookLocked(svc, abs)
 	a.mu.Unlock()
 
 	rememberBookPath(abs)
@@ -377,7 +388,7 @@ func (a *App) CloseBook() (err error) {
 		return nil
 	}
 	shutdownErr := a.svc.Shutdown()
-	a.svc, a.path = nil, ""
+	a.setBookLocked(nil, "")
 	// ★ 必须显式判断：classify(nil) 返回的是 nil 的 *Fault，
 	// 直接 `return classify(err)` 会装箱成一个**非 nil 的 error 接口**，
 	// Wails 就会把「成功关闭」当成失败。详见 wrap 的注释。
@@ -877,7 +888,7 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 	// 直接报「未打开账套」，而不是打到一个半关的连接上。
 	// database/sql 会等已在途的查询走完再真正关连接，安全。
 	if cur != nil {
-		a.svc, a.path = nil, ""
+		a.setBookLocked(nil, "")
 		_ = cur.Shutdown()
 	}
 
@@ -890,7 +901,7 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		// 恢复失败后把原来的账套重新打开，让用户至少还能用
 		if curPath != "" {
 			if svc, e := service.Open(a.context(), service.Options{Path: curPath}); e == nil {
-				a.svc, a.path = svc, curPath
+				a.setBookLocked(svc, curPath)
 			}
 		}
 		a.mu.Unlock()
@@ -903,7 +914,7 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		a.mu.Unlock()
 		return nil, classify(oerr)
 	}
-	a.svc, a.path = svc, dbPath
+	a.setBookLocked(svc, dbPath)
 	a.mu.Unlock()
 	rememberBookPath(dbPath)
 
