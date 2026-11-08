@@ -94,9 +94,11 @@ type InvoiceView struct {
 	Category string `json:"category"`
 	Status   string `json:"status"`
 	// StatusLabel 是中文状态名。
-	StatusLabel string `json:"statusLabel"`
-	ContactID   *int64 `json:"contactId"`
-	Remark      string `json:"remark"`
+	StatusLabel    string `json:"statusLabel"`
+	ContactID      *int64 `json:"contactId"`
+	Remark         string `json:"remark"`
+	ExpenseAccount string `json:"expenseAccount"`
+	DeptID         *int64 `json:"deptId"`
 
 	// VoucherNo 是已生成凭证的凭证号；为空表示尚未生成凭证（草稿也没有号）。
 	VoucherNo string `json:"voucherNo"`
@@ -165,6 +167,7 @@ func toInvoiceView(inv *invoice.Invoice, vnos map[int64]string) InvoiceView {
 		Category: inv.Category,
 		Status:   string(inv.Status), StatusLabel: inv.Status.Label(),
 		ContactID: inv.ContactID, Remark: inv.Remark,
+		ExpenseAccount: inv.ExpenseAccount, DeptID: inv.DeptID,
 		AttachmentCount: len(inv.AttachmentHashes),
 	}
 	if inv.VoucherID != nil {

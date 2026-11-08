@@ -2000,3 +2000,116 @@ function nextMonthDay(p, day) {
   const y = p.month === 12 ? p.year + 1 : p.year
   return `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}`
 }
+
+function changeSelect(el, value) {
+  el.value = String(value)
+  el.dispatchEvent(new win.Event('change', { bubbles: true }))
+}
+
+test('回归：旧进项发票可补选部门，新发票回显各自的过账参数', async () => {
+  const app = win.go.main.App
+  const period = (await app.Periods()).periods.find((p) => p.status === 'open')
+  const supplier = (await app.ContactList()).find((c) => c.kind === 'supplier')
+  const department = (await app.Departments()).find((d) => d.enabled)
+  const invoice = {
+    direction: 'input', kind: 'general', invoiceDate: period.from,
+    contactId: supplier.id, sellerName: supplier.name, amountExTax: '100',
+  }
+  await app.SaveInvoice({ ...invoice, number: 'GUI-OLD-INVOICE' })
+  await app.SaveInvoice({
+    ...invoice, number: 'GUI-NEW-INVOICE', expenseAccount: '560206', deptId: department.id,
+  })
+  await page.goto('/invoices')
+  await page.type(page.input('input[placeholder="记账人"]'), '回归测试员')
+
+  async function openPosting(number) {
+    const row = [...win.document.querySelectorAll('tr')].find((tr) => tr.textContent.includes(number))
+    assert.ok(row, `找不到发票 ${number}`)
+    row.querySelector('button').click()
+    await settle(20)
+    return page.input('select[aria-label="费用归属部门"]')
+  }
+  const stored = await openPosting('GUI-NEW-INVOICE')
+  assert.equal(stored.value, String(department.id))
+  assert.equal(page.input('input[placeholder="留空 = 沿用档案或默认科目"]').value, '560206')
+  await page.clickExact('取消')
+
+  const legacy = await openPosting('GUI-OLD-INVOICE')
+  assert.equal(legacy.selectedIndex, 0)
+  await page.clickExact('确认生成凭证')
+  assert.match(win.document.body.textContent, /要求「部门」/)
+  changeSelect(legacy, department.id)
+  await page.clickExact('确认生成凭证')
+  const rows = await app.Invoices({ direction: 'input', from: period.from, to: period.to })
+  assert.equal(rows.find((r) => r.number === 'GUI-OLD-INVOICE').posted, true)
+  assert.equal(rows.find((r) => r.number === 'GUI-NEW-INVOICE').posted, false)
+})
+
+test('回归：社保基数保持输入文本并按分保存', async () => {
+  await page.goto('/payroll')
+  await page.clickExact('社保方案')
+  await page.click('新增方案')
+  await page.type(page.input('input[placeholder="如：杭州标准"]'), 'GUI-社保基数')
+  const base = page.input('input[placeholder="如：4000.00"]')
+  for (const digit of '4500.25') {
+    await page.type(base, base.value + digit)
+  }
+  assert.equal(base.value, '4500.25')
+  await page.type(base, '4500.251')
+  await page.clickExact('保存')
+  assert.match(win.document.body.textContent, /社保基数下限不是有效金额/)
+  await page.type(base, '4500.25')
+  await page.clickExact('保存')
+  const schemes = await win.go.main.App.InsuranceSchemes()
+  const saved = schemes.find(({ scheme }) => scheme.name === 'GUI-社保基数').scheme
+  assert.equal(saved.baseMin, 450025)
+  assert.equal(saved.baseMax, 0)
+})
+
+test('回归：凭证可选股东、其他往来和双重身份，各维度显示自己的名称', async () => {
+  const app = win.go.main.App
+  const meta = app.VoucherMetaInfo
+  const contacts = [
+    { id: 90001, name: '回归双重身份', kind: 'both' },
+    { id: 90002, name: '回归股东', kind: 'shareholder' },
+    { id: 90003, name: '回归其他往来', kind: 'other' },
+  ]
+  app.VoucherMetaInfo = async () => {
+    const data = await meta()
+    data.accounts.find((a) => a.code === '1122').auxKeys = ['customer', 'dept']
+    return { ...data, contacts }
+  }
+  try {
+    await page.goto('/vouchers')
+    await page.clickExact('录入凭证')
+    async function chooseAccount(code) {
+      const row = page.input('input[placeholder="本行摘要"]').closest('tr')
+      const button = row.cells[2].querySelector('button')
+      button.click()
+      await settle()
+      await page.type(page.input('#acct-search'), code)
+      await page.click(code)
+    }
+    const chip = (label) => page.input(`button[title="选择${label}"]`)
+    async function chooseAux(label, name) {
+      chip(label).click()
+      await settle()
+      await page.click(name)
+    }
+    await chooseAccount('224101')
+    await chooseAux('股东', '回归股东')
+    await chooseAccount('122103')
+    await chooseAux('其他往来', '回归其他往来')
+    await chooseAccount('2202')
+    await chooseAux('供应商', '回归双重身份')
+    await chooseAccount('1122')
+    const department = (await app.Departments()).find((d) => d.enabled)
+    await chooseAux('部门', department.fullName)
+    await chooseAux('客户', '回归双重身份')
+    assert.equal(chip('部门').textContent.trim(), department.fullName)
+    assert.equal(chip('客户').textContent.trim(), '回归双重身份')
+  } finally {
+    app.VoucherMetaInfo = meta
+    await page.goto('/dashboard')
+  }
+})

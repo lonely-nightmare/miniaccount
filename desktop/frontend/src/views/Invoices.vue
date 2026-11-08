@@ -32,6 +32,9 @@ const filter = ref({ from: '', to: '' })
 
 const formOpen = ref(false)
 const form = ref(emptyInvoice())
+const posting = ref(null)
+const postingDepartments = computed(() =>
+  departments.value.filter((d) => d.enabled || d.id === posting.value?.savedDeptId))
 
 function emptyInvoice() {
   return {
@@ -107,17 +110,37 @@ async function save() {
   await load()
 }
 
-async function post(row) {
+function closePost() {
+  if (!busy.value) posting.value = null
+}
+
+function startPost(row) {
+  if (busy.value) return
   if (!operator.value.trim()) { notify('请填写记账人', 'warn'); return }
-  if (!confirm(`为发票 ${row.number || row.code} 生成凭证？\n\n进项票会自动挂「应付账款」，销项票挂「应收账款」。`)) return
+  if (row.direction === 'input') {
+    posting.value = {
+      id: row.id, label: row.number || row.code,
+      expenseAccount: row.expenseAccount ?? '',
+      savedDeptId: row.deptId ?? null,
+      deptId: row.deptId ?? null,
+    }
+    return
+  }
+  if (confirm(`为发票 ${row.number || row.code} 生成凭证？\n\n销项票会自动挂「应收账款」。`)) {
+    post({ id: row.id })
+  }
+}
+
+async function post({ id, expenseAccount = '', deptId = null }) {
+  if (busy.value) return
+  if (!operator.value.trim()) { notify('请填写记账人', 'warn'); return }
   busy.value = true
-  // ★ 费用科目/部门随发票入库（0016 起），过账时后端从档案取 ——
-  // 前端不再传，也就不会再出现「拿 A 发票的表单值贴到 B 发票上」。
   const r = await api.postInvoice({
-    id: row.id, postingBy: operator.value.trim(),
+    id, postingBy: operator.value.trim(), expenseAccount: expenseAccount.trim(), deptId,
   })
   busy.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
+  posting.value = null
   notify(`已生成凭证（${r.data.voucherLabel || r.data.voucherNo}）`, 'success', DRAFT_HINT)
   await load()
 }
@@ -229,7 +252,7 @@ const kindTone = (k) => (k === 'special' ? 'default' : 'muted')
                 </td>
                 <td class="px-3 py-1.5">
                   <div class="flex justify-end gap-1">
-                    <Button v-if="!r.posted" variant="ghost" size="sm" @click="post(r)">
+                    <Button v-if="!r.posted" variant="ghost" size="sm" :disabled="busy" @click="startPost(r)">
                       <FileCheck2 /> 生成凭证
                     </Button>
                   </div>
@@ -240,6 +263,29 @@ const kindTone = (k) => (k === 'special' ? 'default' : 'muted')
         </div>
       </CardContent>
     </Card>
+
+    <Modal v-if="posting" :open="true" :title="`为发票 ${posting.label} 生成凭证`"
+           description="进项票挂应付账款。此处填写的科目和部门用于本次生成的草稿。"
+           width="max-w-lg" @update:open="closePost">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <Label>费用科目</Label>
+          <Input v-model="posting.expenseAccount" class="mt-1.5" placeholder="留空 = 沿用档案或默认科目" />
+        </div>
+        <div>
+          <Label>费用归属部门</Label>
+          <select v-model="posting.deptId" aria-label="费用归属部门"
+                  class="mt-1.5 h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm">
+            <option :value="null">{{ posting.savedDeptId ? '沿用已存部门' : '未指定' }}</option>
+            <option v-for="d in postingDepartments" :key="d.id" :value="d.id">{{ d.fullName }}</option>
+          </select>
+        </div>
+      </div>
+      <template #footer>
+        <Button variant="ghost" :disabled="busy" @click="closePost">取消</Button>
+        <Button :disabled="busy" @click="post(posting)"><FileCheck2 /> 确认生成凭证</Button>
+      </template>
+    </Modal>
 
     <!-- 录入发票 -->
     <Modal

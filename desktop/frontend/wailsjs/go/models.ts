@@ -4887,6 +4887,8 @@ export namespace service {
 	    statusLabel: string;
 	    contactId?: number;
 	    remark: string;
+	    expenseAccount: string;
+	    deptId?: number;
 	    voucherNo: string;
 	    voucherLabel: string;
 	    posted: boolean;
@@ -4920,6 +4922,8 @@ export namespace service {
 	        this.statusLabel = source["statusLabel"];
 	        this.contactId = source["contactId"];
 	        this.remark = source["remark"];
+	        this.expenseAccount = source["expenseAccount"];
+	        this.deptId = source["deptId"];
 	        this.voucherNo = source["voucherNo"];
 	        this.voucherLabel = source["voucherLabel"];
 	        this.posted = source["posted"];
