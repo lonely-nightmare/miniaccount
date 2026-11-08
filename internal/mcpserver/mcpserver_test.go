@@ -52,7 +52,7 @@ func newPairSvc(t *testing.T, readonly bool) (*service.Service, *mcp.ClientSessi
 	return svc, cs
 }
 
-// 契约面：恰好 14 读 + 6 写工具，3 个资源，无 prompts。
+// 契约面：恰好 18 读 + 8 写工具，3 个资源，无 prompts。
 func TestToolSurface(t *testing.T) {
 	ctx := context.Background()
 	cs := newPair(t, false)
@@ -61,12 +61,12 @@ func TestToolSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 20 {
+	if len(tools.Tools) != 26 {
 		names := []string{}
 		for _, tl := range tools.Tools {
 			names = append(names, tl.Name)
 		}
-		t.Fatalf("工具数 = %d，应为 20: %v", len(tools.Tools), names)
+		t.Fatalf("工具数 = %d，应为 26: %v", len(tools.Tools), names)
 	}
 	want := map[string]bool{
 		"book_info": false, "list_accounts": false, "list_periods": false,
@@ -74,9 +74,12 @@ func TestToolSurface(t *testing.T) {
 		"trial_balance": false, "balance_sheet": false, "income_statement": false,
 		"list_contacts": false, "list_departments": false, "list_employees": false,
 		"list_invoices": false, "list_bank_flows": false,
+		"list_attachments": false, "read_attachment": false,
+		"list_orphan_attachments": false, "attachment_coverage": false,
 		"create_draft_voucher": false, "update_draft_voucher": false,
 		"delete_draft_voucher": false, "upsert_contact": false,
 		"save_department": false, "update_employee": false,
+		"upload_attachment": false, "delete_attachment": false,
 	}
 	for _, tl := range tools.Tools {
 		if _, ok := want[tl.Name]; !ok {
@@ -150,6 +153,7 @@ func TestReadonlyMode(t *testing.T) {
 			strings.HasPrefix(tool.Name, "update_") ||
 			strings.HasPrefix(tool.Name, "delete_") ||
 			strings.HasPrefix(tool.Name, "upsert_") ||
+			strings.HasPrefix(tool.Name, "upload_") ||
 			strings.HasPrefix(tool.Name, "save_") {
 			t.Fatalf("只读模式不应注册写工具 %s", tool.Name)
 		}

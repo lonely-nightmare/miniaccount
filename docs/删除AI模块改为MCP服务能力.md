@@ -258,6 +258,10 @@ inode 的句柄继续写，数据写进「幽灵账套」。
 | `list_contacts` | 往来单位 | `s.Contacts` |
 | `list_departments` / `list_employees` | 部门/员工 | `s.Departments`/`s.Employees` |
 | `list_invoices` / `list_bank_flows` | 发票/流水 | `s.Invoices`/`s.BankFlows` |
+| `list_attachments` | 单据附件列表 | `s.ListAttachments`（不含宿主机 path） |
+| `read_attachment` | 读附件内容 | `store.Get`（sha256 校验）→ base64 |
+| `list_orphan_attachments` | 孤儿附件报告 | `s.OrphanAttachments`（只报告） |
+| `attachment_coverage` | 凭证附件覆盖率 | `s.AttachmentCoverage` |
 
 **写（全部进操作日志）**
 
@@ -269,9 +273,12 @@ inode 的句柄继续写，数据写进「幽灵账套」。
 | `upsert_contact` | 建/改往来单位 | 部分更新（2.9） |
 | `save_department` | 建/改部门 | 部分更新（2.9） |
 | `update_employee` | **仅修改**员工档案 | 部分更新 + 字段白名单（2.9） |
+| `upload_attachment` | 挂附件 | `AttachDocument`；base64 内容；内容寻址天然幂等 |
+| `delete_attachment` | 解除附件关联 | 只删关系行，物理文件留孤儿清理 |
 
-**不开放**：过账、结账/反结账、备份/恢复、附件、审计读写、
-密钥配置、任意 SQL、文件系统。
+**不开放**：过账、结账/反结账、备份/恢复、宿主机路径
+（附件只走 base64 内容，不给服务端磁盘路径）、审计日志
+写入接口、密钥配置、任意 SQL、文件系统。
 
 **Resources**：`book://info`/`book://accounts`/`book://periods`
 （同样过凭据与会话检查）。无 Prompts。
@@ -473,7 +480,7 @@ conflict/blocked/not_found/readonly/internal），协议层 error 只留给
 stdout 只跑 JSON-RPC，日志一律 stderr。
 
 **冒烟与测试**：真实 stdio 端到端验证——initialize/tools/list
-（恰 20 工具）/resources（3 个）/create_draft_voucher
+（恰 26 工具）/resources（3 个）/create_draft_voucher
 （source=mcp、audit_state=recorded）/同键重试（idempotent）/
 同键异内容（idempotency_conflict）/错戳删除（conflict）/对戳删除
 （deleted）。Go 测试：`mcpserver_test`（工具面+元字符串契约+只读）、
@@ -855,3 +862,75 @@ URL:  http://127.0.0.1:<端口>/mcp
   磁盘上落了名为 `:memory:` 的文件。修法：`service.Open`
   在规约前先判 `:memory:` ——不规约、不取文件锁、
   `openPath`/`s.path` 原样保留。
+
+## 附件能力（五轮开发）
+
+GUI 早已有完整的附件生命周期（上传/列表/删除/孤儿报告/覆盖
+率统计），MCP 一个都没暴露——外部自动化「建了凭证但挂不上
+发票扫描件，也读不回来」。本节补齐，仍走服务层同一入口。
+
+### 功能目标
+
+- 上传：给 voucher | invoice | expense_claim | expense_item
+  四类单据挂附件（base64 内容，不走宿主机路径——远程 HTTP
+  客户端根本碰不到服务端的文件系统）。
+- 读取：按 hash 取回附件内容（base64）与元数据。
+- 列表：某单据挂了哪些附件（含「原件已丢失」标记）。
+- 辅助：孤儿附件报告、凭证附件覆盖率统计。
+- 删除：解除单据与附件的关联（只删关系行，物理文件留给
+  孤儿清理——内容寻址下同一份文件可能被多单据共享）。
+
+### 技术方案与边界
+
+**接口**（工具名沿用动词_名词惯例）：
+
+| 工具 | 读/写 | 说明 |
+|------|-------|------|
+| `list_attachments` | 读 | ownerType+ownerId → {hash,name,size,mime,missing}[] |
+| `read_attachment` | 读 | hash → {hash,size,mime,dataBase64} |
+| `list_orphan_attachments` | 读 | → {hash,size}[] |
+| `attachment_coverage` | 读 | year?/month? → {posted,withAttach,without} |
+| `upload_attachment` | 写 | ownerType+ownerId+fileName+dataBase64 → {hash,name,size,mime} |
+| `delete_attachment` | 写 | ownerType+ownerId+hash → 解除关联 |
+
+**路径绝不外泄**：`AttachmentInfo.Path` 是宿主机绝对路径——
+对远程客户端没用、对信息泄漏有用。MCP 输出层按字段重建，
+不带 path。GUI 的 OpenAttachment/AttachmentPath（系统程序
+打开）属于「本机交互」，MCP 不提供——外部客户端要的是
+内容本身，不是替服务端开窗口。
+
+**owner 校验**：ownerType 白名单枚举（与表 CHECK 一致）；
+upload 前按类型查对应表确认 owner 真的存在——往不存在的
+id 上挂附件会留下「文件在、归属悬空」的孤儿。`AttachToVoucher`
+泛化为 `AttachDocument(ownerType,…)`， voucher 路径委托之。
+
+**幂等**：附件内容寻址（sha256），同文件重复上传 =
+UNIQUE(owner,hash) + INSERT OR IGNORE → 天然幂等，不需要
+clientRequestId。不同文件得到不同 hash，是两条合法附件。
+
+**大小上限**：附件仓库 20MB/文件（已有约束）。MCP 层对
+dataBase64 先做长度预检（base64 膨胀约 4/3，超 ~28MB 直接
+invalid_params），避免解码出几百 MB 的内存申请。
+
+**审计**：上传沿用 `attachment.upload`；`DeleteAttachment`
+补上 `attachment.delete`（枚举早已存在，此前没人写——
+删除与上传同样是凭证内容变更，缺了日志不对称）。ctx 里
+的 MCP caller 经 recordAudit 自动落到 Source/Operator。
+
+**视图审计**：读附件内容暂不记查看日志——GUI 用系统程序
+打开附件同样不记，口径一致；若以后要求「外发留痕」再加
+专门动作，不混在这次。
+
+**证据链附件**：`audit_evidence` 的挂依据（AddEvidence
+的 Hash/Data 分支）是另一条链路，本期不做——它需要连同
+证据链管理（结论、引用种类）一起设计，不在附件范围内。
+
+### 涉及模块
+
+- `internal/mcpserver/tools.go`：四个读工具。
+- `internal/mcpserver/writes.go`：upload/delete 两个写工具
+  + base64 解码（兼容 data: URL 前缀，同 GUI）。
+- `internal/service/voucher.go`：`AttachDocument` 泛化 +
+  `AttachToVoucher` 委托 + `DeleteAttachment` 补删除审计。
+- 输出契约：金额键规则不变；hash/size/mime/missing 按原样，
+  path 不外发。

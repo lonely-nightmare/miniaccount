@@ -18,6 +18,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"miniaccount/internal/attachment"
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
@@ -178,8 +179,14 @@ func toolError(err error) (*mcp.CallToolResult, any, error) {
 	code := "internal"
 	var inv *service.InvalidInput
 	switch {
-	case errors.As(err, &inv), errors.Is(err, voucher.ErrBadWord):
+	case errors.As(err, &inv), errors.Is(err, voucher.ErrBadWord),
+		errors.Is(err, attachment.ErrTooLarge),
+		errors.Is(err, attachment.ErrEmpty),
+		errors.Is(err, attachment.ErrBadHash),
+		errors.Is(err, attachment.ErrUnsupported):
 		code = "invalid_params"
+	case errors.Is(err, attachment.ErrNotFound):
+		code = "not_found"
 	case errors.Is(err, service.ErrIdempotencyConflict):
 		code = "idempotency_conflict"
 	case errors.Is(err, service.ErrIdempotentTargetDeleted):

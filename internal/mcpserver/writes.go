@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"miniaccount/internal/attachment"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/service"
 )
@@ -369,11 +371,122 @@ func (s *Server) registerWriteTools() {
 		s.changed("employee", eid)
 		return nil, out, nil
 	})
+
+	// upload_attachment —— 内容寻址 + INSERT OR IGNORE，天然幂等，
+	// 不需要 clientRequestId：同文件重传只会是同一份。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "upload_attachment",
+		Description: "给单据挂一份附件（凭证/发票/报销单/报销明细）。" +
+			"dataBase64 传文件内容，可带 data: 前缀；单文件上限 20MB。" +
+			"重复上传同一文件是幂等的（同 hash 不产生第二条）。",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in uploadAttachmentIn) (*mcp.CallToolResult, any, error) {
+		ctx, warn := s.callCtx(ctx)
+		if err := validateAttachmentOwner(in.OwnerType, in.OwnerID); err != nil {
+			return toolError(err)
+		}
+		name := strings.TrimSpace(in.FileName)
+		if name == "" {
+			return toolError(&service.InvalidInput{Msg: "fileName 不能为空"})
+		}
+		if len(name) > 255 {
+			return toolError(&service.InvalidInput{Msg: "fileName 超过 255 字符"})
+		}
+		data, err := decodeAttachmentData(in.DataBase64)
+		if err != nil {
+			return toolError(err)
+		}
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
+			a, err := svc.AttachDocument(ctx, in.OwnerType, in.OwnerID, name, data)
+			if err != nil {
+				return nil, err
+			}
+			o := attachmentOut(*a)
+			o["auditWarnings"] = warn.All()
+			return o, nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
+		}
+		s.changed(in.OwnerType, in.OwnerID)
+		return nil, out, nil
+	})
+
+	// delete_attachment —— 只解除关联，物理文件留给孤儿清理：
+	// 内容寻址下同一份文件可能同时挂在多张单据上。
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "delete_attachment",
+		Description: "解除单据与某附件的关联（不删磁盘文件——同一份文件可能被多张单据共享）。" +
+			"hash 来自 list_attachments。",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in deleteAttachmentIn) (*mcp.CallToolResult, any, error) {
+		ctx, warn := s.callCtx(ctx)
+		if err := validateAttachmentOwner(in.OwnerType, in.OwnerID); err != nil {
+			return toolError(err)
+		}
+		if err := attachment.ValidateHash(strings.TrimSpace(in.Hash)); err != nil {
+			return toolError(&service.InvalidInput{Msg: "hash 必须是 64 位十六进制 sha256"})
+		}
+		res, out, err := s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
+			if err := svc.DeleteAttachment(ctx, in.OwnerType, in.OwnerID,
+				strings.TrimSpace(in.Hash)); err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"detached": true, "auditWarnings": warn.All(),
+			}, nil
+		})
+		if res != nil || err != nil {
+			return res, out, err
+		}
+		s.changed(in.OwnerType, in.OwnerID)
+		return nil, out, nil
+	})
 }
 
 // ---------------------------------------------------------------------------
 // 装配辅助
 // ---------------------------------------------------------------------------
+
+type uploadAttachmentIn struct {
+	OwnerType string `json:"ownerType" jsonschema:"归属类型：voucher|invoice|expense_claim|expense_item"`
+	OwnerID   int64  `json:"ownerId" jsonschema:"归属单据 id"`
+	FileName  string `json:"fileName" jsonschema:"原始文件名（展示用）"`
+	// DataBase64 是文件内容的 base64；可带 data:*;base64, 前缀（同 GUI）。
+	DataBase64 string `json:"dataBase64" jsonschema:"文件内容的 base64（可带 data: URL 前缀）"`
+}
+
+type deleteAttachmentIn struct {
+	OwnerType string `json:"ownerType" jsonschema:"归属类型：voucher|invoice|expense_claim|expense_item"`
+	OwnerID   int64  `json:"ownerId" jsonschema:"归属单据 id"`
+	Hash      string `json:"hash" jsonschema:"附件 sha256，来自 list_attachments"`
+}
+
+// decodeAttachmentData 解 base64 附件内容：
+//   - 兼容 data:*;base64, 前缀（浏览器 DataURL 与 GUI 同约定）；
+//   - 先按字符数预检再解码 —— base64 膨胀约 4/3，20MB 的仓库上限
+//     对应约 28MB 字符；超了直接拒，不会先解出几百 MB 内存。
+func decodeAttachmentData(b64 string) ([]byte, error) {
+	raw := strings.TrimSpace(b64)
+	if i := strings.Index(raw, "base64,"); i >= 0 {
+		raw = raw[i+len("base64,"):]
+	}
+	if raw == "" {
+		return nil, &service.InvalidInput{Msg: "dataBase64 不能为空"}
+	}
+	// 4 字符 base64 → 3 字节；30<<20 对应解码后约 22.5MB，留余量。
+	if len(raw) > 30<<20 {
+		return nil, &service.InvalidInput{
+			Msg: fmt.Sprintf("附件超过大小上限（base64 约 %d 字符，上限约 %d）",
+				len(raw), 30<<20)}
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, &service.InvalidInput{Msg: "dataBase64 不是合法的 base64"}
+	}
+	if len(data) == 0 {
+		return nil, &service.InvalidInput{Msg: "附件内容为空"}
+	}
+	return data, nil
+}
 
 // buildVoucherInput 把工具输入拼成服务层输入；金额元字符串在这里解析成分。
 func buildVoucherInput(lines []voucherLineIn, date, remark string, attach int) (*service.VoucherInput, error) {

@@ -931,6 +931,33 @@ func describeAux(a ledger.Aux, names map[int64]string, deptNames map[int64]strin
 // （AttachmentAudit 按 EXISTS 统计）。
 func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 	filename string, data []byte) (*AttachmentInfo, error) {
+	return s.AttachDocument(ctx, "voucher", voucherID, filename, data)
+}
+
+// attachmentOwners 是 attachment.owner_type 的合法归属
+// （与表 CHECK 一致）：表名用于「确认归属存在」，label 用于
+// 审计摘要（与既有中文口径一致）。表名全部字面量写死 ——
+// 用户输入只能选键，绝不进 SQL。
+var attachmentOwners = map[string]struct {
+	table, label string
+}{
+	"voucher":       {"voucher", "凭证"},
+	"invoice":       {"invoice", "发票"},
+	"expense_claim": {"expense_claim", "报销单"},
+	"expense_item":  {"expense_item", "报销明细"},
+}
+
+// AttachDocument 把一份附件挂到某类单据上（凭证/发票/报销单/报销明细）。
+// owner 必须先存在 —— 往不存在的 id 上挂会留下「文件在、归属悬空」
+// 的孤儿记录；类型不在白名单内直接拒绝。
+func (s *Service) AttachDocument(ctx context.Context, ownerType string,
+	ownerID int64, filename string, data []byte) (*AttachmentInfo, error) {
+
+	own, ok := attachmentOwners[ownerType]
+	if !ok {
+		return nil, &InvalidInput{
+			Msg: fmt.Sprintf("附件归属类型 %q 非法（只接受 voucher|invoice|expense_claim|expense_item）", ownerType)}
+	}
 
 	store, err := s.Attachments()
 	if err != nil {
@@ -943,16 +970,16 @@ func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 
 	err = s.db.WithTx(ctx, func(tx *sqliteTx) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		// ★ 先校验凭证存在：原来不校验，往一个不存在的 id 上
+		// ★ 先校验归属存在：原来不校验，往一个不存在的 id 上
 		// 挂附件会静默成功 —— 文件写进了 .files/、attachment 表
-		// 有了归属记录，但凭证那行是空的，变成永远挂着的孤儿。
+		// 有了归属记录，但单据那行是空的，变成永远挂着的孤儿。
 		var n int
 		if err := tx.QueryRow(ctx,
-			`SELECT COUNT(*) FROM voucher WHERE id = ?`, voucherID).Scan(&n); err != nil {
+			`SELECT COUNT(*) FROM `+own.table+` WHERE id = ?`, ownerID).Scan(&n); err != nil {
 			return err
 		}
 		if n == 0 {
-			return fmt.Errorf("%w: 凭证 id=%d", sqlite.ErrNotFound, voucherID)
+			return fmt.Errorf("%w: %s id=%d", sqlite.ErrNotFound, ownerType, ownerID)
 		}
 		// 同一单据挂同一份文件不重复：UNIQUE(owner_type, owner_id, sha256)
 		// 兜底，这里用 INSERT OR IGNORE 让重复上传变成幂等操作 ——
@@ -960,8 +987,8 @@ func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 		if _, err := tx.Exec(ctx, `
 			INSERT OR IGNORE INTO attachment
 				(owner_type, owner_id, file_name, sha256, mime, size, kind, created_at)
-			VALUES ('voucher', ?, ?, ?, ?, ?, '', ?)`,
-			voucherID, blob.FileName, blob.SHA256, blob.Mime, blob.Size, now); err != nil {
+			VALUES (?, ?, ?, ?, ?, ?, '', ?)`,
+			ownerType, ownerID, blob.FileName, blob.SHA256, blob.Mime, blob.Size, now); err != nil {
 			return err
 		}
 		return nil
@@ -969,16 +996,16 @@ func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 	if err != nil {
 		return nil, err
 	}
-	// ★ 挂附件是凭证内容的变更，必须留痕：
+	// ★ 挂附件是单据内容的变更，必须留痕：
 	// 审计查「这张凭证的发票是什么时候补上的」就靠这一条。
 	s.recordAudit(ctx, AuditEvent{
 		Action:  audit.ActionAttachmentUpload,
-		Summary: fmt.Sprintf("给凭证 #%d 挂附件 %s", voucherID, blob.FileName),
-		Entity:  "voucher", EntityID: strconv.FormatInt(voucherID, 10),
+		Summary: fmt.Sprintf("给%s #%d 挂附件 %s", own.label, ownerID, blob.FileName),
+		Entity:  ownerType, EntityID: strconv.FormatInt(ownerID, 10),
 		Source: audit.SourceGUI,
 		Detail: map[string]any{
 			"文件名": blob.FileName, "SHA256": blob.SHA256,
-			"大小": blob.Size, "凭证ID": voucherID,
+			"大小": blob.Size, "归属": ownerType, "归属ID": ownerID,
 		},
 	})
 	return &AttachmentInfo{
@@ -1027,15 +1054,48 @@ func (s *Service) ListAttachments(ctx context.Context, ownerType string, ownerID
 // 删实体要扫描全部引用，代价高且容易误删。
 // 真正的清理由「孤儿附件清理」统一做（见 OrphanAttachments）。
 func (s *Service) DeleteAttachment(ctx context.Context, ownerType string, ownerID int64, hash string) error {
-	return s.db.WithTx(ctx, func(tx *sqliteTx) error {
+	var fileName string
+	var deleted int64
+	err := s.db.WithTx(ctx, func(tx *sqliteTx) error {
+		// 文件名先取出来给审计明细用 —— 删掉之后就查不到了。
+		_ = tx.QueryRow(ctx, `
+			SELECT file_name FROM attachment
+			 WHERE owner_type = ? AND owner_id = ? AND sha256 = ?`,
+			ownerType, ownerID, hash).Scan(&fileName)
 		// ★ 同 AttachToVoucher：不回写 voucher.attach_count ——
 		// 那是纸质附单据数，删一个电子附件不该改掉它。
-		_, err := tx.Exec(ctx, `
+		res, err := tx.Exec(ctx, `
 			DELETE FROM attachment
 			 WHERE owner_type = ? AND owner_id = ? AND sha256 = ?`,
 			ownerType, ownerID, hash)
-		return err
+		if err != nil {
+			return err
+		}
+		deleted, _ = res.RowsAffected()
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// 解除关联与上传一样要留痕 —— 「这张凭证的原件是谁摘掉的」
+	// 是审计必答的问题；没删到行（重复删/张冠李戴）不记。
+	if deleted > 0 {
+		label := ownerType
+		if own, ok := attachmentOwners[ownerType]; ok {
+			label = own.label
+		}
+		s.recordAudit(ctx, AuditEvent{
+			Action:  audit.ActionAttachmentDelete,
+			Summary: fmt.Sprintf("摘掉%s #%d 的附件 %s", label, ownerID, fileName),
+			Entity:  ownerType, EntityID: strconv.FormatInt(ownerID, 10),
+			Source: audit.SourceGUI,
+			Detail: map[string]any{
+				"文件名": fileName, "SHA256": hash,
+				"归属": ownerType, "归属ID": ownerID,
+			},
+		})
+	}
+	return nil
 }
 
 // OrphanAttachments 返回磁盘上存在、但没有任何单据引用的附件。

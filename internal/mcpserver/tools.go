@@ -2,11 +2,14 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"miniaccount/internal/attachment"
 	"miniaccount/internal/service"
 )
 
@@ -318,6 +321,90 @@ func (s *Server) registerTools() {
 		})
 	})
 
+	// -------------------------------------------------------------------
+	// 附件（读侧）：列表/内容/孤儿/覆盖率。写侧在 writes.go。
+	// 宿主机路径一律不外发 —— 远程客户端用不了，本机客户端也不该
+	// 拿到「服务端磁盘布局」这种信息。
+	// -------------------------------------------------------------------
+
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "list_attachments",
+		Description: "某单据的附件列表（文件名、大小、MIME、是否原件缺失）；" +
+			"ownerType 为 voucher|invoice|expense_claim|expense_item",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in attachmentIn) (*mcp.CallToolResult, any, error) {
+		if err := validateAttachmentOwner(in.OwnerType, in.OwnerID); err != nil {
+			return toolError(err)
+		}
+		return s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
+			list, err := svc.ListAttachments(ctx, in.OwnerType, in.OwnerID)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]map[string]any, 0, len(list))
+			for _, a := range list {
+				out = append(out, attachmentOut(a))
+			}
+			return map[string]any{"items": out, "total": len(out)}, nil
+		})
+	})
+
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "read_attachment",
+		Description: "按 sha256 读取附件内容（base64）。hash 来自 " +
+			"list_attachments / upload_attachment 返回。单文件上限 20MB。",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in readAttachmentIn) (*mcp.CallToolResult, any, error) {
+		h := strings.TrimSpace(in.Hash)
+		if err := attachment.ValidateHash(h); err != nil {
+			return toolError(&service.InvalidInput{Msg: "hash 必须是 64 位十六进制 sha256"})
+		}
+		return s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
+			store, err := svc.Attachments()
+			if err != nil {
+				return nil, err
+			}
+			data, err := store.Get(h)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"hash":       h,
+				"size":       len(data),
+				"mime":       http.DetectContentType(data),
+				"dataBase64": base64.StdEncoding.EncodeToString(data),
+			}, nil
+		})
+	})
+
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name:        "list_orphan_attachments",
+		Description: "磁盘上存在、但没有任何单据引用的附件（孤儿文件）；只报告不删除",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, any, error) {
+		return s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
+			list, err := svc.OrphanAttachments(ctx)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]map[string]any, 0, len(list))
+			for _, a := range list {
+				out = append(out, attachmentOut(a))
+			}
+			return map[string]any{"items": out, "total": len(out)}, nil
+		})
+	})
+
+	mcp.AddTool(s.core, &mcp.Tool{
+		Name: "attachment_coverage",
+		Description: "已记账凭证的电子附件覆盖率：多少张过账凭证挂了/没挂原件；" +
+			"year+month 同时给按期间统计，都不给统计全部",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in attachmentCoverageIn) (*mcp.CallToolResult, any, error) {
+		if (in.Year > 0) != (in.Month > 0) {
+			return toolError(&service.InvalidInput{Msg: "year 与 month 必须同时给出或同时省略"})
+		}
+		return s.run(ctx, req, func(ctx context.Context, svc *service.Service) (any, error) {
+			return svc.AttachmentCoverage(ctx, in.Year, in.Month)
+		})
+	})
+
 	if !s.readonly {
 		s.registerWriteTools()
 	}
@@ -348,6 +435,53 @@ var invoiceStatuses = map[string]struct{}{
 
 var bankFlowStatuses = map[string]struct{}{
 	"imported": {}, "matched": {}, "posted": {}, "ignored": {},
+}
+
+// attachmentOwnerTypes 与 attachment 表 CHECK 一致的四类归属。
+var attachmentOwnerTypes = map[string]struct{}{
+	"voucher": {}, "invoice": {}, "expense_claim": {}, "expense_item": {},
+}
+
+// attachmentIn 是附件归属参数。
+type attachmentIn struct {
+	OwnerType string `json:"ownerType" jsonschema:"归属类型：voucher|invoice|expense_claim|expense_item"`
+	OwnerID   int64  `json:"ownerId" jsonschema:"归属单据 id"`
+}
+
+type readAttachmentIn struct {
+	Hash string `json:"hash" jsonschema:"附件 sha256（64 位十六进制），来自 list_attachments 或 upload_attachment"`
+}
+
+type attachmentCoverageIn struct {
+	Year  int `json:"year,omitempty" jsonschema:"会计年度，与 month 同给或同省"`
+	Month int `json:"month,omitempty" jsonschema:"会计月份 1-12，与 year 同给或同省"`
+}
+
+// validateAttachmentOwner 校验附件归属：类型必须在白名单内、
+// id 必须是正整数。上传/删除/列表三处共用 —— 归属写错了，
+// 附件就挂到另一张单据上，比报错难查得多。
+func validateAttachmentOwner(ownerType string, ownerID int64) error {
+	if err := enumIn(ownerType, attachmentOwnerTypes, "ownerType"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(ownerType) == "" {
+		return &service.InvalidInput{
+			Msg: "ownerType 必填：voucher|invoice|expense_claim|expense_item"}
+	}
+	if ownerID <= 0 {
+		return &service.InvalidInput{Msg: "ownerId 必须是正整数"}
+	}
+	return nil
+}
+
+// attachmentOut 是附件对外的形状：hash/name/size/mime/missing。
+// ★ 故意不带 Path —— 宿主机绝对路径对远程客户端没用，
+// 还会把服务端磁盘布局泄出去。
+func attachmentOut(a service.AttachmentInfo) map[string]any {
+	return map[string]any{
+		"hash": a.Hash, "name": a.Name, "size": a.Size,
+		"mime": a.MIME, "missing": a.Missing,
+	}
 }
 
 // enumIn 校验可选枚举入参：空值放行（表示不限），
