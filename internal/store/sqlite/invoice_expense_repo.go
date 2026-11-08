@@ -963,7 +963,7 @@ func (r *InvoiceRepo) PostInvoice(ctx context.Context, invoiceID int64,
 		}
 	}
 
-		var res PostInvoiceResult
+	var res PostInvoiceResult
 	err = r.db.WithTx(ctx, func(tx *Tx) error {
 		v, err := voucher.New(voucher.WordJi, inv.InvoiceDate, postingBy)
 		if err != nil {

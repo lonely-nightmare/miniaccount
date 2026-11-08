@@ -453,11 +453,16 @@ func extractRow(row []string, ix *indexer, m Mapping, bankAccountCode string) (*
 		f.Direction, f.Amount = dir, amt
 	}
 
-	// 余额：空单元格是「未知」（parseAmountSigned 对空串报错 →
-	// BalanceKnown 保持 false → 存 NULL）；余额可正可负，
-	// 必须用带符号解析 —— parseAmount 取绝对值会把 -200 读成 +200。
+	// 余额：只有**空单元格**才是「未知」（BalanceKnown 保持 false →
+	// 存 NULL）；余额可正可负，必须用带符号解析 —— parseAmount 取
+	// 绝对值会把 -200 读成 +200。非空但解析失败的单元格必须报错：
+	// 一律按「未知」吞掉，会把对账单上写错的余额静默降级成 NULL。
 	if m.Balance != "" {
-		if v, err := parseAmountSigned(ix.get(row, m.Balance)); err == nil {
+		if cell := ix.get(row, m.Balance); cell != "" {
+			v, err := parseAmountSigned(cell)
+			if err != nil {
+				return nil, err
+			}
 			f.Balance = v
 			f.BalanceKnown = true
 		}
@@ -573,6 +578,11 @@ func parseDate(s string) (calendar.Date, error) {
 //
 // 处理中文银行文件常见的写法：千分位逗号、货币符号、括号负数、
 // 以及金额里夹带的空格。
+//
+// ★ 与 parseAmountSigned 的区别（两份并存是语义不同，不是重复）：
+// 本函数给「交易金额」用 —— 金额恒为正，括号负数也算作正额的
+// 一种书写习惯，所以最后取绝对值；parseAmountSigned 给「余额、
+// 带符号发生额」用，符号本身就是数据，不能丢。
 func parseAmount(s string) (money.Money, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -590,7 +600,11 @@ func parseAmount(s string) (money.Money, error) {
 	return v.Abs(), nil
 }
 
-// parseAmountSigned 解析带符号金额（DirModeSign 用）。
+// parseAmountSigned 解析带符号金额（DirModeSign 用、余额列用）。
+//
+// 与 parseAmount 的区别：本函数保留符号（-200 就是 -200），
+// parseAmount 最后取绝对值 —— 交易金额恒为正、括号负数只是
+// 书写习惯，两处语义不同所以并存两份。
 func parseAmountSigned(s string) (money.Money, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

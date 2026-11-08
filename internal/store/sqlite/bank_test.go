@@ -867,8 +867,8 @@ func TestImportDedupRepairsLegacyBalance(t *testing.T) {
 	// 重新导入同一笔流水，这次带真实余额 150000.00。
 	flow := &bank.Flow{
 		AccountCode: "100201",
-		TxnDate: calendar.MustParse("2025-09-03"),
-		Direction: bank.DirIn, Amount: money100(50000),
+		TxnDate:     calendar.MustParse("2025-09-03"),
+		Direction:   bank.DirIn, Amount: money100(50000),
 		Balance: money100(150000), BalanceKnown: true,
 		CounterpartyName: "张三", Summary: "转账",
 		Status: bank.StatusImported,

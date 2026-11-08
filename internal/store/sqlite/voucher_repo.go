@@ -1270,12 +1270,12 @@ type DraftResult struct {
 // 让已上报的报表失去可追溯的对应关系。
 // DeleteResult 是删除一张草稿的附带信息：解除了哪些单据关联。
 type DeleteResult struct {
-	UnlinkedInvoice     int // 发票 booked→verified/pending
-	UnlinkedClaim       int // 报销单 posted→approved
-	UnlinkedFlow        int // 银行流水 posted→matched
-	UnlinkedDepreciate  int // 固定资产计提行
-	UnlinkedAmortize    int // 摊销行
-	UnlinkedAISuggest   int // AI 建议终稿引用
+	UnlinkedInvoice    int // 发票 booked→verified/pending
+	UnlinkedClaim      int // 报销单 posted→approved
+	UnlinkedFlow       int // 银行流水 posted→matched
+	UnlinkedDepreciate int // 固定资产计提行
+	UnlinkedAmortize   int // 摊销行
+	UnlinkedAISuggest  int // AI 建议终稿引用
 }
 
 // DeleteDraft 删除一张草稿凭证。
@@ -1526,11 +1526,10 @@ func rejectInputVATForSmallBook(ctx context.Context, tx *Tx, v *voucher.Voucher)
 
 // smallScaleAtTx 在事务内判定账套在某日期是否为小规模纳税人。
 //
-// 身份历史（vat_status_history）优先；查不到退账簿当前登记身份；
-// 两边都查不到时**放行**（返回 false,nil）：这是记账防错校验，
-// 不是抵扣权限授予 —— 账套数据不全不该让日常记账全部卡死。
-// （PostInvoice 的进项门更严：身份查不到直接报错，
-// 见 InvoiceRepo.smallScaleAt。）
+// 身份历史（vat_status_history）优先；历史起点之前的日期用首条
+// 记录的身份，历史为空退账簿登记身份（见 vat.StatusOnOr）。
+// 两边都查不到时**报错**而不是放行：默认成一般纳税人会放行
+// 本不该抵扣的进项 —— 与发票侧 smallScaleAt 同一口径。
 func smallScaleAtTx(ctx context.Context, tx *Tx, on calendar.Date) (bool, error) {
 	periods, err := loadVATStatusPeriodsTx(ctx, tx)
 	if err != nil {
@@ -1539,9 +1538,13 @@ func smallScaleAtTx(ctx context.Context, tx *Tx, on calendar.Date) (bool, error)
 	var s string
 	if err := tx.QueryRow(ctx,
 		`SELECT COALESCE(vat_status,'') FROM book WHERE id = 1`).Scan(&s); err != nil {
-		s = ""
+		return false, fmt.Errorf("sqlite: 读账套纳税人身份: %w", translateErr(err))
 	}
-	return vat.StatusOnOr(periods, on, vat.VATStatus(s)) == vat.VATSmallScale, nil
+	st := vat.StatusOnOr(periods, on, vat.VATStatus(s))
+	if st == "" {
+		return false, fmt.Errorf("账套未登记 %s 时的纳税人身份，无法判定进项是否可抵扣", on)
+	}
+	return st == vat.VATSmallScale, nil
 }
 
 // loadVATStatusPeriodsTx 读全部纳税人身份期间。

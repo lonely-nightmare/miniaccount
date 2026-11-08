@@ -485,3 +485,22 @@ func TestCleanFileHasNoSkippedRows(t *testing.T) {
 		t.Errorf("行数 = %d，期望 3", len(tbl.Rows))
 	}
 }
+
+// 复盘发现：余额列非空但写错时，旧实现把解析错误吞掉当成「未知」——
+// 空单元格才是未知，非法值必须报错。
+func TestExtractBalanceInvalidErrors(t *testing.T) {
+	text := `交易日期,摘要,对方户名,发生额,余额
+2025-09-03,收到货款,甲公司,-50000.00,不是数字
+2025-09-04,收到货款,甲公司,-100.00,`
+	res := parseSample(t, text, Mapping{
+		Date: "交易日期", Amount: "发生额", Balance: "余额",
+		CounterpartyName: "对方户名", Summary: "摘要",
+		DirectionMode: DirModeSign,
+	})
+	if len(res.Errors) != 1 {
+		t.Fatalf("非法余额应报 1 条错误，得到 %d: %v", len(res.Errors), res.Errors)
+	}
+	if len(res.Flows) != 1 || res.Flows[0].BalanceKnown {
+		t.Fatalf("空余额应是「未知」而非 0：flows=%+v", res.Flows)
+	}
+}
