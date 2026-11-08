@@ -373,10 +373,11 @@ func TestUploadAttachment(t *testing.T) {
 	if info.Path == "" {
 		t.Error("应返回附件的磁盘路径")
 	}
-	// 附单据数要跟着涨
+	// ★ 电子附件不回写附单据数 —— 那是用户手填的纸质单据张数，
+	// 挂一个 PDF 不该把「附 3 张发票」改成 1。
 	after, _ := a.VoucherDetail(d.ID)
-	if after.AttachCount != 1 {
-		t.Errorf("附单据数 = %d，期望 1", after.AttachCount)
+	if after.AttachCount != 0 {
+		t.Errorf("附单据数应保持用户填写值 0，实际 %d", after.AttachCount)
 	}
 
 	// data: URL 前缀要能识别

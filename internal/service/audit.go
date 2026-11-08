@@ -387,12 +387,13 @@ func (s *Service) QueryAudit(ctx context.Context, q AuditQuery) (*audit.Page, er
 }
 
 // VerifyAudit 校验日志完整性（哈希链）。
+//
+// ★ 日志未启用时必须**报错**，不能返回「通过」：
+// 完整性校验给出假结论，比明确说「没开日志」危险得多 ——
+// 审计人员拿着一条 OK:true 会以为日志完整可信，而实际上什么都没有。
 func (s *Service) VerifyAudit(ctx context.Context) (*audit.VerifyResult, error) {
 	st, err := auditStoreRef(ctx)
 	if err != nil {
-		if err == errNoAuditDir {
-			return &audit.VerifyResult{OK: true}, nil
-		}
 		return nil, err
 	}
 	return st.Verify(ctx)

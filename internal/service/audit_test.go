@@ -316,6 +316,20 @@ func TestVerifyAuditFromService(t *testing.T) {
 	}
 }
 
+// ★ 日志未启用时校验必须报错，不能返回「通过」。
+//
+// 完整性校验给出假结论比明确报错危险得多：审计人员拿着一条
+// OK:true 会以为日志完整可信，而实际上什么都没记。
+func TestVerifyAuditWithoutDirReportsError(t *testing.T) {
+	service.SetAuditDir("")
+	t.Cleanup(func() { service.SetAuditDir("") })
+	svc := &service.Service{}
+	res, err := svc.VerifyAudit(context.Background())
+	if err == nil {
+		t.Fatalf("未启用日志时校验应报错，却返回通过：%+v", res)
+	}
+}
+
 func periodKey(year, month int) period.Key { return period.NewKey(year, month) }
 
 // 金额工具：确认测试里用的分与展示一致（防止把「元」当「分」写进断言）

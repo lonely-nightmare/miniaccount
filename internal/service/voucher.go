@@ -75,9 +75,15 @@ func (s *Service) Vouchers(ctx context.Context, q VoucherQuery) ([]VoucherSummar
 		Summary:  fmt.Sprintf("查看凭证列表 %04d-%02d", q.Year, q.Month),
 		Detail:   map[string]any{"期间": fmt.Sprintf("%04d-%02d", q.Year, q.Month), "状态": q.Status, "关键字": q.Keyword},
 	})
+	// Limit 封顶：界面传什么我们都兜个底 —— 整库凭证一把
+	// 全拉回前端，大账套会把 WebView 卡死。
+	limit := q.Limit
+	if limit > 2000 {
+		limit = 2000
+	}
 	rows, err := s.db.Vouchers().List(ctx, sqlite.ListFilter{
 		Year: q.Year, Month: q.Month, Status: q.Status,
-		Keyword: q.Keyword, Limit: q.Limit,
+		Keyword: q.Keyword, Limit: limit,
 	})
 	if err != nil {
 		return nil, err
@@ -188,6 +194,14 @@ type VoucherLine struct {
 	Credit      money.Money `json:"credit"`
 	// AuxDesc 是辅助核算的中文描述。
 	AuxDesc string `json:"auxDesc"`
+	// 辅助核算的实体 id。★ 编辑器载入草稿要靠它们回填：
+	// 只有 AuxDesc 文本的话，打开编辑器四维全是 null，
+	// 保存回去就把辅助核算静默清空了 —— 而界面上往来单位名
+	// 照常显示，用户根本不知道自己丢了数据。
+	ContactID  *int64 `json:"contactId"`
+	EmployeeID *int64 `json:"employeeId"`
+	DeptID     *int64 `json:"deptId"`
+	ProjectID  *int64 `json:"projectId"`
 }
 
 // Voucher 返回一张凭证的完整内容。
@@ -241,7 +255,9 @@ func (s *Service) Voucher(ctx context.Context, id int64) (*VoucherDetail, error)
 		d.Lines = append(d.Lines, VoucherLine{
 			LineNo: i + 1, AccountCode: e.AccountCode, AccountName: name,
 			Summary: e.Summary, Debit: e.Debit, Credit: e.Credit,
-			AuxDesc: describeAux(e.Aux, names, deptNames),
+			AuxDesc:    describeAux(e.Aux, names, deptNames),
+			ContactID:  e.Aux.ContactID, EmployeeID: e.Aux.EmployeeID,
+			DeptID:     e.Aux.DeptID, ProjectID: e.Aux.ProjectID,
 		})
 	}
 
@@ -311,6 +327,14 @@ type VoucherInput struct {
 	Lines       []VoucherLineInput
 	// CreatedBy 是制单人（签署在凭证上）。
 	CreatedBy string
+
+	// Source / SourceID 是凭证来源（空表示手工录入）。
+	// ★ AI 采纳路径必须传 SourceAI + CreatedByAI：
+	// 落库记成 manual 会让「哪些是 AI 起草的」查不出来，
+	// 而审计恰恰要从 created_by_ai 这条线追溯。
+	Source    voucher.Source
+	SourceID  *int64
+	CreatedByAI bool
 }
 
 // build 把界面输入转成领域对象，并执行完整校验。
@@ -335,6 +359,12 @@ func (s *Service) buildVoucher(ctx context.Context, in VoucherInput) (*voucher.V
 	v.ID = in.ID
 	v.Remark = strings.TrimSpace(in.Remark)
 	v.AttachCount = in.AttachCount
+	v.CreatedByAI = in.CreatedByAI
+	if in.Source != "" {
+		if err := v.SetSource(in.Source, in.SourceID); err != nil {
+			return nil, err
+		}
+	}
 
 	for i, l := range in.Lines {
 		code := strings.TrimSpace(l.AccountCode)
@@ -415,6 +445,16 @@ func (s *Service) CheckVoucher(ctx context.Context, in VoucherInput) (CheckResul
 
 // SaveVoucher 保存一张草稿（新建或更新）。
 func (s *Service) SaveVoucher(ctx context.Context, in VoucherInput) (*VoucherDetail, error) {
+	// ★ 「修改前」快照必须先于 SaveDraft 读取。
+	//
+	// 原来在保存之后才去读原凭证 —— 此时新值已经落库，
+	// 读回来的「修改前」就是「修改后」，修改留痕形同虚设。
+	var before *VoucherDetail
+	if in.ID != 0 {
+		if b, berr := s.Voucher(ctx, in.ID); berr == nil {
+			before = b
+		}
+	}
 	v, err := s.buildVoucher(ctx, in)
 	if err != nil {
 		return nil, err
@@ -441,7 +481,7 @@ func (s *Service) SaveVoucher(ctx context.Context, in VoucherInput) (*VoucherDet
 		action = audit.ActionVoucherUpdate
 		summary = "修改凭证草稿 #" + strconv.FormatInt(in.ID, 10)
 		// 改之前的原样留在日志里 —— 这是「修改前后内容」的前一半
-		if before, berr := s.Voucher(ctx, in.ID); berr == nil {
+		if before != nil {
 			detail["修改前"] = map[string]any{
 				"记账日期": before.Date, "摘要": before.Remark,
 				"借方合计": money.Money(before.TotalDebit).String(),
@@ -647,6 +687,12 @@ type AccountOption struct {
 	Direction string `json:"direction"`
 	// AuxTypes 是需要的辅助核算维度（中文名）。
 	AuxTypes []string `json:"auxTypes"`
+	// AuxKeys 是对应的原始维度 key（customer|supplier|employee|dept|project）。
+	//
+	// ★ 界面选档案要靠它而不是中文名 —— 「应收」科目要的是 customer，
+	// 拿中文「客户」去反推 key 迟早断。原来没发它，于是辅助核算
+	// 弹层只会列往来单位，员工/部门/项目永远选不到。
+	AuxKeys []string `json:"auxKeys"`
 	// SearchText 是给前端做模糊匹配用的预拼接串。
 	//
 	// ★ 在 Go 侧拼好而不是让前端每次输入都遍历 190 个科目拼一遍：
@@ -669,8 +715,10 @@ func (s *Service) AccountOptions(ctx context.Context) ([]AccountOption, error) {
 	var out []AccountOption
 	for _, a := range tree.EnabledLeaves() {
 		aux := make([]string, 0, len(a.AuxTypes))
+		keys := make([]string, 0, len(a.AuxTypes))
 		for _, t := range a.AuxTypes {
 			aux = append(aux, t.Label())
+			keys = append(keys, string(t))
 		}
 		dir := "借"
 		if a.BalanceDir == account.DirCredit {
@@ -679,7 +727,7 @@ func (s *Service) AccountOptions(ctx context.Context) ([]AccountOption, error) {
 		full := a.FullName(byCode)
 		out = append(out, AccountOption{
 			Code: a.Code, Name: a.Name, FullName: full,
-			Direction: dir, AuxTypes: aux,
+			Direction: dir, AuxTypes: aux, AuxKeys: keys,
 			SearchText: strings.ToLower(a.Code + " " + full + " " + a.Name),
 		})
 	}
@@ -794,7 +842,7 @@ func describeAux(a ledger.Aux, names map[int64]string, deptNames map[int64]strin
 // 附件
 // ---------------------------------------------------------------------------
 
-// AttachToVoucher 把附件挂到凭证上，并回填附单据数。
+// AttachToVoucher 把附件挂到凭证上。
 //
 // # 为什么必须写 attachment 表
 //
@@ -805,9 +853,15 @@ func describeAux(a ledger.Aux, names map[int64]string, deptNames map[int64]strin
 //  2. 孤儿附件清理无从判断「这个文件还有没有人引用」，只能全留或全删
 //  3. 备份虽然会带上文件（按目录全量打包），但恢复后依然不知道该挂给谁
 //
-// 因此这里一次事务内做三件事：写 attachment、加 attach_count、
-// 返回附件信息。任何一步失败都整体回滚 —— 不会出现「文件在但没记录」
-// 或「记录在但文件丢了」的半截状态。
+// 因此这里一次事务内做三件事：校验凭证、写 attachment、返回附件信息。
+// 任何一步失败都整体回滚 —— 不会出现「文件在但没记录」或
+// 「记录在但文件丢了」的半截状态。
+//
+// ★ 不回写 voucher.attach_count：那一列是用户手填的「附单据数」
+// （原始纸质单据的张数，要跟实物核对），不是电子附件数。
+// 用电子附件数覆盖它，用户填的「附 3 张发票」会在挂上一个 PDF 后
+// 变成 1 —— 静默丢数据。电子附件数以 attachment 表实计为准
+// （AttachmentAudit 按 EXISTS 统计）。
 func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 	filename string, data []byte) (*AttachmentInfo, error) {
 
@@ -822,6 +876,17 @@ func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 
 	err = s.db.WithTx(ctx, func(tx *sqliteTx) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
+		// ★ 先校验凭证存在：原来不校验，往一个不存在的 id 上
+		// 挂附件会静默成功 —— 文件写进了 .files/、attachment 表
+		// 有了归属记录，但凭证那行是空的，变成永远挂着的孤儿。
+		var n int
+		if err := tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM voucher WHERE id = ?`, voucherID).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: 凭证 id=%d", sqlite.ErrNotFound, voucherID)
+		}
 		// 同一单据挂同一份文件不重复：UNIQUE(owner_type, owner_id, sha256)
 		// 兜底，这里用 INSERT OR IGNORE 让重复上传变成幂等操作 ——
 		// 用户重复拖同一个 PDF 进来是很常见的动作，报错没有意义。
@@ -832,21 +897,23 @@ func (s *Service) AttachToVoucher(ctx context.Context, voucherID int64,
 			voucherID, blob.FileName, blob.SHA256, blob.Mime, blob.Size, now); err != nil {
 			return err
 		}
-		// attach_count 用「实际挂了多少个附件」重算，而不是简单 +1。
-		//
-		// 重复上传同一份文件时 +1 会让「附单据数」比实际多 ——
-		// 而凭证上的这个数字是要跟纸质单据核对的，多一个少一个都是错。
-		_, err := tx.Exec(ctx, `
-			UPDATE voucher
-			   SET attach_count = (SELECT COUNT(*) FROM attachment
-			                        WHERE owner_type = 'voucher' AND owner_id = ?),
-			       updated_at = ?
-			 WHERE id = ?`, voucherID, now, voucherID)
-		return err
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	// ★ 挂附件是凭证内容的变更，必须留痕：
+	// 审计查「这张凭证的发票是什么时候补上的」就靠这一条。
+	s.recordAudit(ctx, AuditEvent{
+		Action:   audit.ActionAttachmentUpload,
+		Summary:  fmt.Sprintf("给凭证 #%d 挂附件 %s", voucherID, blob.FileName),
+		Entity:   "voucher", EntityID: strconv.FormatInt(voucherID, 10),
+		Source:   audit.SourceGUI,
+		Detail: map[string]any{
+			"文件名": blob.FileName, "SHA256": blob.SHA256,
+			"大小": blob.Size, "凭证ID": voucherID,
+		},
+	})
 	return &AttachmentInfo{
 		Hash: blob.SHA256, Name: blob.FileName, Size: blob.Size,
 		MIME: blob.Mime, Path: store.MustPath(blob.SHA256),
@@ -894,23 +961,13 @@ func (s *Service) ListAttachments(ctx context.Context, ownerType string, ownerID
 // 真正的清理由「孤儿附件清理」统一做（见 OrphanAttachments）。
 func (s *Service) DeleteAttachment(ctx context.Context, ownerType string, ownerID int64, hash string) error {
 	return s.db.WithTx(ctx, func(tx *sqliteTx) error {
-		if _, err := tx.Exec(ctx, `
+		// ★ 同 AttachToVoucher：不回写 voucher.attach_count ——
+		// 那是纸质附单据数，删一个电子附件不该改掉它。
+		_, err := tx.Exec(ctx, `
 			DELETE FROM attachment
 			 WHERE owner_type = ? AND owner_id = ? AND sha256 = ?`,
-			ownerType, ownerID, hash); err != nil {
-			return err
-		}
-		if ownerType == "voucher" {
-			_, err := tx.Exec(ctx, `
-				UPDATE voucher
-				   SET attach_count = (SELECT COUNT(*) FROM attachment
-				                        WHERE owner_type = 'voucher' AND owner_id = ?),
-				       updated_at = ?
-				 WHERE id = ?`,
-				ownerID, time.Now().UTC().Format(time.RFC3339Nano), ownerID)
-			return err
-		}
-		return nil
+			ownerType, ownerID, hash)
+		return err
 	})
 }
 
@@ -968,6 +1025,55 @@ func (s *Service) OrphanAttachments(ctx context.Context) ([]AttachmentInfo, erro
 		out = append(out, AttachmentInfo{Hash: h, Size: size, Path: store.MustPath(h)})
 	}
 	return out, nil
+}
+
+// AttachmentAudit 报告某期间已记账凭证的电子附件覆盖情况。
+//
+// 这是「对账」的一部分：《会计基础工作规范》要求记账凭证附有原始单据，
+// 而小微企业的现实是「发票在微信里、报销单在抽屉里」。
+// 这个数字让会计知道还差多少张没补。
+type AttachmentAudit struct {
+	Posted     int `json:"posted"`
+	WithAttach int `json:"withAttach"`
+	Without    int `json:"without"`
+}
+
+// AttachmentCoverage 统计凭证的附件覆盖情况。
+//
+// ★ 「有附件」按 attachment 表 EXISTS 判定，不看 voucher.attach_count ——
+// 那一列是用户手填的纸质「附单据数」，语义不同：填了附单据数但
+// 没扫描上传的凭证，恰恰是这项统计要抓出来的对象。
+//
+// year/month 任一 <=0 表示统计全部期间；否则先经 period.NewKey 校验，
+// 非法年月直接拒绝（如 2025-13 会静默查出一堆 0，看起来像「都齐了」）。
+func (s *Service) AttachmentCoverage(ctx context.Context,
+	year, month int) (*AttachmentAudit, error) {
+
+	var where string
+	var args []any
+	if year > 0 || month > 0 {
+		k := period.NewKey(year, month)
+		if !k.Valid() {
+			return nil, fmt.Errorf("会计期间 %04d-%02d 非法", year, month)
+		}
+		where = " AND year = ? AND month = ?"
+		args = []any{year, month}
+	}
+	audit := &AttachmentAudit{}
+	err := s.db.SQL().QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(SUM(CASE WHEN EXISTS (
+		           SELECT 1 FROM attachment a
+		            WHERE a.owner_type = 'voucher' AND a.owner_id = voucher.id
+		       ) THEN 1 ELSE 0 END), 0)
+		  FROM voucher
+		 WHERE status = 'posted'`+where, args...).
+		Scan(&audit.Posted, &audit.WithAttach)
+	if err != nil {
+		return nil, translate(err)
+	}
+	audit.Without = audit.Posted - audit.WithAttach
+	return audit, nil
 }
 
 // AttachmentInfo 是一个已保存的附件。

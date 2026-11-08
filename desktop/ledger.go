@@ -97,7 +97,7 @@ func (a *App) LedgerDetail(req LedgerRequest) (out *LedgerResult, err error) {
 
 	rows, err := svc.DB().Vouchers().Detail(ctx, prefix, from, to)
 	if err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 
 	result := &LedgerResult{
@@ -114,9 +114,9 @@ func (a *App) LedgerDetail(req LedgerRequest) (out *LedgerResult, err error) {
 	}
 
 	// 期初 = 区间开始前的累计净额
-	opening, err := prefixBalanceBefore(ctx, svc, prefix, from)
+	opening, err := svc.LedgerPrefixBalanceBefore(ctx, prefix, from)
 	if err != nil {
-		return nil, err
+		return nil, classify(err)
 	}
 	result.OpeningBalance = int64(opening)
 
@@ -138,26 +138,8 @@ func (a *App) LedgerDetail(req LedgerRequest) (out *LedgerResult, err error) {
 	return result, nil
 }
 
-// prefixBalanceBefore 返回某科目前缀在给定日期之前的累计净额（借−贷）。
-//
-// 这里是整份代码里少数几处直接写 SQL 的桌面层代码，因此更要写清楚理由：
-// 「按科目前缀汇总某日之前的余额」在存储层没有现成的公开方法，
-// 而它只是明细账的一个取数细节，不值得为它往 store 里加一个专用接口。
-func prefixBalanceBefore(ctx contextT, svc *service.Service,
-	prefix string, before date) (money.Money, error) {
-
-	var net sqlNullInt64
-	err := svc.DB().SQL().QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(le.debit), 0) - COALESCE(SUM(le.credit), 0)
-		  FROM ledger_entry le
-		  JOIN account a ON a.id = le.account_id
-		 WHERE a.code LIKE ? AND le.biz_date < ?`,
-		prefix+"%", before.String()).Scan(&net)
-	if err != nil {
-		return 0, err
-	}
-	return money.Money(net.Int64), nil
-}
+// ★ 期初取数收进了 service.LedgerPrefixBalanceBefore ——
+// 绑定层不该写 SQL：它不知道表结构，也不该知道。
 
 // resolveRange 解析日期区间；留空时取账套的全部会计期间。
 func resolveRange(ctx contextT, svc *service.Service,

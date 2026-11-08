@@ -314,21 +314,29 @@ func TestEndToEndFullCycle(t *testing.T) {
 	if list[0].Missing {
 		t.Error("附件文件不该丢失")
 	}
-	// 附单据数要跟着走
+	// ★ 挂电子附件不改 voucher.attach_count ——
+	// 那是用户手填的纸质「附单据数」，语义是两回事。
+	// 电子附件覆盖情况按 attachment 表实计。
 	detail, err := svc.Voucher(ctx, target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.AttachCount != 1 {
-		t.Errorf("附单据数 = %d，期望 1", detail.AttachCount)
+	if detail.AttachCount != 0 {
+		t.Errorf("附单据数应保持用户填写值 0，实际 %d", detail.AttachCount)
 	}
-	// 重复挂同一份文件是幂等的，不该让附单据数变成 2
+	// 重复挂同一份文件是幂等的，attachment 表不会多一条
 	if _, err := svc.AttachToVoucher(ctx, target, "发票.pdf", pdf); err != nil {
 		t.Fatal(err)
 	}
-	detail, _ = svc.Voucher(ctx, target)
-	if detail.AttachCount != 1 {
-		t.Errorf("重复上传后附单据数 = %d，期望仍为 1", detail.AttachCount)
+	if list2, _ := svc.ListAttachments(ctx, "voucher", target); len(list2) != 1 {
+		t.Errorf("重复上传后附件数 = %d，期望仍为 1", len(list2))
+	}
+	cov, err := svc.AttachmentCoverage(ctx, 2025, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cov.WithAttach != 1 {
+		t.Errorf("有附件凭证数 = %d，期望 1", cov.WithAttach)
 	}
 	t.Logf("✓ 附件：1 个（sha256 %s…）", att.Hash[:12])
 

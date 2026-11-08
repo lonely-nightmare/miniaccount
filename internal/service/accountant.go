@@ -282,6 +282,13 @@ type accountantStore struct {
 type accountantSessionState struct {
 	view    AccountantSession
 	history []aiprovider.Message
+	// bookPath 是这段对话属于哪个账套。
+	//
+	// ★ 会话是进程内全局表，但上下文（科目表、往来单位、
+	// 相似凭证）是账套级的。切账套之后继续旧对话，
+	// 会把 A 公司的科目与往来单位塞进 B 公司的凭证里 ——
+	// 模型会一本正经地用别家账套的档案记账。
+	bookPath string
 	// pending 是「上一个问题」，用户下一句话就是回答它。
 	pending *aiprovider.AccountantQuestion
 	// input 是第一句业务描述（用于护栏里的金额比对与历史检索）。
@@ -397,12 +404,27 @@ func (s *Service) AccountantSend(ctx context.Context, in AccountantSendInput) (*
 	id := strings.TrimSpace(in.SessionID)
 	accountantSessions.mu.Lock()
 	st := accountantSessions.sessions[id]
+	// ★ 跨账套不认旧会话：旧会话的上下文装着上一个账套的
+	// 科目表与往来单位清单，继续用等于替别家做账。
+	if st != nil && st.bookPath != s.path {
+		delete(accountantSessions.sessions, id)
+		st = nil
+	}
 	if st == nil {
 		id = newSessionID()
-		st = &accountantSessionState{view: AccountantSession{ID: id, Turns: []AccountantTurn{}}}
+		st = &accountantSessionState{
+			view:     AccountantSession{ID: id, Turns: []AccountantTurn{}},
+			bookPath: s.path,
+		}
 		accountantSessions.sessions[id] = st
 		accountantSessions.order = append(accountantSessions.order, id)
 		accountantSessions.pruneLocked()
+	}
+	// ★ Busy 原来只置位不检查：前端双击/重试会同一会话发两轮，
+	// 两份历史交错，模型看到的是乱序对话。在锁内拒绝第二个。
+	if st.view.Busy {
+		accountantSessions.mu.Unlock()
+		return nil, errors.New("上一句话还在处理中，请稍候")
 	}
 	st.view.Busy = true
 	accountantSessions.mu.Unlock()
@@ -446,7 +468,10 @@ func (s *Service) AccountantSend(ctx context.Context, in AccountantSendInput) (*
 		Asked: st.view.Asks,
 	}
 	reply, history, rerr := acct.Reply(ctx, st.history)
-	st.history = history
+	// ★ 历史要有上限：每一轮都把全部历史重发一遍，几十轮之后
+	// 单次请求会膨胀到几十 KB —— 云端按 token 计费，本地模型
+	// 的上下文窗口也会撑爆。
+	st.history = aiprovider.TrimHistory(history, 40)
 	if rerr != nil {
 		// 出错也要把「用户说了什么」留在会话里，否则用户会以为消息丢了
 		// 又重发一遍，而模型那边其实已经收到了。

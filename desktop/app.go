@@ -60,6 +60,15 @@ func NewApp() *App { return &App{} }
 // startup 由 Wails 在窗口就绪后调用。
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	// ★ 操作日志必须在 GUI 路径也启用。
+	//
+	// 原来 setupAudit 只挂在无窗口的 serveBindings 分支上，
+	// 正常 GUI 启动全程 auditDir=="" —— 凭证增删改、结账、
+	// AI 采纳等约 40 处留痕全部静默失效，「操作日志」页永远空白，
+	// 完整性校验还谎报「通过」。日志写不了不该让软件打不开，
+	// 但「以为在记其实没记」比报错危险得多，所以在这里补上。
+	setupAudit()
+	a.logStartup()
 }
 
 // shutdown 在窗口关闭时调用，释放账套连接。
@@ -648,14 +657,20 @@ func (a *App) Backup(req BackupRequest) (out *backupManifestView, err error) {
 	if strings.TrimSpace(req.Dest) == "" {
 		return nil, &Fault{Kind: FaultInvalid, Message: "请选择备份文件的保存位置"}
 	}
+	dest := strings.TrimSpace(req.Dest)
+	// 备份文件强制 .mabak 扩展名：恢复路径按扩展名识别文件类型，
+	// 存成 .zip/.bak 会在「打开备份」对话框里直接看不见。
+	if !strings.HasSuffix(strings.ToLower(dest), ".mabak") {
+		dest += ".mabak"
+	}
 	m, err := svc.Backup(a.context(), service.BackupOptions{
-		Dest: req.Dest, IncludeFiles: req.IncludeFiles,
+		Dest: dest, IncludeFiles: req.IncludeFiles,
 	})
 	if err != nil {
 		return nil, classify(err)
 	}
 	return &backupManifestView{
-		Path: req.Dest, FormatVersion: m.FormatVersion, AppVersion: m.AppVersion,
+		Path: dest, FormatVersion: m.FormatVersion, AppVersion: m.AppVersion,
 		CompanyName: m.CompanyName, CreatedAt: m.CreatedAt,
 		DBSize: m.DBSize, DBSHA256: m.DBSHA256,
 		FileCount: m.FileCount, FileBytes: m.FileBytes,
@@ -978,20 +993,27 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		return nil, &Fault{Kind: FaultInvalid, Message: "请选择要恢复的备份文件"}
 	}
 
-	a.mu.Lock()
-	cur := a.svc
-	curPath := a.path
-	a.mu.Unlock()
-
 	// 先看清单：恢复前确认是哪个账套、什么时间备份的
 	m, ierr := (&service.Service{}).InspectBackup(req.Archive)
 	if ierr != nil {
 		return nil, classify(ierr)
 	}
 
+	// ★ 恢复全程持写锁：绑定调用全部排队。
+	//
+	// 原来是「取指针 → 放锁 → 关连接 → 恢复 → 重开」，
+	// 恢复要几秒，期间进来的调用拿到的是「正在关闭的连接」
+	// 或一个空 svc，轻则报内部错误，重则对着已被替换的文件
+	// 写进一笔账 —— 而用户以为那笔账进的是恢复后的账套。
+	// 恢复是全局操作，期间排队是唯一正确的语义。
+	a.mu.Lock()
+	cur := a.svc
+	curPath := a.path
+
 	dbPath := strings.TrimSpace(req.DBPath)
 	if dbPath == "" {
 		if curPath == "" {
+			a.mu.Unlock()
 			return nil, &Fault{Kind: FaultInvalid,
 				Message: "请指定恢复到哪个账套文件"}
 		}
@@ -999,12 +1021,12 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 	}
 	filesDir := filepath.Join(filepath.Dir(dbPath), ".files")
 
-	// 关掉当前连接再动文件
+	// 关掉当前连接再动文件：先把指针摘掉，后到的调用
+	// 直接报「未打开账套」，而不是打到一个半关的连接上。
+	// database/sql 会等已在途的查询走完再真正关连接，安全。
 	if cur != nil {
-		_ = cur.Shutdown()
-		a.mu.Lock()
 		a.svc, a.path = nil, ""
-		a.mu.Unlock()
+		_ = cur.Shutdown()
 	}
 
 	res, rerr := backup.Restore(a.context(), req.Archive, dbPath, filesDir)
@@ -1012,20 +1034,19 @@ func (a *App) RestoreBackup(req RestoreRequest) (out *RestoreResult, err error) 
 		// 恢复失败后把原来的账套重新打开，让用户至少还能用
 		if curPath != "" {
 			if svc, e := service.Open(a.context(), service.Options{Path: curPath}); e == nil {
-				a.mu.Lock()
 				a.svc, a.path = svc, curPath
-				a.mu.Unlock()
 			}
 		}
+		a.mu.Unlock()
 		return nil, classify(rerr)
 	}
 
 	// 打开恢复后的账套
 	svc, oerr := service.Open(a.context(), service.Options{Path: dbPath})
 	if oerr != nil {
+		a.mu.Unlock()
 		return nil, classify(oerr)
 	}
-	a.mu.Lock()
 	a.svc, a.path = svc, dbPath
 	a.mu.Unlock()
 	rememberBookPath(dbPath)
@@ -1059,25 +1080,13 @@ func (a *App) AuditAttachments(year, month int) (out *AttachmentAudit, err error
 		return nil, f
 	}
 	ctx := a.context()
-	audit := &AttachmentAudit{}
-
-	var qerr error
-	if year > 0 && month > 0 {
-		qerr = svc.DB().SQL().QueryRowContext(ctx, `
-			SELECT COUNT(*), COALESCE(SUM(attach_count > 0), 0)
-			  FROM voucher WHERE status = 'posted' AND year = ? AND month = ?`,
-			year, month).Scan(&audit.Posted, &audit.WithAttach)
-	} else {
-		qerr = svc.DB().SQL().QueryRowContext(ctx, `
-			SELECT COUNT(*), COALESCE(SUM(attach_count > 0), 0)
-			  FROM voucher WHERE status = 'posted'`).
-			Scan(&audit.Posted, &audit.WithAttach)
+	cov, err := svc.AttachmentCoverage(ctx, year, month)
+	if err != nil {
+		return nil, classify(err)
 	}
-	if qerr != nil {
-		return nil, classify(qerr)
+	audit := &AttachmentAudit{
+		Posted: cov.Posted, WithAttach: cov.WithAttach, Without: cov.Without,
 	}
-	audit.Without = audit.Posted - audit.WithAttach
-
 	orphans, oerr := svc.OrphanAttachments(ctx)
 	if oerr == nil {
 		audit.OrphanFiles = len(orphans)

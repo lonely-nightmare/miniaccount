@@ -370,27 +370,24 @@ func (a *App) ContactList() (out []ContactDetail, err error) {
 	if f != nil {
 		return nil, f
 	}
-	rows, qerr := svc.DB().SQL().QueryContext(a.context(), `
-		SELECT id, kind, name, short_name, tax_no, bank_name, bank_account,
-		       contact_person, phone, address, is_enabled, remark
-		  FROM contact ORDER BY kind, name`)
+	// ★ 走 service.Contacts：绑定层不再裸查 SQL。
+	// 空 kind = 全部（含停用）—— 管理界面要能看到停用档案，
+	// 否则停用就等于「消失且永远改不回来」。
+	contacts, qerr := svc.Contacts(a.context(), "")
 	if qerr != nil {
 		return nil, classify(qerr)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var c ContactDetail
-		var enabled int
-		if err := rows.Scan(&c.ID, &c.Kind, &c.Name, &c.ShortName, &c.TaxNo,
-			&c.BankName, &c.BankAccount, &c.ContactPerson, &c.Phone,
-			&c.Address, &enabled, &c.Remark); err != nil {
-			return nil, classify(err)
-		}
-		c.Enabled = enabled != 0
-		c.KindLabel = contactKindLabel(c.Kind)
-		out = append(out, c)
+	out = make([]ContactDetail, 0, len(contacts))
+	for _, c := range contacts {
+		out = append(out, ContactDetail{
+			ID: c.ID, Kind: c.Kind, KindLabel: c.KindLabel,
+			Name: c.Name, ShortName: c.ShortName, TaxNo: c.TaxNo,
+			BankName: c.BankName, BankAccount: c.BankAccount,
+			ContactPerson: c.ContactPerson, Phone: c.Phone,
+			Address: c.Address, Enabled: c.Enabled, Remark: c.Remark,
+		})
 	}
-	return out, classify(rows.Err())
+	return out, nil
 }
 
 // fmtLine 拼出「第 N 行 XXX」的字段名，让错误信息能定位到具体行。

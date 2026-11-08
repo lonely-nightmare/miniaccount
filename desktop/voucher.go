@@ -230,6 +230,12 @@ func (a *App) ContactOptions() (out []service.ContactOption, err error) {
 type VoucherMeta struct {
 	Accounts []service.AccountOption `json:"accounts"`
 	Contacts []service.ContactOption `json:"contacts"`
+	// Departments / Employees 是辅助核算另两维的档案清单。
+	//
+	// ★ 辅助核算弹层原来只有往来单位 —— 要求员工/部门维度的科目
+	// 在界面上根本选不到正确档案，只能空着交差。
+	Departments []service.Department   `json:"departments"`
+	Employees   []service.EmployeeView `json:"employees"`
 	// Words 是可选凭证字。
 	Words []string `json:"words"`
 	// CurrentPeriod 是当前可记账期间，供默认日期用。
@@ -257,9 +263,18 @@ func (a *App) VoucherMetaInfo() (out *VoucherMeta, err error) {
 	if berr != nil {
 		return nil, classify(berr)
 	}
+	depts, derr := svc.Departments(ctx)
+	if derr != nil {
+		return nil, classify(derr)
+	}
+	employees, eerr := svc.Employees(ctx, true)
+	if eerr != nil {
+		return nil, classify(eerr)
+	}
 
 	meta := &VoucherMeta{
 		Accounts: accounts, Contacts: contacts,
+		Departments: nonNil(depts), Employees: nonNil(employees),
 		Words: []string{"记", "收", "付", "转"},
 		Today: todayDate().String(),
 	}
@@ -317,6 +332,9 @@ func (a *App) UploadAttachment(req UploadAttachmentRequest) (out *service.Attach
 // hash 只能指向账套 .files 目录里已有的文件，路径由 store 校验后派生。
 func (a *App) OpenAttachment(hash string) (err error) {
 	defer recoverTo(&err, "OpenAttachment")()
+	if f := a.guiReady(); f != nil {
+		return f
+	}
 	svc, f := a.book()
 	if f != nil {
 		return f

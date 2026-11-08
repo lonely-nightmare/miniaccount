@@ -69,7 +69,14 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Migrate(ctx); err != nil {
+	if opts.ReadOnly {
+		// 只读打开不跑迁移（迁移要写库），但版本校验不能省：
+		// 比程序新的库读出来是错的，比程序旧的会撞「列不存在」。
+		if err := db.CheckSchemaVersion(ctx); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	} else if err := db.Migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -385,7 +392,7 @@ const (
 	bsLineLiabilities = 47 // 负债合计
 	bsLineEquity      = 52 // 所有者权益合计
 	plLineIncome      = 1  // 营业收入
-	plLineExpense     = 14 // 营业成本及费用合计（依定义文件）
+	plLineProfit      = 30 // 利润总额
 )
 
 // Overview 生成首页概览。
@@ -451,14 +458,20 @@ func (s *Service) Overview(ctx context.Context) (*Dashboard, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, no := range []int{plLineIncome, plLineExpense} {
+	for _, no := range []int{plLineIncome, plLineProfit} {
 		if _, ok := pl.Line(no); !ok {
 			return nil, fmt.Errorf("service: 利润表定义缺少行次 %d", no)
 		}
 	}
 	d.PeriodIncome = lineValue(pl, plLineIncome)
-	d.PeriodExpense = lineValue(pl, plLineExpense)
-	d.PeriodProfit = d.PeriodIncome.Sub(d.PeriodExpense)
+	d.PeriodProfit = lineValue(pl, plLineProfit)
+	// ★ 费用 = 收入 − 利润总额。
+	//
+	// 利润表里没有「费用合计」这一行（原来误取了行14「管理费用」
+	// 一个单行，本期利润被系统性高估）。费用侧本来就是
+	// 收入、投资收益、营业外收支的差值 —— 用利润总额倒推
+	// 既与官方勾稽关系一致，又始终自洽：利润 = 收入 − 费用。
+	d.PeriodExpense = d.PeriodIncome.Sub(d.PeriodProfit)
 
 	if st, err := s.db.CashFlow().StatementForPeriod(ctx, k, nil); err == nil {
 		d.ClosingCash = st.ClosingCash
@@ -783,6 +796,15 @@ type AIConfig struct {
 // AIConfigInfo 汇总 AI 配置与使用情况。
 func (s *Service) AIConfigInfo(ctx context.Context) (*AIConfig, error) {
 	provs, err := s.db.AI().Providers(ctx)
+	if err == nil {
+		// ★ 密钥不下发：Wails 桥另一头是 WebView，明文 key 经
+		// JSON 发给前端后，谁打开 DevTools 都能读走。界面只需要
+		// 知道「有没有」，不需要知道「是什么」。
+		for i := range provs {
+			provs[i].HasKey = provs[i].APIKey != ""
+			provs[i].APIKey = ""
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

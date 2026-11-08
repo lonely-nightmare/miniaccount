@@ -12,6 +12,7 @@ import (
 	"miniaccount/internal/domain/audit"
 	"miniaccount/internal/domain/calendar"
 	"miniaccount/internal/domain/money"
+	"miniaccount/internal/domain/voucher"
 )
 
 // aiProviderFactory 允许替换「怎么拿到模型服务」。
@@ -328,8 +329,22 @@ func (s *Service) AcceptAISuggestion(ctx context.Context, id int64,
 		return nil, fmt.Errorf("这条建议的内容已经读不出来了（提议 JSON 解析失败），" +
 			"不能采纳 —— 请在界面上重新生成一次")
 	}
-	if rec.Decision == string(aiprovider.DecisionAccepted) {
-		return nil, fmt.Errorf("这条建议已经采纳过了（凭证 #%v）", derefID(rec.FinalVoucher))
+	// ★ 处置是终态：已拒绝的建议也不能再采纳。
+	//
+	// 原来只挡「已采纳」，用户点过「拒绝」之后建议仍然留在
+	// 界面上可以被采纳 —— 拒绝这个动作形同虚设，而审计里
+	// 记的是「拒绝了、却又采纳了」，两边对不上。
+	if rec.Decision != "" {
+		label := "已处置"
+		switch rec.Decision {
+		case string(aiprovider.DecisionAccepted):
+			label = fmt.Sprintf("已采纳（凭证 #%v）", derefID(rec.FinalVoucher))
+		case string(aiprovider.DecisionRejected):
+			label = "已拒绝"
+		case string(aiprovider.DecisionModified):
+			label = "已修改采纳"
+		}
+		return nil, fmt.Errorf("这条建议%s，不能再次采纳", label)
 	}
 	if rec.Status != "valid" {
 		return nil, fmt.Errorf("这条建议没有通过护栏校验，不能采纳：%s", rec.RejectReason)
@@ -363,6 +378,9 @@ func (s *Service) AcceptAISuggestion(ctx context.Context, id int64,
 	in := VoucherInput{
 		Word: string(v.Word), Date: v.BizDate.String(), Remark: v.Remark,
 		CreatedBy: createdBy,
+		// ★ 溯源必须落库：AI 起草的凭证记成 manual 会让
+		// 「这张凭证谁提议的」查不出来，created_by_ai 全为 0。
+		Source: voucher.SourceAI, CreatedByAI: true,
 	}
 	for _, e := range v.Entries {
 		in.Lines = append(in.Lines, VoucherLineInput{
