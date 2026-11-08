@@ -167,6 +167,17 @@ func (r *BankRepo) insertFlow(ctx context.Context, tx *Tx, importID, accountID i
 		return false, translateErr(err)
 	}
 	if exists > 0 {
+		// ★ 去重命中也顺带补余额：旧版把未知余额存成了 0，
+		// 重新导入带余额列的对账单时把真值回填进去。
+		// 新行仍算重复（DedupKey 不含余额），不产生新流水。
+		if f.BalanceKnown {
+			if _, err = tx.Exec(ctx, `
+				UPDATE bank_flow SET balance = ?, updated_at = ?
+				 WHERE account_id = ? AND dedup_hash = ?`,
+				int64(f.Balance), now, accountID, f.DedupKey()); err != nil {
+				return false, translateErr(err)
+			}
+		}
 		return false, nil
 	}
 

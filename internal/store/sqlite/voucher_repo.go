@@ -14,6 +14,7 @@ import (
 	"miniaccount/internal/domain/ledger"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
+	"miniaccount/internal/domain/vat"
 	"miniaccount/internal/domain/voucher"
 )
 
@@ -125,8 +126,18 @@ func draftName(v *voucher.Voucher) string {
 // PostPeriodDrafts 把某一期间的全部草稿过账（自开事务）。
 func (r *VoucherRepo) PostPeriodDrafts(ctx context.Context, k period.Key,
 	postingBy string, at time.Time) (*PostPeriodDraftsResult, error) {
+	// 先把工资凭证按工资单最新数据刷一遍 ——
+	// 准备必须在事务外（loadRun 走 db.sql），
+	// 应用必须在事务内（与过账同生共死）。
+	regen, err := r.db.Payroll().PrepareStaleDraftRegen(ctx, k)
+	if err != nil {
+		return nil, err
+	}
 	var out *PostPeriodDraftsResult
-	err := r.db.WithTx(ctx, func(tx *Tx) error {
+	err = r.db.WithTx(ctx, func(tx *Tx) error {
+		if err := r.db.Payroll().ApplyStaleDraftRegenTx(ctx, tx, regen); err != nil {
+			return err
+		}
 		var e error
 		out, e = r.PostPeriodDraftsInTx(ctx, tx, k, postingBy, at)
 		return e
@@ -1337,15 +1348,16 @@ func (r *VoucherRepo) DeleteDraft(ctx context.Context, id int64) (*DeleteResult,
 				updated_at = ? WHERE voucher_id = ?`, nowString(), id); err != nil {
 			return err
 		}
-		// 固定资产计提/摊销行：回可重新生成态。
+		// ★ 固定资产计提/摊销行**整行删除**，不是只清 voucher_id：
+		// 这些行是「已计提」的记账记录，留下来累计折旧仍含这笔数、
+		// HasDepreciationIn 仍会报「已计提」，同期永远重提不了。
+		// 删凭证=撤销计提，行必须一起消失。
 		if res.UnlinkedDepreciate, err = affect(`
-			UPDATE asset_depreciation SET voucher_id = NULL
-			 WHERE voucher_id = ?`, id); err != nil {
+			DELETE FROM asset_depreciation WHERE voucher_id = ?`, id); err != nil {
 			return err
 		}
 		if res.UnlinkedAmortize, err = affect(`
-			UPDATE amortization_entry SET voucher_id = NULL
-			 WHERE voucher_id = ?`, id); err != nil {
+			DELETE FROM amortization_entry WHERE voucher_id = ?`, id); err != nil {
 			return err
 		}
 		if res.UnlinkedAISuggest, err = affect(`
@@ -1463,18 +1475,20 @@ var inputVATColumns = map[string]bool{
 }
 
 // rejectInputVATForSmallBook 阻止小规模纳税人账套使用进项抵扣专栏。
+//
+// ★ 身份按**凭证记账日期**判定，不读账套当前身份：
+// 一月是一般纳税人、二月转小规模时，一月的那笔进项分录依然合法；
+// 反过来一月是小规模、二月才转一般，一月的采购也依然不得抵扣。
+// 用「现在是什么身份」判断历史凭证会把两种情况都判错。
 func rejectInputVATForSmallBook(ctx context.Context, tx *Tx, v *voucher.Voucher) error {
 	if v == nil || len(v.Entries) == 0 {
 		return nil
 	}
-	var taxType string
-	if err := tx.QueryRow(ctx,
-		`SELECT COALESCE(tax_type,'') FROM book WHERE id = 1`).Scan(&taxType); err != nil {
-		// 读不到账套信息就放行：这是防错，不是权限校验，
-		// 不该因为一个读不到就阻断正常记账。
-		return nil
+	small, err := smallScaleAtTx(ctx, tx, v.BizDate)
+	if err != nil {
+		return err
 	}
-	if taxType != TaxTypeSmall {
+	if !small {
 		return nil
 	}
 	for _, e := range v.Entries {
@@ -1482,12 +1496,69 @@ func rejectInputVATForSmallBook(ctx context.Context, tx *Tx, v *voucher.Voucher)
 			continue
 		}
 		return fmt.Errorf(
-			"%w: 本账套是小规模纳税人，不得抵扣进项税额，不能使用「%s」。"+
+			"%w: %s 时账套是小规模纳税人，不得抵扣进项税额，不能使用「%s」。"+
 				"采购时应将价税合计全额计入成本费用"+
 				"（借 相关费用科目 全额 / 贷 银行存款或应付账款），不要拆分税额。",
-			account.ErrNotAllowedForTaxType, e.AccountCode)
+			account.ErrNotAllowedForTaxType, v.BizDate, e.AccountCode)
 	}
 	return nil
+}
+
+// smallScaleAtTx 在事务内判定账套在某日期是否为小规模纳税人。
+//
+// 身份历史（vat_status_history）优先；查不到退账簿当前登记身份；
+// 两边都查不到时**放行**（返回 false,nil）：这是记账防错校验，
+// 不是抵扣权限授予 —— 账套数据不全不该让日常记账全部卡死。
+// （PostInvoice 的进项门更严：身份查不到直接报错，
+// 见 InvoiceRepo.smallScaleAt。）
+func smallScaleAtTx(ctx context.Context, tx *Tx, on calendar.Date) (bool, error) {
+	periods, err := loadVATStatusPeriodsTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if st, ok := vat.StatusOn(periods, on); ok {
+		return st == vat.VATSmallScale, nil
+	}
+	var s string
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(vat_status,'') FROM book WHERE id = 1`).Scan(&s); err != nil {
+		return false, nil
+	}
+	return vat.VATStatus(s) == vat.VATSmallScale, nil
+}
+
+// loadVATStatusPeriodsTx 读全部纳税人身份期间。
+func loadVATStatusPeriodsTx(ctx context.Context, tx *Tx) ([]vat.StatusPeriod, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT status, effective_from, effective_to
+		  FROM vat_status_history ORDER BY effective_from`)
+	if err != nil {
+		return nil, translateErr(err)
+	}
+	defer rows.Close()
+	var out []vat.StatusPeriod
+	for rows.Next() {
+		var status, from, to string
+		if err := rows.Scan(&status, &from, &to); err != nil {
+			return nil, err
+		}
+		dFrom, err := calendar.Parse(from)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: 身份历史生效日 %q: %w", from, err)
+		}
+		p := vat.StatusPeriod{
+			Status: vat.VATStatus(status), EffectiveFrom: dFrom,
+		}
+		if to != "" {
+			dTo, err := calendar.Parse(to)
+			if err != nil {
+				return nil, fmt.Errorf("sqlite: 身份历史截止日 %q: %w", to, err)
+			}
+			p.EffectiveTo = dTo
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // insertDraftEntries 写草稿的分录（只写 voucher_entry，不写总账）。

@@ -707,6 +707,25 @@ func (r *PayrollRepo) recascadeRun(ctx context.Context, runID int64) ([]string, 
 	}
 
 	err = r.db.WithTx(ctx, func(tx *Tx) error {
+		// ★ 凭证已过账 → 整个工资单冻结。
+		//
+		// 只跳过凭证重生成而仍改写工资单，就会出现
+		// 「工资单说 500、总账说 0」的账表背离 ——
+		// 工资单和它的已过账凭证必须同生共死。
+		// 用户要么先红字冲销那张凭证，要么手工调整。
+		for _, vid := range []sql.NullInt64{accID, payID} {
+			if !vid.Valid {
+				continue
+			}
+			var st string
+			if err := tx.QueryRow(ctx,
+				`SELECT status FROM voucher WHERE id = ?`, vid.Int64).Scan(&st); err != nil {
+				return translateErr(err)
+			}
+			if st != string(voucher.StatusDraft) {
+				return errRunFrozen
+			}
+		}
 		if err := r.rewriteRunTx(ctx, tx, rebuilt); err != nil {
 			return err
 		}
@@ -731,10 +750,119 @@ func (r *PayrollRepo) recascadeRun(ctx context.Context, runID int64) ([]string, 
 		}
 		return regen(payID, paymentEntries)
 	})
+	if errors.Is(err, errRunFrozen) {
+		warns = append(warns, fmt.Sprintf(
+			"%d-%02d 月的工资凭证已过账，工资单未自动改；如需反映上游变动请先红字冲销",
+			run.Period.Year, run.Period.Month))
+		return warns, nil
+	}
 	return warns, err
 }
 
+// errRunFrozen 表示工资单的凭证已过账，整单冻结不再自动改。
+var errRunFrozen = errors.New("payroll: 工资凭证已过账，工资单冻结")
+
 var errVoucherNotDraft = errors.New("voucher: 凭证已不是草稿")
+
+// PayrollVoucherRegen 是一张待刷新的工资凭证：按工资单当前数据
+// 重算好的新分录。在过账事务外准备好、事务内应用。
+type PayrollVoucherRegen struct {
+	VoucherID int64
+	Run       *payroll.Run
+	Entries   []payroll.Entry
+}
+
+// PrepareStaleDraftRegen 找出某期间内仍是草稿的工资凭证，
+// 并按工资单**当前落库数据**把新分录先算好。
+//
+// ★ 为什么必须在过账前刷新：
+//
+// 工资凭证是工资单的纯派生物（分录全部由 run 数据构建）。
+// 上游月份重算会改写下游工资单（级联），可级联改不动凭证的
+// 场景真实存在 —— 账期被反结账退回未启用时凭证重写会失败，
+// 留下一张按旧数生成的草稿。这张草稿不刷掉，结账时就按旧税额
+// 过账，总账和工资单从此对不上。
+//
+// 「准备 / 应用」拆两步的原因：loadRun 要发多条只读查询，
+// 单连接池里放进事务就是死锁 —— 所以只能事务外准备、事务内应用。
+func (r *PayrollRepo) PrepareStaleDraftRegen(ctx context.Context, k period.Key) ([]PayrollVoucherRegen, error) {
+	rows, err := r.db.sql.QueryContext(ctx, `
+		SELECT r.id, r.accrual_voucher_id, r.payment_voucher_id
+		  FROM salary_run r
+		  LEFT JOIN voucher va ON va.id = r.accrual_voucher_id
+		  LEFT JOIN voucher vp ON vp.id = r.payment_voucher_id
+		 WHERE r.year = ? AND r.month = ?
+		   AND (va.status = 'draft' OR vp.status = 'draft')`,
+		k.Year, k.Month)
+	if err != nil {
+		return nil, translateErr(err)
+	}
+	type runVouchers struct {
+		id       int64
+		acc, pay sql.NullInt64
+	}
+	var list []runVouchers
+	for rows.Next() {
+		var rv runVouchers
+		if err := rows.Scan(&rv.id, &rv.acc, &rv.pay); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		list = append(list, rv)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, nil
+	}
+
+	vc, err := r.VoucherAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []PayrollVoucherRegen
+	for _, rv := range list {
+		run, err := r.loadRun(ctx, rv.id)
+		if err != nil {
+			return nil, err
+		}
+		for _, pair := range []struct {
+			vid sql.NullInt64
+			fn  func() ([]payroll.Entry, error)
+		}{
+			{rv.acc, func() ([]payroll.Entry, error) { return run.BuildAccrualEntries(vc) }},
+			{rv.pay, func() ([]payroll.Entry, error) { return run.BuildPaymentEntries(vc) }},
+		} {
+			if !pair.vid.Valid {
+				continue
+			}
+			entries, err := pair.fn()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, PayrollVoucherRegen{
+				VoucherID: pair.vid.Int64, Run: run, Entries: entries,
+			})
+		}
+	}
+	return out, nil
+}
+
+// ApplyStaleDraftRegenTx 在过账事务内把准备好的工资凭证分录写回
+// 对应草稿。凭证已不再是草稿时跳过（比如它已被单独过账）。
+func (r *PayrollRepo) ApplyStaleDraftRegenTx(ctx context.Context, tx *Tx,
+	tasks []PayrollVoucherRegen) error {
+
+	for _, t := range tasks {
+		if err := r.regenPayrollVoucherTx(ctx, tx, t.VoucherID,
+			t.Run, t.Entries); err != nil && !errors.Is(err, errVoucherNotDraft) {
+			return fmt.Errorf("工资凭证 #%d 刷新失败: %w", t.VoucherID, err)
+		}
+	}
+	return nil
+}
 
 // regenPayrollVoucherTx 用重算后的分录覆写一张仍是草稿的工资凭证。
 // 凭证已不是草稿时返回 errVoucherNotDraft（调用方降级为警告）。

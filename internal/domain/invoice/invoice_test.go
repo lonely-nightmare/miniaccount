@@ -214,6 +214,7 @@ func TestIdentity(t *testing.T) {
 
 func TestSummarize(t *testing.T) {
 	e1 := base()
+	e1.Status = StatusVerified // 未认证的专票不可抵扣
 	e1.ComputeTax()
 
 	e2 := base()
@@ -238,9 +239,14 @@ func TestSummarize(t *testing.T) {
 	if s.TotalAmount != y(1695) { // 1130 + 565
 		t.Errorf("价税合计 = %s，期望 1695.00", s.TotalAmount)
 	}
-	// 只有专票的 130 可抵扣，普票的 65 不可
-	if s.DeductibleTax != y(130) {
-		t.Errorf("可抵扣税额 = %s，期望 130.00（仅专票）", s.DeductibleTax)
+	// 只有已认证专票的 130 可抵扣：普票 65 不可、未认证专票也不计
+	pending := base()
+	pending.Number = "PENDING01"
+	pending.ComputeTax()
+	s2 := Summarize([]*Invoice{e1, e2, e3, pending})
+	if s.DeductibleTax != y(130) || s2.DeductibleTax != y(130) {
+		t.Errorf("可抵扣税额 = %s / 含未认证 %s，期望 130.00（仅已认证专票）",
+			s.DeductibleTax, s2.DeductibleTax)
 	}
 }
 

@@ -1680,7 +1680,9 @@ test('★ 审计证据链：挂依据、判重、原件丢了要说出来', asyn
   assert.ok(body.includes('证据链回归测试'), '证据链里应当能看到那笔调整')
 
   // ---- 原件不见了：必须报出来 ----
-  const filePath = path.join(path.dirname(dbPath), '.files', link.hash.slice(0, 2), link.hash)
+  // 附件目录按账套隔离：<账套文件名>.files/<hash 前两位>/<hash>
+  const filesDir = `${path.basename(dbPath, path.extname(dbPath))}.files`
+  const filePath = path.join(path.dirname(dbPath), filesDir, link.hash.slice(0, 2), link.hash)
   assert.ok(fs.existsSync(filePath), `附件实体不在预期位置：${filePath}`)
   fs.unlinkSync(filePath)
 

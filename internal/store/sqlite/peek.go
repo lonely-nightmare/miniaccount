@@ -216,40 +216,48 @@ func ScanBookDir(ctx context.Context, dir string) ([]BookPeek, error) {
 
 // VerifyOpenable 校验一个账套文件能被本程序打开。
 //
-// 只读打开、不跑迁移 —— 用在「动用户数据之前的最后一步验证」，
-// 比如恢复备份：新库落位后先确认它能开，再把原库从暂存放回去。
+// # 为什么是「拷一份临时副本、用正常 Open 全真开一遍」
 //
-// 判定比 PeekBook 严格也比它宽松：
-//   - 严格：必须是账套（有 book 表）、必须读得出迁移版本；
-//   - 宽松：版本**比程序旧**不算失败 —— 正常打开路径会把它迁移升级，
-//     恢复的本来就可能是个旧备份；只有「比程序新」才拒绝。
+// 只读打开只能回答「文件有没有坏、版本是不是太新」，
+// 回答不了「这套库能不能被迁移成当前程序要的形状」——
+// 真实案例：备份的 schema_migration 缺一条记录，
+// 只读检查通过、真打开时迁移在重复列上崩溃，
+// 而原账套已经被挪进暂存目录。
+//
+// 在副本上跑**和真实打开完全相同**的 Open（含全部迁移），
+// 副本开得起，真文件就开得起；副本开不起，
+// 恢复流程回滚、原账套原样奉还。迁移写进的是副本，
+// 真实文件保持备份原样，由之后正常打开再迁移一遍。
 func VerifyOpenable(ctx context.Context, path string) error {
-	db, err := Open(ctx, Options{Path: path, ReadOnly: true})
+	src, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("读取待验证账套: %w", err)
 	}
-	defer func() { _ = db.Close() }()
+	tmp, err := os.CreateTemp("", "miniaccount-verify-*.db")
+	if err != nil {
+		return fmt.Errorf("建验证副本: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		// WAL/SHM 是打开过程在副本旁边留下的伴生文件。
+		_ = os.Remove(tmpPath + "-wal")
+		_ = os.Remove(tmpPath + "-shm")
+	}
+	if _, err := tmp.Write(src); err != nil {
+		cleanup()
+		return fmt.Errorf("写验证副本: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("写验证副本: %w", err)
+	}
+	defer cleanup()
 
-	if !db.hasTable(ctx, "book") {
-		return fmt.Errorf("不是账套文件（没有 book 表）")
-	}
-	migrations, err := loadMigrations()
+	db, err := Open(ctx, Options{Path: tmpPath})
 	if err != nil {
-		return err
+		return fmt.Errorf("恢复的账套打不开: %w", err)
 	}
-	maxEmbedded := migrations[len(migrations)-1].Version
-	if !db.hasTable(ctx, "schema_migration") {
-		// 有 book 表但没有迁移记录：比迁移框架还老的账套，
-		// 可写打开时按全量迁移处理，视为「旧」放行。
-		return nil
-	}
-	applied, err := db.appliedSet(ctx)
-	if err != nil {
-		return err
-	}
-	if maxApplied := applied.max(); maxApplied > maxEmbedded {
-		return fmt.Errorf("%w：账套版本 %d > 本程序 %d",
-			ErrSchemaTooNew, maxApplied, maxEmbedded)
-	}
-	return nil
+	return db.Close()
 }

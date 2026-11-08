@@ -453,9 +453,11 @@ func extractRow(row []string, ix *indexer, m Mapping, bankAccountCode string) (*
 		f.Direction, f.Amount = dir, amt
 	}
 
-	// 余额
+	// 余额：空单元格是「未知」（parseAmountSigned 对空串报错 →
+	// BalanceKnown 保持 false → 存 NULL）；余额可正可负，
+	// 必须用带符号解析 —— parseAmount 取绝对值会把 -200 读成 +200。
 	if m.Balance != "" {
-		if v, err := parseAmount(ix.get(row, m.Balance)); err == nil {
+		if v, err := parseAmountSigned(ix.get(row, m.Balance)); err == nil {
 			f.Balance = v
 			f.BalanceKnown = true
 		}

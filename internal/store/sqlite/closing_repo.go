@@ -210,10 +210,18 @@ func (r *ClosingRepo) ClosePeriod(ctx context.Context, in CloseInput) (*CloseRes
 		}
 	}
 
+	// ★ 工资凭证刷新：按工资单当前数据重算草稿分录。
+	// 上游重算会让下游凭证过期，凭证不刷新就按旧税额过账。
+	// 准备在事务外（loadRun 走 db.sql），应用在事务内。
+	regen, err := r.db.Payroll().PrepareStaleDraftRegen(ctx, k)
+	if err != nil {
+		return nil, err
+	}
+
 	var out CloseResult
-	err := r.db.WithTx(ctx, func(tx *Tx) error {
+	err = r.db.WithTx(ctx, func(tx *Tx) error {
 		out = CloseResult{Period: k, Health: health}
-		return r.closeInTx(ctx, tx, in, ac, &out)
+		return r.closeInTx(ctx, tx, in, ac, &out, regen)
 	})
 	if err != nil {
 		return nil, err
@@ -255,10 +263,15 @@ func (r *ClosingRepo) DryRunClose(ctx context.Context, in CloseInput) (*CloseRes
 	}
 	in.At = at
 
+	regen, err := r.db.Payroll().PrepareStaleDraftRegen(ctx, k)
+	if err != nil {
+		return nil, err
+	}
+
 	var out CloseResult
-	err := r.db.WithTx(ctx, func(tx *Tx) error {
+	err = r.db.WithTx(ctx, func(tx *Tx) error {
 		out = CloseResult{Period: k}
-		if err := r.closeInTx(ctx, tx, in, ac, &out); err != nil {
+		if err := r.closeInTx(ctx, tx, in, ac, &out, regen); err != nil {
 			return err
 		}
 		return errDryRunRollback
@@ -274,7 +287,7 @@ func (r *ClosingRepo) DryRunClose(ctx context.Context, in CloseInput) (*CloseRes
 // 顺序：校验期间 → 过本期草稿 → 算结转 → 写结转凭证 → 关期间 →
 // 启用下期。任何一步失败整个事务回滚。
 func (r *ClosingRepo) closeInTx(ctx context.Context, tx *Tx, in CloseInput,
-	ac closing.Accounts, out *CloseResult) error {
+	ac closing.Accounts, out *CloseResult, regen []PayrollVoucherRegen) error {
 	k := in.Period
 	at := in.At
 
@@ -308,6 +321,12 @@ func (r *ClosingRepo) closeInTx(ctx context.Context, tx *Tx, in CloseInput,
 		// 放在同一个事务里：过账、结转、关期间要么都成，要么都不成。
 		// 分开做的话，中途失败会留下一批「已过账但期间还开着」的凭证，
 		// 用户再点一次结账，凭证号就重号了。
+		//
+		// 过账前先在同事务里刷新工资凭证（草稿分录按工资单最新数据
+		// 重写）——否则级联改不动的过期草稿会按旧数过账。
+		if err := r.db.Payroll().ApplyStaleDraftRegenTx(ctx, tx, regen); err != nil {
+			return err
+		}
 		posted, err := r.db.Vouchers().PostPeriodDraftsInTx(ctx, tx, k, in.PostingBy, at)
 		if err != nil {
 			return err

@@ -876,3 +876,112 @@ func TestCorruptTaxTableIsReported(t *testing.T) {
 		t.Errorf("空税表应回落内置默认表，实际报错: %v", err)
 	}
 }
+
+// 体检问题 4-续：级联改不动的过期工资凭证，结账过账时必须按
+// 工资单最新数据刷新，不能按旧数进总账。
+func TestStalePayrollDraftRefreshedOnPost(t *testing.T) {
+	ctx := context.Background()
+	f := setupPayroll(t)
+	dept := int64(1)
+	emp := f.addEmployee(t, "E001", "张三", payroll.KindEmployee,
+		"560201", &dept, "测试城市")
+
+	runID := f.buildAndSave(t, 2025, 9, map[int64]*payroll.Item{
+		emp: {BaseSalary: money100(20000), SpecialAdditional: money100(2000)},
+	})
+	res, err := f.DB.Payroll().PostRun(ctx, runID, "王主管",
+		time.Date(2025, 9, 30, 18, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟级联没改动的后果：直接把发放凭证的税分录改成旧值 0.01。
+	if _, err := f.DB.sql.ExecContext(ctx, `
+		UPDATE voucher_entry SET credit = 1
+		 WHERE voucher_id = ? AND account_id IN
+		   (SELECT id FROM account WHERE code LIKE '2241%')`,
+		res.PaymentVoucherID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 按期过账（结账走的同一条路）：凭证应先按工资单刷新。
+	if _, err := f.DB.Vouchers().PostPeriodDrafts(ctx,
+		period.NewKey(2025, 9), "王主管", time.Now()); err != nil {
+		t.Fatalf("按期过账失败: %v", err)
+	}
+	pay, err := f.DB.Vouchers().Get(ctx, res.PaymentVoucherID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taxCredit money.Money
+	for _, e := range pay.Entries {
+		if e.Credit.IsPositive() && e.AccountCode != "1002" {
+			taxCredit = taxCredit.Add(e.Credit)
+		}
+	}
+	if taxCredit == money.Money(1) || taxCredit.IsZero() {
+		t.Errorf("过账后的工资凭证仍按旧数（税=%s）—— 过期草稿没有被刷新", taxCredit)
+	}
+}
+
+// 体检问题 4-续：凭证已过账的工资单，级联不得再改写 ——
+// 只改工资单不改凭证就是账表背离。
+func TestCascadeSkipsPostedRun(t *testing.T) {
+	ctx := context.Background()
+	f := setupPayroll(t)
+	dept := int64(1)
+	emp := f.addEmployee(t, "E001", "张三", payroll.KindEmployee,
+		"560201", &dept, "测试城市")
+
+	janID := f.buildAndSave(t, 2025, 8, map[int64]*payroll.Item{
+		emp: {BaseSalary: money100(20000), SpecialAdditional: money100(2000)},
+	})
+	febID := f.buildAndSave(t, 2025, 9, map[int64]*payroll.Item{
+		emp: {BaseSalary: money100(20000), SpecialAdditional: money100(2000)},
+	})
+	if _, err := f.DB.Payroll().PostRun(ctx, febID, "王主管",
+		time.Date(2025, 9, 30, 18, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	postDrafts(t, f.DB, 2025, 9) // 二月的凭证过账 → 工资单冻结
+
+	runs, _ := f.DB.Payroll().ListRuns(ctx)
+	var febBefore money.Money
+	for _, r := range runs {
+		if r.ID == febID {
+			febBefore = r.TotalIIT
+		}
+	}
+
+	// 重存一月（加调增项 → 二月累计预扣应变，但二月已入账不能动）
+	run, err := f.DB.Payroll().BuildRun(ctx, BuildRunInput{
+		Period: period.NewKey(2025, 8), CreatedBy: "李会计",
+		Amounts: map[int64]*payroll.Item{
+			emp: {BaseSalary: money100(20000), SpecialAdditional: money100(5000)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveRes, err := f.DB.Payroll().SaveRun(ctx, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = janID
+	var warned bool
+	for _, w := range saveRes.Warnings {
+		if strings.Contains(w, "已过账") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("级联跳过已过账工资单时应给出警告")
+	}
+	runs, _ = f.DB.Payroll().ListRuns(ctx)
+	for _, r := range runs {
+		if r.ID == febID && r.TotalIIT != febBefore {
+			t.Errorf("已过账的工资单仍被级联改写（%s → %s）—— 账表背离",
+				febBefore, r.TotalIIT)
+		}
+	}
+}

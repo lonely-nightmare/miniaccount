@@ -332,8 +332,18 @@ func TestSmallTaxpayerCannotPostInputVAT(t *testing.T) {
 		{"small", false},
 	} {
 		db := newTestDB(t)
+		vatStatus := "general"
+		if tc.taxType == "small" {
+			vatStatus = "small_scale"
+		}
 		if err := db.WithTx(ctx, func(tx *Tx) error {
-			_, err := tx.Exec(ctx, `UPDATE book SET tax_type = ? WHERE id = 1`, tc.taxType)
+			if _, err := tx.Exec(ctx,
+				`UPDATE book SET vat_status = ?, tax_type = ? WHERE id = 1`,
+				vatStatus, tc.taxType); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx,
+				`UPDATE vat_status_history SET status = ?`, vatStatus)
 			return err
 		}); err != nil {
 			t.Fatal(err)

@@ -211,6 +211,12 @@ async function doBuild() {
   buildOpen.value = false
   if (buildForm.value.save) {
     notify('工资单已生成（草稿），请核对后再生成凭证', 'success')
+    // ★ 级联警告必须见光：上游重算会联动改后续月份的工资单与凭证，
+    // 改不动的（凭证已过账、期间未启用）都在这里点名 ——
+    // 悄悄吞掉等于让用户拿着旧数去结账。
+    for (const w of (r.data.cascadeWarnings || [])) {
+      notify(`级联提示：${w}`, 'warn')
+    }
     await load()
   }
 }

@@ -935,9 +935,10 @@ func (s *Service) migrateLegacyFilesDir(ctx context.Context) {
 	if st, err := os.Stat(legacy); err != nil || !st.IsDir() {
 		return
 	}
-	rows, err := s.db.SQL().QueryContext(ctx, `
-		SELECT sha256 FROM attachment
-		UNION SELECT sha256 FROM attachment_v2`)
+	// ★ 只查 attachment：0013 迁移把 attachment_v2 改名回 attachment，
+	// 两张表名同时出现在 UNION 里会因后者不存在而整句失败。
+	rows, err := s.db.SQL().QueryContext(ctx,
+		`SELECT sha256 FROM attachment`)
 	if err != nil {
 		return
 	}

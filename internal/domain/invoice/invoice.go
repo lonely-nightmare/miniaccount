@@ -301,7 +301,7 @@ type Summary struct {
 	AmountExTax money.Money
 	TaxAmount   money.Money
 	TotalAmount money.Money
-	// DeductibleTax 是可抵扣税额（仅进项专票）。
+	// DeductibleTax 是可抵扣税额（仅已认证/已入账的进项专票）。
 	DeductibleTax money.Money
 }
 
@@ -316,7 +316,12 @@ func Summarize(invs []*Invoice) Summary {
 		s.AmountExTax = s.AmountExTax.Add(inv.AmountExTax)
 		s.TaxAmount = s.TaxAmount.Add(inv.TaxAmount)
 		s.TotalAmount = s.TotalAmount.Add(inv.TotalAmount)
-		s.DeductibleTax = s.DeductibleTax.Add(inv.DeductibleTax())
+		// ★ 可抵扣只对「已认证/已入账」的票成立：
+		// 未认证的专票不能抵扣（见 PostInvoice 认证门），
+		// 汇总里照票面税额全算上是对申报口径的误导。
+		if inv.Status == StatusVerified || inv.Status == StatusBooked {
+			s.DeductibleTax = s.DeductibleTax.Add(inv.DeductibleTax())
+		}
 	}
 	return s
 }
