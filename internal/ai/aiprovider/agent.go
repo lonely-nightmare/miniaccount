@@ -161,6 +161,12 @@ type Agent struct {
 	Provider Provider
 	Tools    *ToolSet
 	Options  AgentOptions
+	// Privacy 是发往模型前的脱敏策略，作用于**工具结果**。
+	//
+	// ★ 提示词（system/user）由调用方各自脱敏，但工具结果是
+	// 在循环内部追加进历史的：工资试算、明细账、报表都是
+	// 数据库原文，不脱敏等于把整本账原样发给云端。
+	Privacy Privacy
 }
 
 // ErrNoFinalAnswer 表示轮数用尽仍未拿到最终答案。
@@ -292,10 +298,15 @@ func (a *Agent) RunConversation(ctx context.Context, history []Message) (*AgentR
 			out, terr := tool.Run(ctx, rawOrEmpty(tc.Arguments))
 			if terr != nil {
 				rec.Err = terr.Error()
-				history = append(history, toolResultMessage(tc.ID, toolErrorText(terr.Error())))
+				history = append(history,
+					toolResultMessage(tc.ID, toolErrorText(terr.Error())))
 			} else {
 				rec.Result = out
-				history = append(history, toolResultMessage(tc.ID, out))
+				// ★ 工具结果是账套原文（工资明细、逐笔分录、报表），
+				// 进历史前必须先过脱敏 —— 云端 provider 不该
+				// 拿到未经处理的银行账号与证照号。
+				history = append(history,
+					toolResultMessage(tc.ID, a.Privacy.Apply(out)))
 			}
 			res.ToolCalls = append(res.ToolCalls, rec)
 		}
@@ -435,6 +446,35 @@ func toolErrorText(msg string) string {
 
 func toolResultMessage(id, content string) Message {
 	return Message{Role: "tool", Content: content, ToolCallID: id}
+}
+
+// TrimHistory 把对话历史截到 system 消息 + 最近 keep 条。
+//
+// ★ 会计会话的历史是无界增长的：每说一句话都带着全部历史
+// 重发一遍。聊到三四十轮时，单次请求的 token 会变成几十倍 ——
+// 对云端计费与本地上下文窗口都是失控。保留最早一条 system
+// （那里是规则与账套上下文），再留最近的对话。
+func TrimHistory(msgs []Message, keep int) []Message {
+	if keep <= 0 {
+		keep = 30
+	}
+	var sys []Message
+	rest := msgs
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		sys = msgs[:1]
+		rest = msgs[1:]
+	}
+	if len(rest) <= keep {
+		return msgs
+	}
+	// 截断点不能落在「assistant+tool_calls 与其 tool 结果」
+	// 中间 —— 那是协议违规。向前找一条非 tool 消息作起点。
+	cut := len(rest) - keep
+	for cut > 0 && rest[cut].Role == "tool" {
+		cut--
+	}
+	out := append(append([]Message(nil), sys...), rest[cut:]...)
+	return sanitizeHistory(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +664,11 @@ func FindSimilarVouchersTool(p HistoryProvider) Tool {
 			limit := args.Limit
 			if limit <= 0 {
 				limit = 3
+			}
+			// ★ 上限必须有：模型要多少给它多少，一张凭证的
+			// 全部分录都回灌，token 账单会失控。
+			if limit > 10 {
+				limit = 10
 			}
 			ex, err := p.Similar(ctx, args.Text, args.Counterparty, args.Amount, limit)
 			if err != nil {

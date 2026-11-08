@@ -17,6 +17,7 @@
 package aiprovider
 
 import (
+	"net/url"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -177,9 +178,31 @@ func NewOpenAICompat(o Options) (*OpenAICompat, error) {
 	if strings.TrimSpace(o.Model) == "" {
 		return nil, fmt.Errorf("%w: Model 为空", ErrNoProvider)
 	}
+	// ★ BaseURL 必须解析出 http/https + host：
+	//
+	//  1. scheme 不是 http(s)（file://、javascript:）会在发请求时
+	//     变成非预期行为 —— 恶意 .mabak 可以注入这种 provider；
+	//  2. 带密钥却走 http 明文：Bearer token 直接上公网，
+	//     等于把 API key 贴给所有中间设备。本机 http 放行
+	//     （127.0.0.1 的密钥不出网卡）。
+	u, err := url.Parse(o.BaseURL)
+	if err != nil || u.Host == "" ||
+		(u.Scheme != "http" && u.Scheme != "https") {
+		return nil, fmt.Errorf("%w: BaseURL 非法 %q（应为 http(s):// 开头）",
+			ErrNoProvider, o.BaseURL)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("%w: BaseURL 不应带账号密码（密钥走 APIKey 字段）",
+			ErrNoProvider)
+	}
 	kind := o.Kind
 	if kind == "" {
 		kind = inferKind(o.BaseURL)
+	}
+	if o.APIKey != "" && u.Scheme == "http" && kind != KindLocal &&
+		inferKind(o.BaseURL) != KindLocal {
+		return nil, fmt.Errorf(
+			"%w: 云端服务必须 https —— http 会把 API 密钥明文发到公网", ErrNoProvider)
 	}
 	timeout := o.Timeout
 	if timeout <= 0 {

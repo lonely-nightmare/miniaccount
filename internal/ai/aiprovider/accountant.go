@@ -226,7 +226,8 @@ func (a *Accountant) Reply(ctx context.Context, history []Message) (*AccountantR
 		tools = NewToolSet(AskUserTool())
 	}
 
-	agent := &Agent{Provider: a.Provider, Tools: tools, Options: opts}
+	agent := &Agent{Provider: a.Provider, Tools: tools, Options: opts,
+		Privacy: DefaultPrivacy(a.Provider.Kind())}
 	res, out, err := agent.RunConversation(ctx, history)
 	reply := &AccountantReply{Rounds: res.Rounds}
 	reply.Raw = res.Content

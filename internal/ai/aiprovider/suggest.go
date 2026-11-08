@@ -249,7 +249,7 @@ func (s *Suggester) Suggest(ctx context.Context, in Input, targetType string,
 	)
 	if s.Tools != nil && s.Tools.Len() > 0 {
 		agent := &Agent{
-			Provider: s.Provider, Tools: s.Tools,
+			Provider: s.Provider, Tools: s.Tools, Privacy: s.Privacy,
 			Options: AgentOptions{
 				MaxRounds: s.MaxToolRounds, MaxTokens: s.maxTokens(),
 				Temperature: s.Temperature,
