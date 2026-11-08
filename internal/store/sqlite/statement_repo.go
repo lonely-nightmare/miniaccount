@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 
+	"miniaccount/internal/domain/account"
 	"miniaccount/internal/domain/calendar"
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/statement"
@@ -44,12 +45,6 @@ func (r *StatementRepo) ContactInfoOf(ctx context.Context, id int64) (*ContactIn
 func (r *StatementRepo) BuildStatement(ctx context.Context, contactID int64,
 	from, to calendar.Date, accountPrefix string) (*statement.Statement, []statement.Entry, error) {
 
-	// 期初余额 = 期间之前的全部发生额
-	opening, err := r.contactBalanceBefore(ctx, contactID, from, accountPrefix)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	// 期间内的发生额
 	sqlText := `
 		SELECT a.code, le.biz_date, le.debit, le.credit, le.summary,
@@ -66,41 +61,58 @@ func (r *StatementRepo) BuildStatement(ctx context.Context, contactID int64,
 	}
 	sqlText += ` ORDER BY le.biz_date, v.no, le.id`
 
-	rows, err := r.db.sql.QueryContext(ctx, sqlText, args...)
-	if err != nil {
-		return nil, nil, translateErr(err)
-	}
-	defer rows.Close()
-
-	var entries []statement.Entry
-	names := map[string]string{}
-	for rows.Next() {
-		var (
-			code, bizDate, summary, voucherNo string
-			debit, credit                     int64
-		)
-		if err := rows.Scan(&code, &bizDate, &debit, &credit, &summary, &voucherNo); err != nil {
-			return nil, nil, err
+	var (
+		opening money.Money
+		entries []statement.Entry
+		tree    *account.Tree
+	)
+	// ★ 期初余额与期间分录共用一份快照：
+	// 两笔查询之间过账一张期初日之前的凭证，会出现
+	// 「期初不含它、明细里也没有它」的丢钱对账单 ——
+	// 而这张单子是要发给客户盖章确认的。
+	err := r.db.Read(ctx, func(q Querier) error {
+		// 期初余额 = 期间之前的全部发生额
+		var e error
+		if opening, e = r.contactBalanceBefore(ctx, q, contactID, from, accountPrefix); e != nil {
+			return e
 		}
-		d, err := calendar.Parse(bizDate)
+		rows, err := q.Query(ctx, sqlText, args...)
 		if err != nil {
-			return nil, nil, err
+			return translateErr(err)
 		}
-		entries = append(entries, statement.Entry{
-			AccountCode: code, Date: d,
-			Debit: money.Money(debit), Credit: money.Money(credit),
-			Summary: summary, VoucherNo: voucherNo,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
-	}
-	rows.Close() // ★ 单连接池：先关 rows 再继续查询
-
-	tree, err := r.db.Accounts().Tree(ctx)
+		for rows.Next() {
+			var (
+				code, bizDate, summary, voucherNo string
+				debit, credit                     int64
+			)
+			if err := rows.Scan(&code, &bizDate, &debit, &credit, &summary, &voucherNo); err != nil {
+				rows.Close()
+				return err
+			}
+			d, err := calendar.Parse(bizDate)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			entries = append(entries, statement.Entry{
+				AccountCode: code, Date: d,
+				Debit: money.Money(debit), Credit: money.Money(credit),
+				Summary: summary, VoucherNo: voucherNo,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close() // ★ 单连接池：先关 rows 再继续查询
+		tree, e = r.db.Accounts().TreeQ(ctx, q)
+		return e
+	})
 	if err != nil {
 		return nil, nil, err
 	}
+
+	names := map[string]string{}
 	for _, e := range entries {
 		if _, ok := names[e.AccountCode]; ok {
 			continue
@@ -133,7 +145,7 @@ func (r *StatementRepo) BuildStatement(ctx context.Context, contactID int64,
 }
 
 // contactBalanceBefore 返回某往来单位在给定日期之前的净额（借−贷）。
-func (r *StatementRepo) contactBalanceBefore(ctx context.Context, contactID int64,
+func (r *StatementRepo) contactBalanceBefore(ctx context.Context, q Querier, contactID int64,
 	before calendar.Date, accountPrefix string) (money.Money, error) {
 
 	sqlText := `
@@ -148,7 +160,7 @@ func (r *StatementRepo) contactBalanceBefore(ctx context.Context, contactID int6
 	}
 
 	var net int64
-	if err := r.db.sql.QueryRowContext(ctx, sqlText, args...).Scan(&net); err != nil {
+	if err := q.QueryRow(ctx, sqlText, args...).Scan(&net); err != nil {
 		return 0, translateErr(err)
 	}
 	return money.Money(net), nil

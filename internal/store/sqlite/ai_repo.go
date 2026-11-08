@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -45,7 +46,11 @@ type AIProviderConfig struct {
 	Kind      string `json:"kind"` // local | cloud
 	BaseURL   string `json:"baseUrl"`
 	Model     string `json:"model"`
-	APIKey    string `json:"apiKey"`
+	// APIKey 是**入参**：保存时用。列表与配置下发时会被清空，
+	// 改用 HasKey 告诉界面「这条配置有没有密钥」。
+	APIKey string `json:"apiKey,omitempty"`
+	// HasKey 为真表示库里有密钥（界面上显示「已配置」）。
+	HasKey    bool   `json:"hasKey"`
 	Enabled   bool   `json:"enabled"`
 	IsDefault bool   `json:"isDefault"`
 	TimeoutMS int    `json:"timeoutMs"`
@@ -72,12 +77,22 @@ func (r *AIRepo) SaveProvider(ctx context.Context, c *AIProviderConfig) (int64, 
 	if c.Kind != string(aiprovider.KindLocal) && c.Kind != string(aiprovider.KindCloud) {
 		return 0, fmt.Errorf("ai: 部署形态必须是 local 或 cloud")
 	}
+	// ★ 地址在保存时就校验，别等调用时才失败：
+	// 恶意备份可以恢复出一条 file:// 或带账号密码的 provider，
+	// 保存路径是唯一能把这类脏东西挡在库外的门。
+	u, err := url.Parse(strings.TrimSpace(c.BaseURL))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return 0, fmt.Errorf("ai: 服务地址非法 %q（应为 http(s):// 开头）", c.BaseURL)
+	}
+	if u.User != nil {
+		return 0, fmt.Errorf("ai: 服务地址不应带账号密码（密钥走 API 密钥字段）")
+	}
 	if c.TimeoutMS <= 0 {
 		c.TimeoutMS = int(aiprovider.DefaultTimeout / time.Millisecond)
 	}
 
 	var id int64
-	err := r.db.WithTx(ctx, func(tx *Tx) error {
+	err = r.db.WithTx(ctx, func(tx *Tx) error {
 		if c.IsDefault {
 			if _, err := tx.Exec(ctx,
 				`UPDATE ai_provider SET is_default = 0 WHERE is_default = 1`); err != nil {
@@ -98,12 +113,16 @@ func (r *AIRepo) SaveProvider(ctx context.Context, c *AIProviderConfig) (int64, 
 			id, err = res.LastInsertId()
 			return err
 		}
+		// ★ 更新时空 api_key 表示「保留旧密钥」：
+		// 列表下发的是脱敏配置，界面回传时 apiKey 是空的；
+		// 直接覆盖会把密钥清空，用户改个备注就把连接改断了。
 		res, err := tx.Exec(ctx, `
 			UPDATE ai_provider SET name = ?, kind = ?, base_url = ?, model = ?,
-				api_key = ?, enabled = ?, is_default = ?, timeout_ms = ?,
+				api_key = COALESCE(NULLIF(?, ''), api_key),
+				enabled = ?, is_default = ?, timeout_ms = ?,
 				remark = ?, updated_at = ?
 			 WHERE id = ?`,
-			c.Name, c.Kind, c.BaseURL, c.Model, nullString(&c.APIKey),
+			c.Name, c.Kind, c.BaseURL, c.Model, c.APIKey,
 			boolInt(c.Enabled), boolInt(c.IsDefault), c.TimeoutMS, c.Remark,
 			nowString(), c.ID)
 		if err != nil {

@@ -194,14 +194,28 @@ func legacyTaxType(vatStatus string) string {
 
 // Update 更新账套信息（不改启用期间 —— 启用期间一经确定不允许修改，
 // 否则已记账的凭证会落在期间表之外）。
+//
+// ★ vat_status / enterprise_scale 必须一起写：
+// Create 负责写、Get 负责读、Update 原来不写 —— 三个入口
+// 对同一组字段各管一段，任何「改单位信息」的调用都会把
+// 纳税人身份与企业规模悄悄抹空。与 Create 同样保持
+// tax_type 历史字段同步。
 func (r *BookRepo) Update(ctx context.Context, b *Book) error {
+	taxType := b.TaxType
+	if b.VATStatus != "" {
+		taxType = legacyTaxType(b.VATStatus)
+	}
 	res, err := r.db.sql.ExecContext(ctx, `
 		UPDATE book SET company_name = ?, credit_code = ?, legal_person = ?,
 			address = ?, phone = ?, email = ?, bank_name = ?, bank_account = ?,
-			tax_type = ?, setup_complete = ?, updated_at = ?
+			tax_type = ?, enterprise_scale = ?,
+			vat_status = ?, vat_status_effective_from = ?,
+			setup_complete = ?, updated_at = ?
 		 WHERE id = 1`,
 		b.CompanyName, b.CreditCode, b.LegalPerson, b.Address, b.Phone, b.Email,
-		b.BankName, b.BankAccount, b.TaxType, boolInt(b.SetupComplete), nowString())
+		b.BankName, b.BankAccount, taxType, b.EnterpriseScale,
+		b.VATStatus, b.VATStatusEffectiveFrom,
+		boolInt(b.SetupComplete), nowString())
 	if err != nil {
 		return translateErr(err)
 	}

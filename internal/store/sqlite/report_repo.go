@@ -10,6 +10,7 @@ import (
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
 	"miniaccount/internal/domain/report"
+	"miniaccount/internal/domain/voucher"
 )
 
 // ReportRepo 提供报表取数。
@@ -57,14 +58,26 @@ var _ report.Resolver = (*balanceResolver)(nil)
 // asOf 是资产负债表日（含当天）。若 fs 非空，会额外计算「年初余额」口径 ——
 // 但年初余额是另一个 Resolver，由调用方分别 Compute 两次。
 func (r *ReportRepo) BalanceSheetResolver(ctx context.Context, asOf calendar.Date) (report.Resolver, error) {
-	return r.resolver(ctx, calendar.Date{}, asOf, modeBalance)
+	var out report.Resolver
+	err := r.db.Read(ctx, func(q Querier) error {
+		var e error
+		out, e = r.resolver(ctx, q, calendar.Date{}, asOf, modeBalance)
+		return e
+	})
+	return out, err
 }
 
 // IncomeStatementResolver 构造利润表用的取数器。
 //
 //	from..to 为空区间时表示「本年累计」（从年初到 to）。
 func (r *ReportRepo) IncomeStatementResolver(ctx context.Context, from, to calendar.Date) (report.Resolver, error) {
-	return r.resolver(ctx, from, to, modeMovement)
+	var out report.Resolver
+	err := r.db.Read(ctx, func(q Querier) error {
+		var e error
+		out, e = r.resolver(ctx, q, from, to, modeMovement)
+		return e
+	})
+	return out, err
 }
 
 type resolverMode int
@@ -76,12 +89,17 @@ const (
 
 // resolver 是两种口径共用的构造逻辑。
 //
+// ★ 全部查询都经 q 发出 —— 调用方把它放进 db.Read 的只读事务，
+// 科目树与总账取数就看到同一份快照。裸跑 autocommit 时，
+// 两条 SELECT 之间挤进一笔过账，资产负债表会刚好差掉那笔数，
+// 而报表本身浑然不觉。
+//
 // 关键点：Value 对资产负债表意味着「期末余额」，对利润表意味着「本期发生额」。
 // 公式语言不变，只是换了个 Resolver —— 这正是把取数抽象成接口的价值。
-func (r *ReportRepo) resolver(ctx context.Context, from, to calendar.Date,
+func (r *ReportRepo) resolver(ctx context.Context, q Querier, from, to calendar.Date,
 	mode resolverMode) (report.Resolver, error) {
 
-	tree, err := r.db.Accounts().Tree(ctx)
+	tree, err := r.db.Accounts().TreeQ(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -98,9 +116,9 @@ func (r *ReportRepo) resolver(ctx context.Context, from, to calendar.Date,
 
 	switch mode {
 	case modeBalance:
-		err = r.fillBalances(ctx, tree, to, out)
+		err = r.fillBalances(ctx, q, tree, to, out)
 	case modeMovement:
-		err = r.fillMovements(ctx, tree, from, to, out)
+		err = r.fillMovements(ctx, q, tree, from, to, out)
 	}
 	if err != nil {
 		return nil, err
@@ -120,11 +138,11 @@ func (r *ReportRepo) resolver(ctx context.Context, from, to calendar.Date,
 }
 
 // fillBalances 填充「期末余额」及按方向分解的明细余额。
-func (r *ReportRepo) fillBalances(ctx context.Context, tree *account.Tree,
+func (r *ReportRepo) fillBalances(ctx context.Context, q Querier, tree *account.Tree,
 	asOf calendar.Date, out *balanceResolver) error {
 
 	// 1) 按「叶子科目 × 往来单位」算原始净额
-	units, err := r.unitBalances(ctx, "", asOf)
+	units, err := r.unitBalances(ctx, q, "", asOf)
 	if err != nil {
 		return err
 	}
@@ -159,15 +177,28 @@ func (r *ReportRepo) fillBalances(ctx context.Context, tree *account.Tree,
 // 损益类科目按发生额取数而非余额，是因为它们年中会被结转到本年利润，
 // 按余额取数会得到 0 或错数。这也正是官方利润表编制说明的要求：
 // 「本项目应根据『主营业务收入』科目的**发生额**合计填列」。
-func (r *ReportRepo) fillMovements(ctx context.Context, tree *account.Tree,
+//
+// ★ 必须排除期末结转凭证（source='closing'）：
+//
+// 结转分录把每个损益科目的期间净发生额精确转平 —— 若一并统计，
+// 已结账月份的「本月数」全变成 0，「本年累计」漏掉全部已结月份。
+// 反结账生成的红字冲销凭证同样继承 source='closing'，
+// 一并被排除后，反结账期间的发生额也恢复为业务口径。
+//
+// 注意这只影响「发生额」口径（利润表）；余额口径（资产负债表、
+// 余额表）不过滤，因为结转分录本身是真实的总账记录。
+func (r *ReportRepo) fillMovements(ctx context.Context, q Querier, tree *account.Tree,
 	from, to calendar.Date, out *balanceResolver) error {
 
-	rows, err := r.db.sql.QueryContext(ctx, `
+	rows, err := q.Query(ctx, `
 		SELECT a.code, SUM(le.debit), SUM(le.credit)
 		  FROM ledger_entry le
 		  JOIN account a ON a.id = le.account_id
+		  JOIN voucher v ON v.id = le.voucher_id
 		 WHERE le.biz_date BETWEEN ? AND ?
-		 GROUP BY a.code`, from.String(), to.String())
+		   AND v.source <> ?
+		 GROUP BY a.code`, from.String(), to.String(),
+		string(voucher.SourceClosing))
 	if err != nil {
 		return translateErr(err)
 	}
@@ -224,8 +255,8 @@ func natural(net money.Money, dir account.BalanceDir) money.Money {
 // 分解粒度之所以到往来单位：采用辅助核算时，同一个应收账款科目下
 // 客户甲可能挂借方、客户乙挂贷方，只看科目总额无法完成
 // 中国报表要求的「按明细方向分析填列」。
-func (r *ReportRepo) unitBalances(ctx context.Context, _ string, asOf calendar.Date) ([]report.UnitBalance, error) {
-	rows, err := r.db.sql.QueryContext(ctx, `
+func (r *ReportRepo) unitBalances(ctx context.Context, q Querier, _ string, asOf calendar.Date) ([]report.UnitBalance, error) {
+	rows, err := q.Query(ctx, `
 		SELECT a.code, le.contact_id, SUM(le.debit), SUM(le.credit)
 		  FROM ledger_entry le
 		  JOIN account a ON a.id = le.account_id
@@ -265,25 +296,35 @@ func (r *ReportRepo) unitBalances(ctx context.Context, _ string, asOf calendar.D
 // 与财务报表不同，余额表是「按科目列示」的原始数据，不做分析填列 ——
 // 它恰恰是会计用来核对财务报表的依据。
 func (r *ReportRepo) TrialBalanceReport(ctx context.Context, k period.Key) (*report.BalanceReport, error) {
-	tree, err := r.db.Accounts().Tree(ctx)
-	if err != nil {
-		return nil, err
-	}
 	rng := report.Range(k)
 	dayBefore := rng.From.AddDays(-1)
 
-	// 期初余额（截至上期最后一天）
-	opening, err := r.balancesUpTo(ctx, dayBefore)
-	if err != nil {
-		return nil, err
-	}
-	// 本期发生额
-	period, err := r.movementsBetween(ctx, rng.From, rng.To)
-	if err != nil {
-		return nil, err
-	}
-	// 期末余额
-	closing, err := r.balancesUpTo(ctx, rng.To)
+	var (
+		tree    *account.Tree
+		opening map[string]money.Money
+		periodM map[string]movement
+		closing map[string]money.Money
+	)
+	// ★ 一个只读事务包住科目树与三段余额 —— 期初+发生额+期末
+	// 必须来自同一快照，否则「期初+本期≠期末」这种一眼假的
+	// 结果会出现在正式报表上。
+	err := r.db.Read(ctx, func(q Querier) error {
+		var e error
+		if tree, e = r.db.Accounts().TreeQ(ctx, q); e != nil {
+			return e
+		}
+		// 期初余额（截至上期最后一天）
+		if opening, e = r.balancesUpTo(ctx, q, dayBefore); e != nil {
+			return e
+		}
+		// 本期发生额
+		if periodM, e = r.movementsBetween(ctx, q, rng.From, rng.To); e != nil {
+			return e
+		}
+		// 期末余额
+		closing, e = r.balancesUpTo(ctx, q, rng.To)
+		return e
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +359,7 @@ func (r *ReportRepo) TrialBalanceReport(ctx context.Context, k period.Key) (*rep
 		cbD, cbC := report.SplitBalance(sumBalance(closing, a.Code))
 		var mv movement
 		for _, c := range sub[a.Code] {
-			if m, ok := period[c]; ok {
+			if m, ok := periodM[c]; ok {
 				mv.debit = mv.debit.Add(m.debit)
 				mv.credit = mv.credit.Add(m.credit)
 			}
@@ -344,8 +385,8 @@ func (r *ReportRepo) TrialBalanceReport(ctx context.Context, k period.Key) (*rep
 type movement struct{ debit, credit money.Money }
 
 // balancesUpTo 返回截至某日（含）各科目的原始净余额（借−贷）。
-func (r *ReportRepo) balancesUpTo(ctx context.Context, asOf calendar.Date) (map[string]money.Money, error) {
-	rows, err := r.db.sql.QueryContext(ctx, `
+func (r *ReportRepo) balancesUpTo(ctx context.Context, q Querier, asOf calendar.Date) (map[string]money.Money, error) {
+	rows, err := q.Query(ctx, `
 		SELECT a.code, SUM(le.debit) - SUM(le.credit)
 		  FROM ledger_entry le
 		  JOIN account a ON a.id = le.account_id
@@ -368,8 +409,8 @@ func (r *ReportRepo) balancesUpTo(ctx context.Context, asOf calendar.Date) (map[
 }
 
 // movementsBetween 返回某区间各科目的借贷发生额。
-func (r *ReportRepo) movementsBetween(ctx context.Context, from, to calendar.Date) (map[string]movement, error) {
-	rows, err := r.db.sql.QueryContext(ctx, `
+func (r *ReportRepo) movementsBetween(ctx context.Context, q Querier, from, to calendar.Date) (map[string]movement, error) {
+	rows, err := q.Query(ctx, `
 		SELECT a.code, SUM(le.debit), SUM(le.credit)
 		  FROM ledger_entry le
 		  JOIN account a ON a.id = le.account_id
@@ -405,12 +446,12 @@ func (r *ReportRepo) ContactBalances(ctx context.Context, k period.Key,
 	rng := report.Range(k)
 	dayBefore := rng.From.AddDays(-1)
 
-	const q = `
+	const qText = `
 		SELECT c.id, c.name, c.kind, a.code,
 		       COALESCE(SUM(CASE WHEN le.biz_date <=  ?  THEN le.debit - le.credit ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN le.biz_date >=  ? AND le.biz_date <=  ? THEN le.debit  ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN le.biz_date >=  ? AND le.biz_date <=  ? THEN le.credit ELSE 0 END), 0),
-		       COALESCE(SUM(le.debit - le.credit), 0)
+		       COALESCE(SUM(CASE WHEN le.biz_date <=  ?  THEN le.debit - le.credit ELSE 0 END), 0)
 		  FROM ledger_entry le
 		  JOIN account a ON a.id = le.account_id
 		  JOIN contact c ON c.id = le.contact_id
@@ -419,33 +460,41 @@ func (r *ReportRepo) ContactBalances(ctx context.Context, k period.Key,
 		 GROUP BY c.id, a.code
 		 ORDER BY a.code, c.name`
 
-	rows, err := r.db.sql.QueryContext(ctx, q,
-		dayBefore.String(),
-		rng.From.String(), rng.To.String(),
-		rng.From.String(), rng.To.String(),
-		accountPrefix)
-	if err != nil {
-		return nil, translateErr(err)
-	}
-	defer rows.Close()
-
+	// ★ 期末余额同样要有日期上限：期间之后的往来业务不该计入
+	// 本期的「期末余额」，否则期后录入的凭证会回头改变已出报表的数字。
 	var out []report.ContactBalanceRow
-	for rows.Next() {
-		var (
-			row                    report.ContactBalanceRow
-			opening, d, c, closing int64
-		)
-		if err := rows.Scan(&row.ContactID, &row.ContactName, &row.ContactKind,
-			&row.AccountCode, &opening, &d, &c, &closing); err != nil {
-			return nil, err
+	err := r.db.Read(ctx, func(q Querier) error {
+		rows, err := q.Query(ctx, qText,
+			dayBefore.String(),
+			rng.From.String(), rng.To.String(),
+			rng.From.String(), rng.To.String(),
+			rng.To.String(),
+			accountPrefix)
+		if err != nil {
+			return translateErr(err)
 		}
-		row.Opening = money.Money(opening)
-		row.Debit = money.Money(d)
-		row.Credit = money.Money(c)
-		row.Closing = money.Money(closing)
-		out = append(out, row)
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				row                    report.ContactBalanceRow
+				opening, d, c, closing int64
+			)
+			if err := rows.Scan(&row.ContactID, &row.ContactName, &row.ContactKind,
+				&row.AccountCode, &opening, &d, &c, &closing); err != nil {
+				return err
+			}
+			row.Opening = money.Money(opening)
+			row.Debit = money.Money(d)
+			row.Credit = money.Money(c)
+			row.Closing = money.Money(closing)
+			out = append(out, row)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -459,12 +508,25 @@ func (r *ReportRepo) ContactBalances(ctx context.Context, k period.Key,
 func (r *ReportRepo) BuildBalanceSheet(ctx context.Context, asOf calendar.Date) (
 	closing, opening *report.Definition, issues []report.CheckIssue, err error) {
 
-	// 期末
-	closing, err = report.LoadBalanceSheet()
-	if err != nil {
+	// ★ 期末与年初两个取数器共用一份快照：资产负债表的「期末」
+	// 与「年初」列若分属两个瞬间，期间正好发生的一笔业务会让
+	// 两列各差一半 —— 而勾稽校验检查的是各列内部，发现不了。
+	yearStart, _ := calendar.New(asOf.Year, 1, 1)
+	var rc, ro report.Resolver
+	if err := r.db.Read(ctx, func(q Querier) error {
+		var e error
+		if rc, e = r.resolver(ctx, q, calendar.Date{}, asOf, modeBalance); e != nil {
+			return e
+		}
+		ro, e = r.resolver(ctx, q, calendar.Date{},
+			yearStart.AddDays(-1), modeBalance)
+		return e
+	}); err != nil {
 		return nil, nil, nil, err
 	}
-	rc, err := r.BalanceSheetResolver(ctx, asOf)
+
+	// 期末
+	closing, err = report.LoadBalanceSheet()
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -475,11 +537,6 @@ func (r *ReportRepo) BuildBalanceSheet(ctx context.Context, asOf calendar.Date) 
 	// 年初余额 = 上年末的期末余额（官方原文：「应根据上年末资产负债表
 	// 『期末余额』栏内所列数字填列」）
 	opening, err = report.LoadBalanceSheet()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	yearStart, _ := calendar.New(asOf.Year, 1, 1)
-	ro, err := r.BalanceSheetResolver(ctx, yearStart.AddDays(-1))
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -502,11 +559,22 @@ func (r *ReportRepo) BuildIncomeStatement(ctx context.Context, k period.Key) (
 		return nil, nil, nil, fmt.Errorf("sqlite: 年度起始日: %w", err)
 	}
 
-	current, err = report.LoadIncomeStatement()
-	if err != nil {
+	// ★ 本月数与本年累计共用一份快照：否则两次取数之间过账一笔，
+	// 「本月 + 之前各月 ≠ 本年累计」就成立了 —— 而它是
+	// 所得税预缴取数的来源，错的是税。
+	var rc, ry report.Resolver
+	if err := r.db.Read(ctx, func(q Querier) error {
+		var e error
+		if rc, e = r.resolver(ctx, q, rng.From, rng.To, modeMovement); e != nil {
+			return e
+		}
+		ry, e = r.resolver(ctx, q, yearStart, rng.To, modeMovement)
+		return e
+	}); err != nil {
 		return nil, nil, nil, err
 	}
-	rc, err := r.IncomeStatementResolver(ctx, rng.From, rng.To)
+
+	current, err = report.LoadIncomeStatement()
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -515,10 +583,6 @@ func (r *ReportRepo) BuildIncomeStatement(ctx context.Context, k period.Key) (
 	}
 
 	ytd, err = report.LoadIncomeStatement()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	ry, err := r.IncomeStatementResolver(ctx, yearStart, rng.To)
 	if err != nil {
 		return nil, nil, nil, err
 	}

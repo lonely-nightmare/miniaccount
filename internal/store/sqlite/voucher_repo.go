@@ -973,6 +973,67 @@ func (r *PeriodRepo) SetStatus(ctx context.Context, tx *Tx, k period.Key,
 	return nil
 }
 
+// EnsureNextOpen 在 k 结账后启用它的下一期间。
+//
+// # 为什么必须在事务内、结账这一步里做
+//
+// 领域层 Calendar.Close 有「关当前期 → 启用下一期」的动作，
+// 持久化实现少了它的话，结完最后一个已启用期间后，
+// 所有期间都停在 future/closed：存草稿、过账、结账全部要求
+// 期间为 open，账簿就此永久冻结 —— 这是已实锤过的阻断缺陷。
+//
+// # 跨年边界
+//
+// 期间表只在建账时生成到建账年度的 12 月。
+// 因此当 k.Next() 的行不存在时（必然落在 1 月），
+// 先把该年度的 12 行期间以 future 补出来，再启用其中第一期。
+// INSERT OR IGNORE 保底：即使期间表被外部工具加过零散的行，
+// 也不会因为主键冲突把整个结账事务拖回滚。
+//
+// 只把「紧邻的下一期」放开：更后面的期间保持 future，
+// 维持「任何时刻最多一个可记账期间」的约束。
+func (r *PeriodRepo) EnsureNextOpen(ctx context.Context, tx *Tx, k period.Key) error {
+	nk := k.Next()
+	var st string
+	err := tx.QueryRow(ctx,
+		`SELECT status FROM period WHERE year = ? AND month = ?`,
+		nk.Year, nk.Month).Scan(&st)
+	switch {
+	case err == sql.ErrNoRows:
+		// 期间表还没有生到 nk —— 只可能发生在年度边界
+		// （年内各月在建账时已整体生成）。补齐整年期间。
+		// 年中缺行属于数据异常：此时补出「之前的月份为 future」
+		// 会造成永远无法顺序结账的死锁，宁可明确报错。
+		if nk.Month != 1 {
+			return fmt.Errorf("%w: 期间表缺少 %s（数据异常，请检查期间表）",
+				period.ErrPeriodNotFound, nk)
+		}
+		for m := 1; m <= 12; m++ {
+			kk := period.NewKey(nk.Year, m)
+			from, _ := calendar.New(kk.Year, kk.Month, 1)
+			to, _ := calendar.New(kk.Year, kk.Month,
+				calendar.DaysInMonth(kk.Year, kk.Month))
+			if _, err := tx.Exec(ctx, `
+				INSERT OR IGNORE INTO period
+					(year, month, start_date, end_date, status, closed_by)
+				VALUES (?,?,?,?,?,'')`,
+				kk.Year, kk.Month, from.String(), to.String(),
+				string(period.StatusFuture)); err != nil {
+				return err
+			}
+		}
+		st = string(period.StatusFuture)
+	case err != nil:
+		return translateErr(err)
+	}
+	if st == string(period.StatusFuture) {
+		return r.SetStatus(ctx, tx, nk, period.StatusOpen, "", nil)
+	}
+	// 已经是 open/closed：不动 —— 后者理论上不该发生（顺序结账保证
+	// 紧邻期间不可能先于本期间关闭），但宁可不碰也不去矫正。
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // 时间辅助
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 
+	"miniaccount/internal/domain/account"
 	"miniaccount/internal/domain/aging"
 	"miniaccount/internal/domain/calendar"
 	"miniaccount/internal/domain/money"
@@ -42,63 +43,74 @@ func (r *AgingRepo) BuildAging(ctx context.Context, asOf calendar.Date,
 	}
 	sqlText += ` ORDER BY le.contact_id, a.code, le.biz_date, le.id`
 
-	rows, err := r.db.sql.QueryContext(ctx, sqlText, args...)
-	if err != nil {
-		return nil, translateErr(err)
-	}
-	defer rows.Close()
-
-	var entries []aging.Entry
-	names := map[int64]string{}
-	for rows.Next() {
-		var (
-			contactID     int64
-			code, name    string
-			bizDate       string
-			debit, credit int64
-			summary       string
-			voucherNo     string
-		)
-		if err := rows.Scan(&contactID, &code, &name, &bizDate,
-			&debit, &credit, &summary, &voucherNo); err != nil {
-			return nil, err
-		}
-		d, err := calendar.Parse(bizDate)
+	var (
+		entries []aging.Entry
+		names   = map[int64]string{}
+		tree    *account.Tree
+	)
+	// ★ 一个只读事务包住分录、往来单位与科目树：
+	// 账龄表发给客户/供应商对账，「分录归属」与「名称」分属两个瞬间
+	// 时，同一笔款会对出两个名字或漏进刚建的新档案。
+	err := r.db.Read(ctx, func(q Querier) error {
+		rows, err := q.Query(ctx, sqlText, args...)
 		if err != nil {
-			return nil, err
+			return translateErr(err)
 		}
-		entries = append(entries, aging.Entry{
-			ContactID: contactID, AccountCode: code, Date: d,
-			Debit: money.Money(debit), Credit: money.Money(credit),
-			Summary: summary, VoucherNo: voucherNo,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	rows.Close() // ★ 单连接池：先关 rows 再发下一次查询
 
-	// 往来单位名称
-	nrows, err := r.db.sql.QueryContext(ctx, `SELECT id, name FROM contact`)
-	if err != nil {
-		return nil, translateErr(err)
-	}
-	for nrows.Next() {
-		var id int64
-		var name string
-		if err := nrows.Scan(&id, &name); err != nil {
+		for rows.Next() {
+			var (
+				contactID     int64
+				code, name    string
+				bizDate       string
+				debit, credit int64
+				summary       string
+				voucherNo     string
+			)
+			if err := rows.Scan(&contactID, &code, &name, &bizDate,
+				&debit, &credit, &summary, &voucherNo); err != nil {
+				rows.Close()
+				return err
+			}
+			d, err := calendar.Parse(bizDate)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			entries = append(entries, aging.Entry{
+				ContactID: contactID, AccountCode: code, Date: d,
+				Debit: money.Money(debit), Credit: money.Money(credit),
+				Summary: summary, VoucherNo: voucherNo,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close() // ★ 单连接池：先关 rows 再发下一次查询
+
+		// 往来单位名称
+		nrows, err := q.Query(ctx, `SELECT id, name FROM contact`)
+		if err != nil {
+			return translateErr(err)
+		}
+		for nrows.Next() {
+			var id int64
+			var name string
+			if err := nrows.Scan(&id, &name); err != nil {
+				nrows.Close()
+				return err
+			}
+			names[id] = name
+		}
+		if err := nrows.Err(); err != nil {
 			nrows.Close()
-			return nil, err
+			return err
 		}
-		names[id] = name
-	}
-	if err := nrows.Err(); err != nil {
 		nrows.Close()
-		return nil, err
-	}
-	nrows.Close()
 
-	tree, err := r.db.Accounts().Tree(ctx)
+		tree, err = r.db.Accounts().TreeQ(ctx, q)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}

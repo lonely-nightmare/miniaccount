@@ -81,6 +81,34 @@ func (r *AccountRepo) TreeFrom(ctx context.Context, tx *Tx) (*account.Tree, erro
 	return account.NewTree(accts)
 }
 
+// TreeQ 在只读查询器上加载科目树。
+//
+// 报表在 db.Read 的快照事务里跑：树与总账必须来自**同一份快照**，
+// 否则「期间内新增了一个科目」会让发生额按旧树归集、
+// 叶子判断按新树校验 —— 两边各看一半。
+func (r *AccountRepo) TreeQ(ctx context.Context, q Querier) (*account.Tree, error) {
+	rows, err := q.Query(ctx, `SELECT `+accountColumns+` FROM account ORDER BY code`)
+	if err != nil {
+		return nil, translateErr(err)
+	}
+	accts, err := r.scanAccounts(ctx, querierRows{q}, rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(accts) == 0 {
+		return nil, fmt.Errorf("%w: 账套尚未初始化科目表", ErrNotFound)
+	}
+	return account.NewTree(accts)
+}
+
+// querierRows 把 Querier（Query/QueryRow）适配成 rowQuerier（QueryRowContext）。
+type querierRows struct{ q Querier }
+
+func (w querierRows) QueryRowContext(ctx context.Context, query string,
+	args ...any) *sql.Row {
+	return w.q.QueryRow(ctx, query, args...)
+}
+
 // IDsByCode 返回 编码 → id 的映射，过账时用来把编码换成外键。
 func (r *AccountRepo) IDsByCode(ctx context.Context) (map[string]int64, error) {
 	return r.idsByCodeQ(ctx, r.db.sql)

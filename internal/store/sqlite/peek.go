@@ -77,6 +77,13 @@ func PeekBook(ctx context.Context, path string) BookPeek {
 	db, err := Open(ctx, Options{Path: path, ReadOnly: true})
 	if err != nil {
 		p.Err = "打不开：" + err.Error()
+		// 只读类错误再给半句提示：文件在只读介质/目录上、或正被
+		// 另一个进程以独占方式占用时，用户看到的是一句干巴巴的
+		// 「打不开」，完全不知道该查什么。
+		if strings.Contains(err.Error(), "readonly") ||
+			strings.Contains(err.Error(), "read-only") {
+			p.Err += "（文件或所在目录可能是只读的）"
+		}
 		return p
 	}
 	defer func() { _ = db.Close() }()
@@ -86,16 +93,36 @@ func PeekBook(ctx context.Context, path string) BookPeek {
 		return p
 	}
 
+	// ★ 只选「这库实际有的列」。
+	//
+	// vat_status 等列是后加的（迁移 0010），0010 之前建的老账套
+	// 没有它们 —— 直接 SELECT 会报「no such column」，
+	// 老账套在选择器里就全被当成「不是账套」，
+	// 尽管正常打开路径能把它们迁移升级。
+	cols, err := db.columnNames(ctx, "book")
+	if err != nil {
+		p.Err = "读不出表结构：" + err.Error()
+		return p
+	}
+	pick := func(name string) string {
+		if cols[name] {
+			return name
+		}
+		return "NULL AS " + name
+	}
+
 	var (
 		name, credit, vat     sql.NullString
 		startYear, startMonth sql.NullInt64
 		setup                 sql.NullInt64
 		vouchers              int
 	)
-	err = db.sql.QueryRowContext(ctx, `
-		SELECT company_name, credit_code, vat_status, start_year, start_month,
-		       COALESCE(setup_complete, 0)
-		  FROM book WHERE id = 1`).
+	err = db.sql.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s, %s, %s, %s, %s, %s
+		  FROM book WHERE id = 1`,
+		pick("company_name"), pick("credit_code"), pick("vat_status"),
+		pick("start_year"), pick("start_month"),
+		"COALESCE(setup_complete, 0)")).
 		Scan(&name, &credit, &vat, &startYear, &startMonth, &setup)
 	if errors.Is(err, sql.ErrNoRows) {
 		p.Err = "还是空库（建账没做完）"
@@ -126,6 +153,29 @@ func (db *DB) hasTable(ctx context.Context, name string) bool {
 		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`,
 		name).Scan(&n)
 	return err == nil && n > 0
+}
+
+// columnNames 返回某张表的全部列名（供兼容性探测用）。
+func (db *DB) columnNames(ctx context.Context, table string) (map[string]bool, error) {
+	rows, err := db.sql.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return nil, translateErr(err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid         int
+			name, typ   string
+			notNull, pk int
+			dflt        sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }
 
 // ScanBookDir 列出目录下所有 .db 文件的外观信息，按修改时间倒序。

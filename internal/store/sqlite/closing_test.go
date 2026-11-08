@@ -869,3 +869,78 @@ func postDrafts(t *testing.T, db *DB, y, m int) *PostPeriodDraftsResult {
 	}
 	return res
 }
+
+// ---------------------------------------------------------------------------
+// 期间启用（回归：结账曾不启用下一期间，账簿在跨期后永久冻结）
+// ---------------------------------------------------------------------------
+
+// ★ 结账必须把紧邻的下一期间从 future 启用为 open。
+func TestClosePeriodActivatesNextPeriod(t *testing.T) {
+	db := newTestDBThrough(t, 3)
+
+	for m := 1; m <= 3; m++ {
+		closeP(t, db, 2025, m, "王主管")
+	}
+	if got := periodStatus(t, db, 2025, 4); got != "open" {
+		t.Fatalf("结完 3 月后 4 月应自动启用为 open，实际 %s", got)
+	}
+	if got := periodStatus(t, db, 2025, 5); got != "future" {
+		t.Errorf("5 月应保持 future（一次只启用一期），实际 %s", got)
+	}
+	// 4 月可以继续结账 —— 修复前这里永远报「期间未启用」，账簿冻结
+	closeP(t, db, 2025, 4, "王主管")
+	if got := periodStatus(t, db, 2025, 5); got != "open" {
+		t.Errorf("结完 4 月后 5 月应启用为 open，实际 %s", got)
+	}
+}
+
+// ★ 期间表只生成到建账年度 12 月：跨年时结账要补出下一年度期间。
+func TestClosePeriodAcrossYearExtendsCalendar(t *testing.T) {
+	db := newTestDBThrough(t, 12)
+	for m := 1; m <= 12; m++ {
+		closeP(t, db, 2025, m, "王主管")
+	}
+	if got := periodStatus(t, db, 2026, 1); got != "open" {
+		t.Fatalf("跨年后 2026-01 应已生成并启用为 open，实际 %s", got)
+	}
+	for _, m := range []int{2, 6, 12} {
+		if got := periodStatus(t, db, 2026, m); got != "future" {
+			t.Errorf("2026-%02d 应已生成为 future，实际 %s", m, got)
+		}
+	}
+	// 新年度的第一个期间可以继续正常结账
+	closeP(t, db, 2026, 1, "王主管")
+	if got := periodStatus(t, db, 2026, 2); got != "open" {
+		t.Errorf("结完 2026-01 后 2026-02 应启用为 open，实际 %s", got)
+	}
+}
+
+// ★ 反结账把后续 open 期间退回 future：否则同时存在两个可记账期间，
+// 允许「先记 10 月再回头记 9 月」的乱序。
+func TestReopenPeriodRetreatsLaterOpens(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDBThrough(t, 3)
+	for m := 1; m <= 3; m++ {
+		closeP(t, db, 2025, m, "王主管")
+	}
+	if got := periodStatus(t, db, 2025, 4); got != "open" {
+		t.Fatalf("前置条件：结完 3 月后 4 月应 open，实际 %s", got)
+	}
+
+	if _, err := db.Closing().ReopenPeriod(ctx, ReopenInput{
+		Period: period.NewKey(2025, 3), PostingBy: "王主管"}); err != nil {
+		t.Fatalf("反结账失败: %v", err)
+	}
+	if got := periodStatus(t, db, 2025, 3); got != "open" {
+		t.Errorf("反结账后 3 月应 open，实际 %s", got)
+	}
+	if got := periodStatus(t, db, 2025, 4); got != "future" {
+		t.Errorf("反结账后 4 月应退回 future，实际 %s", got)
+	}
+
+	// 再次结 3 月，4 月重新启用
+	closeP(t, db, 2025, 3, "王主管")
+	if got := periodStatus(t, db, 2025, 4); got != "open" {
+		t.Errorf("重新结完 3 月后 4 月应再次 open，实际 %s", got)
+	}
+}

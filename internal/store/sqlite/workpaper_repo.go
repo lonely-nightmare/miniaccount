@@ -154,11 +154,15 @@ func (r *WorkpaperRepo) Benchmarks(ctx context.Context, k period.Key) (*Benchmar
 		return nil, err
 	}
 	var expense int64
+	// ★ 排除期末结转凭证：结转把费用净发生额转平，连同统计会把
+	// 已结账月份的费用全部归零，重要性基准被严重低估。
 	err = r.db.sql.QueryRowContext(ctx, `
 		SELECT COALESCE(SUM(le.debit) - SUM(le.credit), 0)
 		  FROM ledger_entry le
 		  JOIN account a ON a.id = le.account_id
+		  JOIN voucher v ON v.id = le.voucher_id
 		 WHERE a.root_type = 'expense' AND a.is_leaf = 1
+		   AND v.source <> 'closing'
 		   AND le.biz_date >= ? AND le.biz_date <= ?`,
 		start.String(), end.String()).Scan(&expense)
 	if err != nil {

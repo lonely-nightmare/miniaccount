@@ -143,6 +143,17 @@ func (b *Backup) Create(ctx context.Context, dest string, opts Options) (*Manife
 		return nil, err
 	}
 
+	// ★ 快照里抹掉 API 密钥。
+	//
+	// ai_provider.api_key 明文存在账套库里（本地桌面应用的常规取舍），
+	// 但备份文件会离开本机 —— 拷给代办会计、存到云盘都是常态。
+	// 密钥跟着备份走，等于把第三方 AI 账户的钥匙散出去。
+	// 恢复回来时密钥列为空，用户在界面上重新填一次即可。
+	// （schema 注释原本就承诺「备份导出时剔除」，这里把承诺兑现。）
+	if err := scrubSecrets(ctx, snapshot); err != nil {
+		return nil, err
+	}
+
 	// 2) 收集附件清单
 	files, totalBytes, err := collectFiles(b.FilesDir, opts.IncludeFiles)
 	if err != nil {
@@ -386,7 +397,15 @@ func Restore(ctx context.Context, archivePath, dbPath, filesDir string) (res *Re
 	res.DBRestored = true
 
 	// 4) 解压附件（逐个校验 sha256）
-	if len(manifest.Files) > 0 && filesDir != "" {
+	//
+	// ★ 归档里明明有附件却没地方放，是错误而不是「跳过」：
+	// 静默丢掉附件，恢复出来的账套看起来完好，
+	// 但凭证上的原始单据全没了 —— 而用户要等到查账时才发现。
+	if len(manifest.Files) > 0 && filesDir == "" {
+		return nil, fmt.Errorf("%w: 备份含 %d 个附件，但未指定附件目录",
+			ErrBadArchive, len(manifest.Files))
+	}
+	if len(manifest.Files) > 0 {
 		if err := os.MkdirAll(filesDir, 0o755); err != nil {
 			return nil, fmt.Errorf("backup: 创建附件目录: %w", err)
 		}
@@ -641,6 +660,32 @@ func vacuumInto(ctx context.Context, dbPath, dest string) error {
 	return nil
 }
 
+// scrubSecrets 抹掉备份快照里的敏感字段。
+//
+// 只清「离开本机就不该带走」的：AI 供应商的 API 密钥。
+// ai_suggestion 里的 raw_response 属账主自己的数据（脱敏前的原文），
+// 它是审计留痕的一部分，保留。
+func scrubSecrets(ctx context.Context, snapshot string) error {
+	db, err := sql.Open("sqlite", "file:"+snapshot+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fmt.Errorf("backup: 打开快照: %w", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sqlite_master
+		 WHERE type = 'table' AND name = 'ai_provider'`).Scan(&n); err != nil {
+		return fmt.Errorf("backup: 检查 ai_provider 表: %w", err)
+	}
+	if n == 0 {
+		return nil // 旧版本库没有这张表
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE ai_provider SET api_key = ''`); err != nil {
+		return fmt.Errorf("backup: 抹除 API 密钥: %w", err)
+	}
+	return nil
+}
+
 // fillBookStats 从快照里读取账套概况写进 manifest。
 // 读不到不算错误 —— 备份本身仍然有效。
 func fillBookStats(ctx context.Context, snapshot string, m *Manifest) {
@@ -705,6 +750,12 @@ func collectFiles(filesDir string, include bool) ([]fileEntry, int64, error) {
 		if d.IsDir() {
 			return nil
 		}
+		// ★ 跳过符号链接：WalkDir 不跟随链接，但这里一旦读文件内容
+		// 就会把链接目标（可能在 .files 之外，比如 ~/.ssh/ 下的文件）
+		// 原样打进备份。附件目录按内容寻址，正常不该有链接。
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
 		rel, err := filepath.Rel(filesDir, path)
 		if err != nil {
 			return err
@@ -764,10 +815,21 @@ func writeFileToZip(zw *zip.Writer, name, path string) error {
 	return nil
 }
 
+// maxRestoreBytes 是单个解压文件的上限。
+//
+// 备份文件可以从别人那里拿到：一个构造过的归档可以用极小体积
+// 声明一个超大解压结果（zip 炸弹），恢复时把磁盘写满。
+// 8 GiB 对一个小微企业账套（含附件）已经足够宽裕。
+const maxRestoreBytes = 8 << 30
+
 func extractOne(zr *zip.ReadCloser, name, dest string) error {
 	for _, f := range zr.File {
 		if f.Name != name {
 			continue
+		}
+		if f.UncompressedSize64 > maxRestoreBytes {
+			return fmt.Errorf("%w: %s 声明解压后 %d 字节，超过上限",
+				ErrBadArchive, name, f.UncompressedSize64)
 		}
 		rc, err := f.Open()
 		if err != nil {
@@ -780,8 +842,15 @@ func extractOne(zr *zip.ReadCloser, name, dest string) error {
 			return fmt.Errorf("backup: 创建 %s: %w", dest, err)
 		}
 		defer out.Close()
-		if _, err := io.Copy(out, rc); err != nil {
+		// 头部声明也可能撒谎：按上限+1 截断拷贝，超限即失败。
+		// CopyN 在源比 n 短时返回 io.EOF —— 那是正常结束，不是错。
+		n, err := io.CopyN(out, rc, maxRestoreBytes+1)
+		if err != nil && err != io.EOF {
 			return fmt.Errorf("backup: 解压 %s: %w", name, err)
+		}
+		if n > maxRestoreBytes {
+			return fmt.Errorf("%w: %s 实际解压超过 %d 字节上限",
+				ErrBadArchive, name, maxRestoreBytes)
 		}
 		return nil
 	}

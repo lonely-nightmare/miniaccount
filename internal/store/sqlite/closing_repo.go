@@ -296,6 +296,20 @@ func (r *ClosingRepo) ClosePeriod(ctx context.Context, in CloseInput) (*CloseRes
 		if err := r.db.Periods().SetStatus(ctx, tx, k, period.StatusClosed, in.PostingBy, &at); err != nil {
 			return err
 		}
+
+		// 6. ★ 启用下一期间 —— 领域层 Calendar.Close 里的这一步，
+		//	持久化实现同样不能少。
+		//
+		// 所有写路径（存草稿/过账/结账）都要求期间为 open。
+		// 漏掉这一步的后果是：结完最后一个初始 open 期间后，
+		// 下一期间永远停在 future，账簿无法再记任何一笔账 ——
+		// 这是一个真实发生过的阻断缺陷。
+		//
+		// 期间表只生成到建账年度的 12 月，因此跨年时还要先
+		// 把下一年度的期间行补出来（见 EnsureNextOpen）。
+		if err := r.db.Periods().EnsureNextOpen(ctx, tx, k); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -411,6 +425,23 @@ func (r *ClosingRepo) ReopenPeriod(ctx context.Context, in ReopenInput) (*Reopen
 		// 两步在同一事务内，所以先放开并不构成风险：
 		// 冲销只要失败，整个事务回滚，期间依旧保持已结账。
 		if err := r.db.Periods().SetStatus(ctx, tx, k, period.StatusOpen, "", nil); err != nil {
+			return err
+		}
+
+		// ★ 后续已启用的期间退回 future。
+		//
+		// 结账时会自动启用下一期间；这里把 k 重新放开后，
+		// 若 k+1 仍保持 open，就会出现两个可记账期间，
+		// 等于允许「先记 10 月再回头记 9 月」的乱序 ——
+		// 顺序结账规则正是为了杜绝这种乱序。
+		// 领域层 Calendar.Reopen 有同样的动作，这里与它保持一致。
+		// 退回 future 期间里的草稿不会被丢：仍是草稿，
+		// 等该期间再次被启用后照常参与结账。
+		if _, err := tx.Exec(ctx, `
+			UPDATE period SET status = ?, closed_by = '', closed_at = NULL
+			 WHERE (year > ? OR (year = ? AND month > ?)) AND status = ?`,
+			string(period.StatusFuture), k.Year, k.Year, k.Month,
+			string(period.StatusOpen)); err != nil {
 			return err
 		}
 

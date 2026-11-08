@@ -94,17 +94,23 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 //	                   导致凭证字号分配偶发 SQLITE_BUSY。
 //	foreign_keys(1)    SQLite 默认不启用外键，必须逐连接打开。
 //	busy_timeout       遇锁等待而非立即报错。
-//	journal_mode(WAL)  读写并发更好，且崩溃恢复更安全。
+//	journal_mode(WAL)  读写并发更好，且崩溃恢复更安全。**仅可写连接发送**：
+//	                   它要改写库文件头，mode=ro 连接对 delete 模式的库
+//	                   必报「attempt to write a readonly database」——
+//	                   而备份的 VACUUM INTO 产物恰恰就是 delete 模式。
+//	                   日志模式是文件属性：读它不需要改它，WAL 库用
+//	                   ro 打开时驱动照读 -wal 边车文件。
+//	synchronous        只影响写持久性；ro 连接不发（同上原因）。
 func buildDSN(path string, readOnly bool) string {
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(1)")
-	q.Add("_pragma", "journal_mode(WAL)")
-	q.Add("_pragma", "synchronous(NORMAL)")
 	if readOnly {
 		q.Set("mode", "ro")
 	} else {
 		q.Set("_txlock", "immediate")
+		q.Add("_pragma", "journal_mode(WAL)")
+		q.Add("_pragma", "synchronous(NORMAL)")
 	}
 	if path == ":memory:" {
 		// 共享缓存内存库，保证同一进程内看到同一份数据

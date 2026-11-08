@@ -46,67 +46,80 @@ func (r *ColumnarRepo) BuildColumnar(ctx context.Context,
 		return nil, fmt.Errorf("%w: 期间 %s 至 %s", columnar.ErrBadRange, from, to)
 	}
 
-	tree, err := r.db.Accounts().Tree(ctx)
-	if err != nil {
-		return nil, err
-	}
-	head, ok := tree.Get(accountCode)
-	if !ok {
-		return nil, fmt.Errorf("%w: 科目 %s", ErrNotFound, accountCode)
-	}
-
-	// 栏目 = 该科目下的全部可记账明细科目
-	//
-	// ★ 必须用「严格下级」，不能用 Tree.SubtreeLeaves：
-	// 后者在科目本身是明细科目时会返回它自己（这是余额汇总想要的语义），
-	// 于是「1002 银行存款」会得到一个名为「银行存款」的栏目 ——
-	// 一张只有一栏的多栏式明细账，既没用又难看。
-	desc := tree.Descendants(accountCode)
-	leaves := make([]*account.Account, 0, len(desc))
-	for _, d := range desc {
-		if d.IsLeaf {
-			leaves = append(leaves, d)
+	// ★ 科目树、期初余额、期间分录共用一份快照：
+	// 取数之间挤进一笔过账，「期初 + 栏目发生额 ≠ 期末」
+	// 会在给客户看的账页上成立。
+	var (
+		tree    *account.Tree
+		opening money.Money
+		movs    []columnar.Movement
+		ids     []int64
+		cols    []columnar.Column
+		head    *account.Account
+	)
+	err := r.db.Read(ctx, func(q Querier) error {
+		var e error
+		if tree, e = r.db.Accounts().TreeQ(ctx, q); e != nil {
+			return e
 		}
-	}
-	if len(leaves) == 0 {
-		return nil, fmt.Errorf(
-			"%w: 科目「%s %s」没有下级科目，多栏式明细账需要至少一个下级科目；"+
-				"没有下级科目时请改用明细账（三栏式）",
-			columnar.ErrNoColumns, head.Code, head.Name)
-	}
-
-	// 科目 id 集合：本级 + **全部**下级（含中间汇总科目）。
-	//
-	// 中间层也要算进去 —— 万一有分录直接记在某个汇总科目上
-	// （历史上它是明细科目、后来才加了子科目），那笔钱不该凭空消失，
-	// 而应进「其他」栏并在提示里点出来。少一个 id 就是少一笔钱。
-	ids := make([]int64, 0, len(desc)+1)
-	ids = append(ids, head.ID)
-	for _, d := range desc {
-		ids = append(ids, d.ID)
-	}
-	cols := make([]columnar.Column, 0, len(leaves))
-	for _, l := range leaves {
-		side := columnar.SideDebit
-		if l.BalanceDir == account.DirCredit {
-			side = columnar.SideCredit
+		var ok bool
+		head, ok = tree.Get(accountCode)
+		if !ok {
+			return fmt.Errorf("%w: 科目 %s", ErrNotFound, accountCode)
 		}
-		cols = append(cols, columnar.Column{
-			Key: l.Code, Label: shortName(l.Name),
-			Side: side, AccountCode: l.Code,
-		})
-	}
-	// 栏目顺序：借方栏目在前、贷方栏目在后，组内按科目树顺序。
-	// 增值税表就是靠这一步得到「左借方 6 栏、右贷方 4 栏」的版式。
-	cols = orderColumns(cols)
 
-	// 期初余额：期间开始日之前的净额（借 − 贷）
-	opening, err := r.subtreeNet(ctx, ids, calendar.Date{}, from.AddDays(-1))
-	if err != nil {
-		return nil, err
-	}
+		// 栏目 = 该科目下的全部可记账明细科目
+		//
+		// ★ 必须用「严格下级」，不能用 Tree.SubtreeLeaves：
+		// 后者在科目本身是明细科目时会返回它自己（这是余额汇总想要的语义），
+		// 于是「1002 银行存款」会得到一个名为「银行存款」的栏目 ——
+		// 一张只有一栏的多栏式明细账，既没用又难看。
+		desc := tree.Descendants(accountCode)
+		leaves := make([]*account.Account, 0, len(desc))
+		for _, d := range desc {
+			if d.IsLeaf {
+				leaves = append(leaves, d)
+			}
+		}
+		if len(leaves) == 0 {
+			return fmt.Errorf(
+				"%w: 科目「%s %s」没有下级科目，多栏式明细账需要至少一个下级科目；"+
+					"没有下级科目时请改用明细账（三栏式）",
+				columnar.ErrNoColumns, head.Code, head.Name)
+		}
 
-	movs, err := r.subtreeMovements(ctx, ids, from, to)
+		// 科目 id 集合：本级 + **全部**下级（含中间汇总科目）。
+		//
+		// 中间层也要算进去 —— 万一有分录直接记在某个汇总科目上
+		// （历史上它是明细科目、后来才加了子科目），那笔钱不该凭空消失，
+		// 而应进「其他」栏并在提示里点出来。少一个 id 就是少一笔钱。
+		ids = make([]int64, 0, len(desc)+1)
+		ids = append(ids, head.ID)
+		for _, d := range desc {
+			ids = append(ids, d.ID)
+		}
+		cols = make([]columnar.Column, 0, len(leaves))
+		for _, l := range leaves {
+			side := columnar.SideDebit
+			if l.BalanceDir == account.DirCredit {
+				side = columnar.SideCredit
+			}
+			cols = append(cols, columnar.Column{
+				Key: l.Code, Label: shortName(l.Name),
+				Side: side, AccountCode: l.Code,
+			})
+		}
+		// 栏目顺序：借方栏目在前、贷方栏目在后，组内按科目树顺序。
+		// 增值税表就是靠这一步得到「左借方 6 栏、右贷方 4 栏」的版式。
+		cols = orderColumns(cols)
+
+		// 期初余额：期间开始日之前的净额（借 − 贷）
+		if opening, e = r.subtreeNet(ctx, q, ids, calendar.Date{}, from.AddDays(-1)); e != nil {
+			return e
+		}
+		movs, e = r.subtreeMovements(ctx, q, ids, from, to)
+		return e
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +162,7 @@ func shortName(name string) string {
 
 // subtreeNet 汇总一组科目在 [from, to] 区间的净额（借 − 贷）。
 // from 为零值时表示不限起点。
-func (r *ColumnarRepo) subtreeNet(ctx context.Context,
+func (r *ColumnarRepo) subtreeNet(ctx context.Context, q Querier,
 	ids []int64, from, to calendar.Date) (money.Money, error) {
 
 	if len(ids) == 0 {
@@ -161,24 +174,24 @@ func (r *ColumnarRepo) subtreeNet(ctx context.Context,
 		args = append(args, id)
 	}
 
-	q := `SELECT COALESCE(SUM(debit) - SUM(credit), 0) FROM ledger_entry
+	qText := `SELECT COALESCE(SUM(debit) - SUM(credit), 0) FROM ledger_entry
 	       WHERE account_id IN (` + ph + `) AND biz_date <= ?`
 	args = append(args, to.String())
 	if from.Valid() {
-		q = `SELECT COALESCE(SUM(debit) - SUM(credit), 0) FROM ledger_entry
+		qText = `SELECT COALESCE(SUM(debit) - SUM(credit), 0) FROM ledger_entry
 		      WHERE account_id IN (` + ph + `) AND biz_date >= ? AND biz_date <= ?`
 		args = append(args, from.String(), to.String())
 	}
 
 	var net int64
-	if err := r.db.sql.QueryRowContext(ctx, q, args...).Scan(&net); err != nil {
+	if err := q.QueryRow(ctx, qText, args...).Scan(&net); err != nil {
 		return 0, translateErr(err)
 	}
 	return money.Money(net), nil
 }
 
 // subtreeMovements 取一组科目在 [from, to] 区间的全部分录，逐笔返回。
-func (r *ColumnarRepo) subtreeMovements(ctx context.Context,
+func (r *ColumnarRepo) subtreeMovements(ctx context.Context, q Querier,
 	ids []int64, from, to calendar.Date) ([]columnar.Movement, error) {
 
 	if len(ids) == 0 {
@@ -190,7 +203,7 @@ func (r *ColumnarRepo) subtreeMovements(ctx context.Context,
 	}
 	args = append(args, from.String(), to.String())
 
-	rows, err := r.db.sql.QueryContext(ctx, `
+	rows, err := q.Query(ctx, `
 		SELECT le.biz_date, COALESCE(v.no, ''), le.summary, a.code,
 		       le.line_no, le.debit, le.credit
 		  FROM ledger_entry le

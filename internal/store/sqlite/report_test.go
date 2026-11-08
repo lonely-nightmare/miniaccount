@@ -585,3 +585,70 @@ func TestTrialBalanceRollsUpParentRows(t *testing.T) {
 			pd, pc, rawDebit, rawCredit)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 已结账期间的利润表（回归：结转凭证曾把发生额全部抵消成 0）
+// ---------------------------------------------------------------------------
+
+// ★ 利润表按「业务发生额」填列，期末结转凭证不参与取数。
+//
+// 结转分录会把每个损益科目的期间净额转平 —— 若一并统计，
+// 已结账月份的本月数全归零、本年累计漏掉已结月份，
+// 下游企业所得税取数、审计底稿基准全部被污染。
+func TestIncomeStatementAfterClosing(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	seedBook(t, db)
+
+	for m := 1; m <= 9; m++ {
+		closeP(t, db, 2025, m, "王主管")
+	}
+
+	get := func(d *report.Definition, no int) money.Money {
+		l, ok := d.Line(no)
+		if !ok {
+			t.Fatalf("行 %d 不存在", no)
+		}
+		return l.Value
+	}
+
+	current, ytd, _, err := db.Reports().BuildIncomeStatement(ctx, period.NewKey(2025, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := get(current, 1); got != money100(80000) {
+		t.Errorf("已结账的 9 月营业收入 = %s，期望 80,000.00", got)
+	}
+	if got := get(current, 30); got != money100(65000) {
+		t.Errorf("已结账的 9 月利润总额 = %s，期望 65,000.00", got)
+	}
+	if got := get(ytd, 30); got != money100(65000) {
+		t.Errorf("9 月本年累计利润总额 = %s，期望 65,000.00", got)
+	}
+
+	// 10 月的累计数同样不能把已结的 9 月漏掉
+	_, ytdOct, _, err := db.Reports().BuildIncomeStatement(ctx, period.NewKey(2025, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := get(ytdOct, 30); got != money100(65000) {
+		t.Errorf("10 月本年累计利润总额 = %s，期望 65,000.00", got)
+	}
+
+	// ★ 反结账生成 source='closing' 的红字冲销凭证；
+	// 期间重新打开后，9 月发生额仍应等于业务口径。
+	if _, err := db.Closing().ReopenPeriod(ctx, ReopenInput{
+		Period: period.NewKey(2025, 9), PostingBy: "王主管"}); err != nil {
+		t.Fatalf("反结账失败: %v", err)
+	}
+	cur2, _, _, err := db.Reports().BuildIncomeStatement(ctx, period.NewKey(2025, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := get(cur2, 1); got != money100(80000) {
+		t.Errorf("反结账后 9 月营业收入 = %s，期望 80,000.00", got)
+	}
+	if got := get(cur2, 30); got != money100(65000) {
+		t.Errorf("反结账后 9 月利润总额 = %s，期望 65,000.00", got)
+	}
+}

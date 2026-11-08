@@ -219,6 +219,21 @@ func (s *Store) openActive(ctx context.Context) error {
 		return err
 	}
 	// 从文件里恢复链头与序号 —— 不能靠内存，重启后要接着写
+	if err := s.refreshChain(ctx); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(last); err == nil {
+		s.bytes = fi.Size()
+	}
+	return nil
+}
+
+// refreshChain 从当前分片重读链头（hash）与全局序号（seq）。
+//
+// 启动时用它接续上次的链；写入撞唯一约束时也用它 ——
+// 另一个写入方（桌面端与 CLI 同开一本账）先进了一条时，
+// 重读链头重算哈希，后到者仍然接得上。
+func (s *Store) refreshChain(ctx context.Context) error {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(seq),0), COALESCE(MAX(segment_seq),0) FROM audit_log`)
 	var seq int64
@@ -232,9 +247,6 @@ func (s *Store) openActive(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT hash FROM audit_log ORDER BY segment_seq DESC LIMIT 1`).Scan(&h); err == nil && h.Valid {
 		s.head = h.String
-	}
-	if fi, err := os.Stat(last); err == nil {
-		s.bytes = fi.Size()
 	}
 	return nil
 }
@@ -327,6 +339,19 @@ func (s *Store) openFile(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	// ★ 老分片的列补齐必须在这里做。
+	//
+	// migrateSegment 原来只在 createSegment 被调 —— 而新文件刚按
+	// 最新 schema 建出来，永远已经有这些列，那次调用恒为空转；
+	// 真正需要补列的老分片走的却是这条 openFile 路径，从来没补过。
+	// 后果是老分片里的 category 列缺失，写入时直接失败、
+	// 日志静默停记。只读模式下跳过：补列是写操作。
+	if !s.readOnly {
+		if err := migrateSegment(ctx, db); err != nil {
+			_ = db.Close()
+			return err
+		}
+	}
 	if s.db != nil {
 		_ = s.db.Close()
 	}
@@ -372,7 +397,13 @@ func openSQLite(path string, readOnly bool) (*sql.DB, error) {
 const schema = `
 CREATE TABLE IF NOT EXISTS audit_log (
   segment_seq  INTEGER PRIMARY KEY AUTOINCREMENT,
-  seq          INTEGER NOT NULL,
+  -- seq 上加 UNIQUE：同一日志库只应有一个写入方，但桌面端与 CLI
+  -- 同开一本账时可能出现两个 —— 没有约束的话两条追加会撞同一个
+  -- 序号、哈希链悄悄分叉而校验看不出来。约束把「静默分叉」变成
+  -- 「后到者失败」，由 Append 重读链头重试接住。
+  -- （CREATE TABLE IF NOT EXISTS 只影响新建分片；老分片靠
+  --   重试逻辑与单写入方纪律兜底，不为加约束而重建表。）
+  seq          INTEGER NOT NULL UNIQUE,
   at           TEXT    NOT NULL,
   operator     TEXT    NOT NULL DEFAULT '',
   source       TEXT    NOT NULL DEFAULT '',
@@ -454,15 +485,29 @@ func (s *Store) Append(ctx context.Context, e audit.Entry) (audit.Entry, error) 
 		// 主字段照记。日志的价值在于「发生过什么」，明细是加分项。
 		detail = []byte(`{"_error":"明细无法序列化"}`)
 	}
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO audit_log (seq, at, operator, source, action, category, summary,
-			entity, entity_id, detail_json, result, message, book, company,
-			app_version, prev_hash, hash)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		e.Seq, e.At, e.Operator, string(e.Source), string(e.Action),
-		string(categoryOf(e)), e.Summary,
-		e.Entity, e.EntityID, string(detail), string(e.Result), e.Message,
-		e.Book, e.Company, e.AppVersion, e.PrevHash, e.Hash)
+	insert := func() error {
+		_, ierr := s.db.ExecContext(ctx, `
+			INSERT INTO audit_log (seq, at, operator, source, action, category, summary,
+				entity, entity_id, detail_json, result, message, book, company,
+				app_version, prev_hash, hash)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			e.Seq, e.At, e.Operator, string(e.Source), string(e.Action),
+			string(categoryOf(e)), e.Summary,
+			e.Entity, e.EntityID, string(detail), string(e.Result), e.Message,
+			e.Book, e.Company, e.AppVersion, e.PrevHash, e.Hash)
+		return ierr
+	}
+	err = insert()
+	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		// 另一个写入方先进了一条：重读链头/序号，重算哈希后再试一次。
+		// 仍失败就原样报错 —— 那说明分片本身有问题，不该再吞。
+		if rerr := s.refreshChain(ctx); rerr == nil {
+			e.Seq = s.seq + 1
+			e.PrevHash = s.head
+			e.Hash = e.ComputeHash(s.head)
+			err = insert()
+		}
+	}
 	if err != nil {
 		return e, fmt.Errorf("auditdb: 写日志失败: %w", err)
 	}

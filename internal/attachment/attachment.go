@@ -165,9 +165,16 @@ func (s *Store) Put(data []byte, fileName string) (*Blob, error) {
 	hash := hex.EncodeToString(sum[:])
 	path := s.MustPath(hash) // hash 刚由内容算出来，必然合法
 
-	// 已存在则复用
+	// 已存在则复用 —— 但先对内容。
+	//
+	// 只看「文件在 + 尺寸一致」就复用是有漏洞的：磁盘损坏或手工改动
+	// 留下的同尺寸坏文件会被当成好附件一直引用下去，
+	// 而它的内容 hash 其实已经对不上文件名了。
 	if fi, err := os.Stat(path); err == nil && fi.Size() == int64(len(data)) {
-		return &Blob{SHA256: hash, Size: fi.Size(), FileName: fileName, Mime: mime}, nil
+		if same, _ := fileMatches(path, hash); same {
+			return &Blob{SHA256: hash, Size: fi.Size(), FileName: fileName, Mime: mime}, nil
+		}
+		// 坏文件：落回下面的重写路径，用正确内容覆盖
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -197,6 +204,20 @@ func (s *Store) Put(data []byte, fileName string) (*Blob, error) {
 		return nil, fmt.Errorf("attachment: 改名: %w", err)
 	}
 	return &Blob{SHA256: hash, Size: int64(len(data)), FileName: fileName, Mime: mime}, nil
+}
+
+// fileMatches 校验磁盘上的文件内容是否与期望的 sha256 一致。
+func fileMatches(path, wantHash string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)) == wantHash, nil
 }
 
 // Open 打开一个附件的读取流。

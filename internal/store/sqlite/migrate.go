@@ -16,6 +16,7 @@ package sqlite
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -82,6 +83,18 @@ CREATE TABLE IF NOT EXISTS schema_migration (
   applied_at TEXT    NOT NULL
 );`
 
+// ErrSchemaTooNew 表示账套由**更新版本**的程序创建。
+//
+// 降级打开一个高版本账套，读出来的是「看不懂的字段当不存在」——
+// 那是静默的数据失真，比报错危险得多，所以这里直接拒绝。
+var ErrSchemaTooNew = errors.New("sqlite: 账套由更新版本的软件创建，请先升级程序")
+
+// ErrSchemaBehind 表示只读打开的账套结构落后于本程序。
+//
+// 只读连接不能跑迁移（迁移要写库），继续读会撞上「列不存在」
+// 之类难懂的错误 —— 不如在这里用一句人话说明白。
+var ErrSchemaBehind = errors.New("sqlite: 账套结构需要升级，请先用可写方式打开一次")
+
 // Migrate 按版本顺序执行尚未应用的迁移。可重复调用。
 func (db *DB) Migrate(ctx context.Context) error {
 	migrations, err := loadMigrations()
@@ -91,33 +104,33 @@ func (db *DB) Migrate(ctx context.Context) error {
 	if _, err := db.sql.ExecContext(ctx, migrationTableDDL); err != nil {
 		return fmt.Errorf("sqlite: 建迁移记录表: %w", err)
 	}
-
-	applied := map[int]bool{}
-	rows, err := db.sql.QueryContext(ctx, `SELECT version FROM schema_migration`)
+	applied, err := db.appliedSet(ctx)
 	if err != nil {
-		return fmt.Errorf("sqlite: 读取已应用迁移: %w", err)
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return err
-		}
-		applied[v] = true
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
 		return err
 	}
-	rows.Close()
+	// ★ 库版本比程序新：拒绝迁移也拒绝继续使用。
+	// 已应用的版本号来自未来，说明这份账套被更新版的程序打开过 ——
+	// 旧程序不认识新列/新表，跑下去只会把账写错。
+	if maxV := migrations[len(migrations)-1].Version; applied.max() > maxV {
+		return fmt.Errorf("%w：账套版本 %d > 本程序 %d",
+			ErrSchemaTooNew, applied.max(), maxV)
+	}
 
 	for _, m := range migrations {
 		if applied[m.Version] {
 			continue
 		}
+		// ★ 迁移脚本与种子脚本走同一条剔除通道：
+		// 事务由 WithTx 管理，脚本里若混入 BEGIN/COMMIT 会在
+		// 已有事务里再开事务而被 SQLite 拒绝 —— 报错措辞还完全
+		// 不指向真实原因。
+		sqlText, err := stripTxControl(m.SQL)
+		if err != nil {
+			return fmt.Errorf("迁移 %04d_%s: %w", m.Version, m.Name, err)
+		}
 		// 每个迁移单独一个事务：失败则整体回滚，不会留下半套表结构
-		err := db.WithTx(ctx, func(tx *Tx) error {
-			if _, err := tx.Exec(ctx, m.SQL); err != nil {
+		err = db.WithTx(ctx, func(tx *Tx) error {
+			if _, err := tx.Exec(ctx, sqlText); err != nil {
 				return fmt.Errorf("迁移 %04d_%s 执行失败: %w", m.Version, m.Name, err)
 			}
 			_, err := tx.Exec(ctx,
@@ -130,6 +143,70 @@ func (db *DB) Migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// CheckSchemaVersion 校验库结构版本与本程序兼容（只读打开路径用）。
+//
+// 不跑迁移（只读连接写不了库），只做版本比对：
+//   - 库比程序新 → ErrSchemaTooNew；
+//   - 库比程序旧 → ErrSchemaBehind（该先可写打开一次完成升级）。
+//
+// 没有 schema_migration 表视为「版本 0」—— 那多半根本不是账套，
+// 由调用方自行判断（PeekBook 等探针另有校验）。
+func (db *DB) CheckSchemaVersion(ctx context.Context) error {
+	migrations, err := loadMigrations()
+	if err != nil {
+		return err
+	}
+	maxEmbedded := migrations[len(migrations)-1].Version
+	if !db.hasTable(ctx, "schema_migration") {
+		return fmt.Errorf("%w：尚无迁移记录（本程序版本 %d）", ErrSchemaBehind, maxEmbedded)
+	}
+	applied, err := db.appliedSet(ctx)
+	if err != nil {
+		return err
+	}
+	maxApplied := applied.max()
+	switch {
+	case maxApplied > maxEmbedded:
+		return fmt.Errorf("%w：账套版本 %d > 本程序 %d",
+			ErrSchemaTooNew, maxApplied, maxEmbedded)
+	case maxApplied < maxEmbedded:
+		return fmt.Errorf("%w：账套版本 %d < 本程序 %d",
+			ErrSchemaBehind, maxApplied, maxEmbedded)
+	}
+	return nil
+}
+
+// appliedSet 是已应用迁移版本号的集合。
+type appliedSet map[int]bool
+
+func (s appliedSet) max() int {
+	m := 0
+	for v := range s {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+// appliedSet 读取 schema_migration 的全部版本号。
+func (db *DB) appliedSet(ctx context.Context) (appliedSet, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT version FROM schema_migration`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: 读取已应用迁移: %w", err)
+	}
+	defer rows.Close()
+	out := appliedSet{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out[v] = true
+	}
+	return out, rows.Err()
 }
 
 // AppliedMigrations 返回已应用的迁移版本号，升序。

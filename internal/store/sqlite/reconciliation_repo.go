@@ -54,87 +54,95 @@ func (r *ReconciliationRepo) BuildReconciliationFrom(ctx context.Context,
 		accountCode = "1002"
 	}
 
-	// 科目名
-	var accountName string
-	var accountID int64
-	err := r.db.sql.QueryRowContext(ctx,
-		`SELECT id, name FROM account WHERE code = ?`, accountCode).
-		Scan(&accountID, &accountName)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("%w: 银行科目 %s", ErrNotFound, accountCode)
-	}
-	if err != nil {
-		return nil, translateErr(err)
-	}
-
-	// 对账窗口起点：默认取最早一笔流水之日
-	if !from.Valid() {
-		d, ok, err := r.firstFlowDate(ctx, accountID, asOf)
+	var (
+		accountName              string
+		accountID                int64
+		bookBalance, bookOpening money.Money
+		bankOpening              *money.Money
+		bankIn, bankOut          []reconciliation.Item
+		bookIn, bookOut          []reconciliation.Item
+		bb                       *money.Money
+		unreconciled             int
+	)
+	// ★ 整张调节表共用一份快照：账面余额、未达账项、对账单余额
+	// 分属两个瞬间时，「企业未记一笔款」与「银行那笔款」会同时对不上，
+	// 调节表两边都差同一个数 —— 这正是它要抓的错误。
+	err := r.db.Read(ctx, func(q Querier) error {
+		err := q.QueryRow(ctx,
+			`SELECT id, name FROM account WHERE code = ?`, accountCode).
+			Scan(&accountID, &accountName)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: 银行科目 %s", ErrNotFound, accountCode)
+		}
 		if err != nil {
-			return nil, err
+			return translateErr(err)
 		}
-		if ok {
-			from = d
-		} else {
-			// 没有流水（没导入对账单）时窗口退化为一天，
-			// 于是所有余额归入期初、未达账项为空。
-			from = asOf
+
+		// 对账窗口起点：默认取最早一笔流水之日
+		if !from.Valid() {
+			d, ok, err := r.firstFlowDate(ctx, q, accountID, asOf)
+			if err != nil {
+				return err
+			}
+			if ok {
+				from = d
+			} else {
+				// 没有流水（没导入对账单）时窗口退化为一天，
+				// 于是所有余额归入期初、未达账项为空。
+				from = asOf
+			}
 		}
-	}
 
-	// 账面余额与账面期初
-	bookBalance, err := r.accountNet(ctx, accountID, calendar.Date{}, asOf)
-	if err != nil {
-		return nil, err
-	}
-	bookOpening, err := r.accountNet(ctx, accountID, calendar.Date{}, from.AddDays(-1))
-	if err != nil {
-		return nil, err
-	}
-
-	// 银行期初：最早一笔流水的余额 − 该笔金额
-	bankOpening, err := r.bankOpening(ctx, accountID, from, asOf)
-	if err != nil {
-		return nil, err
-	}
-
-	bankIn, err := r.flowsNotBooked(ctx, accountID, from, asOf, "in")
-	if err != nil {
-		return nil, err
-	}
-	bankOut, err := r.flowsNotBooked(ctx, accountID, from, asOf, "out")
-	if err != nil {
-		return nil, err
-	}
-	bookIn, err := r.entriesNotBanked(ctx, accountID, from, asOf, true)
-	if err != nil {
-		return nil, err
-	}
-	bookOut, err := r.entriesNotBanked(ctx, accountID, from, asOf, false)
-	if err != nil {
-		return nil, err
-	}
-
-	// 从对账单里取期末余额（最后一条有余额的流水）
-	bb := bankBalance
-	if bb == nil {
-		b, ok, err := r.lastStatementBalance(ctx, accountID, asOf)
-		if err != nil {
-			return nil, err
+		// 账面余额与账面期初
+		if bookBalance, err = r.accountNet(ctx, q, accountID, calendar.Date{}, asOf); err != nil {
+			return err
 		}
-		if ok {
-			bb = &b
+		if bookOpening, err = r.accountNet(ctx, q, accountID, calendar.Date{}, from.AddDays(-1)); err != nil {
+			return err
 		}
-	}
 
-	// 未处理流水条数（提示用）
-	var unreconciled int
-	if err := r.db.sql.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM bank_flow
-		 WHERE account_id = ? AND voucher_id IS NULL
-		   AND status <> 'ignored' AND txn_date >= ? AND txn_date <= ?`,
-		accountID, from.String(), asOf.String()).Scan(&unreconciled); err != nil {
-		return nil, translateErr(err)
+		// 银行期初：最早一笔流水的余额 − 该笔金额
+		if bankOpening, err = r.bankOpening(ctx, q, accountID, from, asOf); err != nil {
+			return err
+		}
+
+		if bankIn, err = r.flowsNotBooked(ctx, q, accountID, from, asOf, "in"); err != nil {
+			return err
+		}
+		if bankOut, err = r.flowsNotBooked(ctx, q, accountID, from, asOf, "out"); err != nil {
+			return err
+		}
+		if bookIn, err = r.entriesNotBanked(ctx, q, accountID, from, asOf, true); err != nil {
+			return err
+		}
+		if bookOut, err = r.entriesNotBanked(ctx, q, accountID, from, asOf, false); err != nil {
+			return err
+		}
+
+		// 从对账单里取期末余额（最后一条有余额的流水）
+		bb = bankBalance
+		if bb == nil {
+			b, ok, err := r.lastStatementBalance(ctx, q, accountID, asOf)
+			if err != nil {
+				return err
+			}
+			if ok {
+				bb = &b
+			}
+		}
+
+		// 未处理流水条数（提示用）
+		if err := q.QueryRow(ctx, `
+			SELECT COUNT(*) FROM bank_flow
+			 WHERE account_id = ? AND voucher_id IS NULL
+			   AND status <> 'ignored' AND txn_date >= ? AND txn_date <= ?`,
+			accountID, from.String(), asOf.String()).Scan(&unreconciled); err != nil {
+			return translateErr(err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return reconciliation.Build(reconciliation.Input{
@@ -154,11 +162,11 @@ func (r *ReconciliationRepo) BuildReconciliationFrom(ctx context.Context,
 
 // accountNet 返回 [from, to] 区间内该科目的净额（借−贷）。
 // from 为零值时表示不限起点。
-func (r *ReconciliationRepo) accountNet(ctx context.Context,
+func (r *ReconciliationRepo) accountNet(ctx context.Context, q Querier,
 	accountID int64, from, to calendar.Date) (money.Money, error) {
 	var net int64
 	if from.Valid() {
-		err := r.db.sql.QueryRowContext(ctx, `
+		err := q.QueryRow(ctx, `
 			SELECT COALESCE(SUM(debit), 0) - COALESCE(SUM(credit), 0)
 			  FROM ledger_entry
 			 WHERE account_id = ? AND biz_date >= ? AND biz_date <= ?`,
@@ -168,7 +176,7 @@ func (r *ReconciliationRepo) accountNet(ctx context.Context,
 		}
 		return money.Money(net), nil
 	}
-	err := r.db.sql.QueryRowContext(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT COALESCE(SUM(debit), 0) - COALESCE(SUM(credit), 0)
 		  FROM ledger_entry WHERE account_id = ? AND biz_date <= ?`,
 		accountID, to.String()).Scan(&net)
@@ -179,13 +187,13 @@ func (r *ReconciliationRepo) accountNet(ctx context.Context,
 }
 
 // firstFlowDate 返回窗口内最早一笔流水的日期。
-func (r *ReconciliationRepo) firstFlowDate(ctx context.Context,
+func (r *ReconciliationRepo) firstFlowDate(ctx context.Context, q Querier,
 	accountID int64, asOf calendar.Date) (calendar.Date, bool, error) {
 	// MIN() 在没有匹配行时返回 NULL 而不是「无行」，
 	// 所以必须用 NullString 接 —— 否则「还没导入对账单」这种
 	// 最常见的初始状态会直接报 Scan 错误。
 	var d sql.NullString
-	err := r.db.sql.QueryRowContext(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT MIN(txn_date) FROM bank_flow
 		 WHERE account_id = ? AND txn_date <= ? AND status <> 'ignored'`,
 		accountID, asOf.String()).Scan(&d)
@@ -207,14 +215,14 @@ func (r *ReconciliationRepo) firstFlowDate(ctx context.Context,
 // 算法：取窗口内最早一笔**带余额**的流水，用「该笔余额 − 该笔金额」
 // 反推出它发生前的余额。银行流水的余额列是账户余额快照，
 // 因此这个反推是精确的，不需要用户额外提供期初数。
-func (r *ReconciliationRepo) bankOpening(ctx context.Context,
+func (r *ReconciliationRepo) bankOpening(ctx context.Context, q Querier,
 	accountID int64, from, asOf calendar.Date) (*money.Money, error) {
 	var (
 		bal       int64
 		amount    int64
 		direction string
 	)
-	err := r.db.sql.QueryRowContext(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT balance, amount, direction FROM bank_flow
 		 WHERE account_id = ? AND txn_date >= ? AND txn_date <= ?
 		   AND balance IS NOT NULL AND status <> 'ignored'
@@ -236,10 +244,10 @@ func (r *ReconciliationRepo) bankOpening(ctx context.Context,
 }
 
 // flowsNotBooked 返回尚未生成凭证的流水。
-func (r *ReconciliationRepo) flowsNotBooked(ctx context.Context,
+func (r *ReconciliationRepo) flowsNotBooked(ctx context.Context, q Querier,
 	accountID int64, from, asOf calendar.Date, dir string) ([]reconciliation.Item, error) {
 
-	rows, err := r.db.sql.QueryContext(ctx, `
+	rows, err := q.Query(ctx, `
 		SELECT txn_date, summary, counterparty_name, amount, COALESCE(serial_no, '')
 		  FROM bank_flow
 		 WHERE account_id = ? AND direction = ? AND txn_date >= ? AND txn_date <= ?
@@ -288,14 +296,14 @@ func (r *ReconciliationRepo) flowsNotBooked(ctx context.Context,
 // entriesNotBanked 返回银行科目上「不来自银行流水」的分录。
 //
 // 判定依据：该分录所属凭证没有被任何流水引用（bank_flow.voucher_id）。
-func (r *ReconciliationRepo) entriesNotBanked(ctx context.Context,
+func (r *ReconciliationRepo) entriesNotBanked(ctx context.Context, q Querier,
 	accountID int64, from, asOf calendar.Date, debit bool) ([]reconciliation.Item, error) {
 
 	pick := "le.debit"
 	if !debit {
 		pick = "le.credit"
 	}
-	rows, err := r.db.sql.QueryContext(ctx, `
+	rows, err := q.Query(ctx, `
 		SELECT le.biz_date, le.summary, `+pick+`, COALESCE(v.no, '')
 		  FROM ledger_entry le
 		  LEFT JOIN voucher v ON v.id = le.voucher_id
@@ -333,11 +341,11 @@ func (r *ReconciliationRepo) entriesNotBanked(ctx context.Context,
 }
 
 // lastStatementBalance 取对账单上最后一条有余额的流水的余额。
-func (r *ReconciliationRepo) lastStatementBalance(ctx context.Context,
+func (r *ReconciliationRepo) lastStatementBalance(ctx context.Context, q Querier,
 	accountID int64, asOf calendar.Date) (money.Money, bool, error) {
 
 	var bal sql.NullInt64
-	err := r.db.sql.QueryRowContext(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT balance FROM bank_flow
 		 WHERE account_id = ? AND txn_date <= ? AND balance IS NOT NULL
 		 ORDER BY txn_date DESC, id DESC LIMIT 1`,
