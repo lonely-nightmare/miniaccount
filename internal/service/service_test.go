@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -331,3 +332,72 @@ func mustContact(t *testing.T, svc *service.Service, kind, name string) int64 {
 }
 
 func money100(yuan int64) money.Money { return money.Money(yuan) * money.Yuan }
+
+// 往「指向账套的符号链接」上恢复：os.Rename 会把链接本身换成
+// 独立文件、原账套原地不动——命令报告成功实际一字没恢复。
+// 目标路径必须先归约再替换（实测复现）。
+func TestRestoreToSymlinkReplacesTarget(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	// 源账套：建账 + 备份。
+	svc, err := service.Open(ctx, service.Options{Path: filepath.Join(dir, "src.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Shutdown()
+	if _, err := svc.CreateBook(ctx, service.CreateBookInput{
+		CompanyName: "链接恢复", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bak := filepath.Join(dir, "b.mabak")
+	if _, err := svc.Backup(ctx, service.BackupOptions{Dest: bak}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 目标：一本独立账套（先建再关，锁释放）+ 指向它的符号链接。
+	target := filepath.Join(dir, "target.db")
+	other, err := service.Open(ctx, service.Options{Path: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.CreateBook(ctx, service.CreateBookInput{
+		CompanyName: "旧账套", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.db")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("此平台不支持符号链接")
+	}
+
+	if _, err := svc.Restore(ctx, service.RestoreOptions{
+		Archive: bak, DBPath: link,
+	}); err != nil {
+		t.Fatalf("恢复到符号链接失败: %v", err)
+	}
+
+	// 符号链接必须还是链接（没有被替换成独立文件）。
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("恢复后链接应仍为符号链接")
+	}
+	// 目标文件里必须是恢复出来的账套（「链接恢复」）。
+	restored, err := service.Open(ctx, service.Options{Path: link, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Shutdown()
+	info, err := restored.Book(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.CompanyName != "链接恢复" {
+		t.Fatalf("经链接恢复后目标账套单位 = %q，应为「链接恢复」", info.CompanyName)
+	}
+}

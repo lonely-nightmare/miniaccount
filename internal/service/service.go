@@ -97,8 +97,9 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 	// 里的 owner 记录会把它再归并到首个持锁者的路径——WAL
 	// 按打开路径字符串命名，不用归并路径就是两份 WAL，
 	// 只读端会静默读到过期数据。
-	openPath := filelock.CanonicalPath(opts.Path)
+	openPath := opts.Path
 	if opts.Path != ":memory:" {
+		openPath = filelock.CanonicalPath(opts.Path)
 		var err error
 		if _, statErr := os.Stat(opts.Path); errors.Is(statErr, os.ErrNotExist) {
 			id, ierr := filelock.PathIdentity(opts.Path)
@@ -1032,17 +1033,21 @@ type RestoreOptions struct {
 // 损坏都在 Restore 的回滚守卫内触发，原账套自动放回，
 // 而不是留给打开阶段再失败、让用户手工翻暂存目录。
 func (s *Service) Restore(ctx context.Context, o RestoreOptions) (*backup.RestoreResult, error) {
+	// 目标路径先规约：往一个「指向账套的符号链接」上恢复，
+	// os.Rename 会把链接本身换成独立文件，原账套原地不动
+	// ——命令报告成功，实际一字没恢复。规约到真实位置再动。
+	dbPath := filelock.CanonicalPath(o.DBPath)
 	// 恢复全程持独占占用（§2.4）：任何进程持共享打开着就拒绝，
 	// 而不是让它对着已被替换的文件继续写。
 	var lk *filelock.Lock
 	var err error
-	if _, statErr := os.Stat(o.DBPath); errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(dbPath); errors.Is(statErr, os.ErrNotExist) {
 		var id filelock.Identity
-		if id, err = filelock.PathIdentity(o.DBPath); err == nil {
+		if id, err = filelock.PathIdentity(dbPath); err == nil {
 			lk, err = filelock.AcquireIdentity(id, true)
 		}
 	} else {
-		lk, err = filelock.AcquireExclusive(o.DBPath)
+		lk, err = filelock.AcquireExclusive(dbPath)
 	}
 	if err != nil {
 		if errors.Is(err, filelock.ErrOccupied) {
@@ -1051,7 +1056,7 @@ func (s *Service) Restore(ctx context.Context, o RestoreOptions) (*backup.Restor
 		return nil, err
 	}
 	defer lk.Release()
-	return backup.Restore(ctx, o.Archive, o.DBPath, o.FilesDir,
+	return backup.Restore(ctx, o.Archive, dbPath, o.FilesDir,
 		sqlite.VerifyOpenable)
 }
 

@@ -803,3 +803,55 @@ URL:  http://127.0.0.1:<端口>/mcp
   另一条记录。修法：`decodeMapArgs` 用 `UseNumber` 重解
   `req.Params.Arguments`，`idFromJSON`/`patchInt` 精确解析
   `json.Number`。
+
+### 四轮复查修复记录（验收实测：边界与半完成态）
+
+验收复核三轮修复：关账死锁、SSE 停止不刷新、同实例重开
+已通过；以下 5 项边界仍可复现，逐项修复。
+
+**符号链接恢复锁（1 项）**
+
+- 恢复暂存原库后目标短暂不存在，指向它的符号链接变成
+  悬空链接：旧 `CanonicalPath` 只回溯到「存在的祖先」，
+  悬空末段按链接名算出另一把 p- 闸门，新建占位把库文件
+  写穿链接落在恢复目标上。修法：`CanonicalPath` 增加
+  「EvalSymlinks 失败 → Lstat 全路径 → 末段是符号链接就
+  Readlink 跳目标再重试」循环（上界 40 防环），再回溯
+  祖先。`service.Restore` 把目标路径先规约再锁再替换——
+  直接往符号链接上恢复，`os.Rename` 会把链接本身换成
+  独立文件、原账套原地不动，命令报成功实际一字没恢复。
+
+**owner 表继承（1 项）**
+
+- 单行 owner 记录绑定首个 PID：登记进程退出、写进程继续
+  运行时，新开的硬链接只读端失去归并路径，又读到 0 行。
+  修法：`.owner` 升级为多行表「pid → 归并后路径」，每个
+  持锁进程登记自己的行（登记的是归并后的实际打开路径，
+  继承链不断）；取首个活行，`readOwnerTable` 按 pid 活性
+  + 「记录路径仍指向同一身份」双重校验过滤陈行。
+
+**幂等补记半完成态（1 项）**
+
+- 「审计 Append 成功、`audit_state` 更新失败」留下
+  已落库日志 + repairing 状态；认领过期后重试又写一条
+  创建日志。修法：CAS 认领后先 `hasCreateAudit` 查重——
+  按 entity+Book+`clientRequestId`（detail_json 里）找
+  已有创建日志，命中只把状态修回 recorded，不再追加。
+  查重用 `QueryAudit` 的 Text 过滤（detail_json 已进
+  检索列）+ 逐条精确比对。
+
+**大整数输出（1 项）**
+
+- 输入侧 `UseNumber` 已精确，但 `mustJSON` 输出侧普通解码
+  把 int64 变 float64：`list_contacts` 把 ...992 和 ...993
+  都序列化成 ...992，客户端照抄列表 id 改错记录。修法：
+  `mustJSON` 改 `json.Decoder.UseNumber`，`yuanWalk` 对
+  `json.Number` 走 `Int64()` 转换；分页/报表非金额数字
+  仍按数字输出，金额键仍转元字符串。
+
+**`:memory:` 回归（1 项）**
+
+- 路径归约把 SQLite 内存库标记变成当前目录绝对路径，
+  磁盘上落了名为 `:memory:` 的文件。修法：`service.Open`
+  在规约前先判 `:memory:` ——不规约、不取文件锁、
+  `openPath`/`s.path` 原样保留。

@@ -143,3 +143,32 @@ func TestReadonlyAliasSeesWriterWAL(t *testing.T) {
 		t.Fatalf("别名只读应归并到 %q，实际 %q", svc.Path(), ro.Path())
 	}
 }
+
+// :memory: 是 SQLite 内存库标记，不是路径——路径规约把它
+// 变成 ./:memory: 磁盘文件就是回归（实测复现）。
+func TestMemoryPathCreatesNoFile(t *testing.T) {
+	dir := t.TempDir()
+	old, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(old)
+
+	svc, err := service.Open(context.Background(), service.Options{Path: ":memory:"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Shutdown()
+	if _, err := svc.CreateBook(context.Background(), service.CreateBookInput{
+		CompanyName: "内存库", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if svc.Path() != ":memory:" {
+		t.Fatalf("内存库的 Path 应是 :memory:，实际 %q", svc.Path())
+	}
+	if _, err := os.Stat(":memory:"); !os.IsNotExist(err) {
+		t.Fatal(":memory: 不应在磁盘落文件")
+	}
+}

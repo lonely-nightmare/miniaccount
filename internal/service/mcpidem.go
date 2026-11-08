@@ -166,6 +166,14 @@ func (s *Service) resolveIdem(ctx context.Context, row *sqlite.IdemRow,
 			}
 			return d, out, nil
 		}
+		// ★ 先查重再补写：上次「日志写成、SetAuditState 失败」
+		// 会留下已落库的创建日志 + repairing 状态——不查重就
+		// 再写，一条创建变两条（实测复现）。
+		if s.hasCreateAudit(ctx, row) {
+			s.db.MCPIdem().SetAuditState(ctx, row.RequestID, "recorded", "")
+			out.AuditState = "recorded"
+			return d, out, nil
+		}
 		if repairErr := s.repairCreateAudit(ctx, d, row); repairErr != nil {
 			s.db.MCPIdem().SetAuditState(ctx, row.RequestID, "failed", repairErr.Error())
 			out.AuditState, out.AuditError = "failed", repairErr.Error()
@@ -180,6 +188,29 @@ func (s *Service) resolveIdem(ctx context.Context, row *sqlite.IdemRow,
 		out.AuditState, out.AuditError = "pending", "上次写入后未确认审计留痕"
 	}
 	return d, out, nil
+}
+
+// hasCreateAudit 查这张凭证是否已有带本 requestID 的创建日志
+// —— 「Append 成功、SetAuditState 失败」留下的半完成态靠它
+// 识别，避免重试再写一条。
+// requestID 在 detail_json 里，Text 过滤缩小范围后再精确比对。
+func (s *Service) hasCreateAudit(ctx context.Context, row *sqlite.IdemRow) bool {
+	page, err := s.QueryAudit(ctx, AuditQuery{
+		Actions: []string{string(audit.ActionVoucherCreate)},
+		Text:    row.RequestID, Limit: 20,
+	})
+	if err != nil || page == nil {
+		return false
+	}
+	vid := fmt.Sprintf("%d", row.VoucherID)
+	for _, e := range page.Entries {
+		if e.Entity == "voucher" && e.EntityID == vid && e.Book == s.path {
+			if rid, ok := e.Detail["clientRequestId"].(string); ok && rid == row.RequestID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // repairCreateAudit 为「审计写失败」的幂等命中补记创建日志。

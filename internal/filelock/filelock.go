@@ -76,10 +76,12 @@ func Dir() (string, error) {
 
 // CanonicalPath 把路径规约到「真实位置」：
 //   - 文件存在：全路径 EvalSymlinks —— 连末段的文件符号链接
-//     一起解析（/link/b.db → /real/b.db）。这步不能省：
-//     只解析父目录会让「指向恢复目标的文件符号链接」算出
-//     不同的路径身份，绕过路径闸门去读刚被替换的新文件。
-//   - 文件不存在：解析最深存在的祖先（父目录）再接回文件名。
+//     一起解析（/link/b.db → /real/b.db）。
+//   - 末段是悬空的符号链接（恢复暂存原库、目标短暂不存在时
+//     就是这种状态）：EvalSymlinks 解不动，但链接本身在——
+//     Readlink 跳到目标再整轮重试，不跳就按别的名字算出
+//     另一把闸门绕过恢复锁。
+//   - 其余不存在：逐级向上找能解析的祖先，剩余段原样接回。
 //
 // 锁身份、SQLite 实际打开路径一律用规约结果——SQLite 的 WAL
 // 文件按「打开时传入的路径字符串」命名，两个名字=两份 WAL。
@@ -88,14 +90,39 @@ func CanonicalPath(path string) string {
 	if err != nil {
 		return filepath.Clean(path)
 	}
-	if r, err := filepath.EvalSymlinks(abs); err == nil {
-		return r
+	for i := 0; i < 40; i++ {
+		if r, err := filepath.EvalSymlinks(abs); err == nil {
+			return r
+		}
+		fi, err := os.Lstat(abs)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			break
+		}
+		tgt, err := os.Readlink(abs)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(tgt) {
+			tgt = filepath.Join(filepath.Dir(abs), tgt)
+		}
+		abs = filepath.Clean(tgt)
 	}
-	dir, base := filepath.Dir(abs), filepath.Base(abs)
-	if rd, err := filepath.EvalSymlinks(dir); err == nil {
-		return filepath.Join(rd, base)
+	cur := abs
+	var rest []string
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(rest) - 1; i >= 0; i-- {
+				r = filepath.Join(r, rest[i])
+			}
+			return r
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs
+		}
+		rest = append(rest, filepath.Base(cur))
+		cur = parent
 	}
-	return abs
 }
 
 // IdentityOf 解析路径并取文件身份。文件必须已存在。
@@ -238,19 +265,24 @@ func acquire(path string, exclusive bool) (*Lock, error) {
 // 无归并（独占获取、路径锁占位）时返回空串，调用方用原路径。
 func (l *Lock) EffectivePath() string { return l.effective }
 
-// claimOpenPath 决定本次打开用哪条路径：读 owner 记录 →
-// 有活进程登记过别的规约路径就换用它；没有就登记自己的。
+// claimOpenPath 决定本次打开用哪条路径：owner 表存每个持锁
+// 进程的「pid → 归并后路径」，取首个活着的登记路径；都死了
+// 或表空 → 登记自己的规约路径。
 //
-// 共享锁不互斥——两个首开进程可能同时看到「没有记录」，
-// 「读→判→写」必须另串行，所以开一把 <身份>.claim 短锁
-// （顺序固定 gate→i→claim，不回头，不死锁）。进程崩溃留
-// 下的陈记录靠 pid 活性 + 「记录路径仍指向同一身份」回收。
+// 一行一活人的原因是「登记进程退出」不该让表失效：写进程还
+// 活着、它的登记行还在，后开者继续归并到它在用的路径——
+// 归并进的是「实际打开路径」，不是「各自想要的路径」。
+//
+// 共享锁不互斥——两个首开进程可能同时看到「表空」，「读→判
+// →写」必须另串行，所以开一把 <身份>.claim 短锁（顺序固定
+// gate→i→claim，不回头，不死锁）。陈行按 pid 活性 + 「记录
+// 路径仍指向同一身份」双重校验回收。
 func claimOpenPath(id Identity, mine string) (string, error) {
 	dir, err := Dir()
 	if err != nil {
 		return "", err
 	}
-	// .claim 只被持有「读一行+写一个文件」这一瞬，但取不到
+	// .claim 只被持有「读几行+写一个文件」这一瞬，但取不到
 	// 也不能直接放弃——短退避等一拍即可。
 	var claim *Lock
 	for i := 0; i < 20; i++ {
@@ -269,38 +301,79 @@ func claimOpenPath(id Identity, mine string) (string, error) {
 	defer claim.Release()
 
 	owner := filepath.Join(dir, id.Key+".owner")
-	if b, err := os.ReadFile(owner); err == nil {
-		if pid, rec := parseOwner(string(b)); pid > 0 && rec != "" &&
-			processAlive(pid) {
-			// 记录路径可能被回收重用过：它必须仍指向同一
-			// 文件身份，否则照它打开会开错账套。
-			if rid, rerr := IdentityOf(rec); rerr == nil && rid.Key == id.Key {
-				return rec, nil
-			}
+	live := readOwnerTable(owner, id)
+	eff := mine
+	if len(live) > 0 {
+		eff = live[0].path
+	}
+	// 自己这行也要登记（登记的是归并后的实际打开路径）——
+	// 否则前面的人一退，这张表就断了继承人。
+	me := os.Getpid()
+	rows := live[:0]
+	for _, r := range live {
+		if r.pid != me {
+			rows = append(rows, r)
 		}
 	}
+	rows = append(rows, ownerRow{pid: me, path: eff})
 	tmp := owner + ".tmp"
-	content := strconv.Itoa(os.Getpid()) + "\n" + mine + "\n"
-	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+	var sb strings.Builder
+	for _, r := range rows {
+		sb.WriteString(strconv.Itoa(r.pid))
+		sb.WriteByte('\t')
+		sb.WriteString(r.path)
+		sb.WriteByte('\n')
+	}
+	if err := os.WriteFile(tmp, []byte(sb.String()), 0o600); err != nil {
 		return "", err
 	}
 	if err := os.Rename(tmp, owner); err != nil {
 		return "", err
 	}
-	return mine, nil
+	return eff, nil
 }
 
-// parseOwner 解析 owner 记录「pid\n路径」。
+// ownerRow 是 owner 表的一行：持锁进程 → 它实际打开的路径。
+type ownerRow struct {
+	pid  int
+	path string
+}
+
+// readOwnerTable 读 owner 表并按「pid 活 + 路径仍指向同一
+// 文件身份」过滤出活行；解析不了的行直接丢。
+func readOwnerTable(owner string, id Identity) []ownerRow {
+	b, err := os.ReadFile(owner)
+	if err != nil {
+		return nil
+	}
+	var out []ownerRow
+	for _, ln := range strings.Split(string(b), "\n") {
+		if ln == "" {
+			continue
+		}
+		pid, p := parseOwner(ln)
+		if pid <= 0 || p == "" || !processAlive(pid) {
+			continue
+		}
+		if rid, err := IdentityOf(p); err != nil || rid.Key != id.Key {
+			continue
+		}
+		out = append(out, ownerRow{pid: pid, path: p})
+	}
+	return out
+}
+
+// parseOwner 解析一行「pid\t路径」。
 func parseOwner(s string) (int, string) {
-	parts := strings.SplitN(strings.TrimRight(s, "\n"), "\n", 2)
-	if len(parts) != 2 {
+	pidStr, p, ok := strings.Cut(s, "\t")
+	if !ok {
 		return 0, ""
 	}
-	pid, err := strconv.Atoi(parts[0])
+	pid, err := strconv.Atoi(pidStr)
 	if err != nil || pid <= 0 {
 		return 0, ""
 	}
-	return pid, parts[1]
+	return pid, p
 }
 
 // WriterKey 由账套身份推导「写者锁」的身份：读写打开在

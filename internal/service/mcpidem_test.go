@@ -220,3 +220,59 @@ func TestIdempotentRepairReplaysOriginalOnce(t *testing.T) {
 		t.Fatalf("补记应回放原始金额 100,000.00，实际记成 %v（=改后内容失真）", got)
 	}
 }
+
+// ★ 半完成态修复（实测复现）：「日志已写成、recorded 更新失败」
+// 留下的是 repairing + 已落库日志——认领过期后的重试必须
+// 先查重再决定补不补，否则一条创建日志写两条。
+func TestIdempotentRepairDedupesWrittenAudit(t *testing.T) {
+	ctx := context.Background()
+
+	service.SetAuditDir("")
+	service.CloseAudit()
+	svc := newSvc(t, 3)
+	sh := mustContact(t, svc, "shareholder", "张三")
+	in := basicInput()
+	in.Lines[1].ContactID = &sh
+	const key, hash = "req-dedupe", "h-ded"
+
+	if _, oc, err := svc.CreateDraftVoucherIdempotent(ctx, in, key, hash); err != nil ||
+		oc.AuditState != "failed" {
+		t.Fatalf("无审计目录时应 failed: %v %+v", err, oc)
+	}
+
+	service.SetAuditDir(filepath.Join(t.TempDir(), "logs"))
+	t.Cleanup(func() {
+		service.CloseAudit()
+		service.SetAuditDir("")
+	})
+
+	// 第一次重试：补记成功 → recorded + 一条日志。
+	if _, oc, err := svc.CreateDraftVoucherIdempotent(ctx, in, key, hash); err != nil ||
+		oc.AuditState != "recorded" {
+		t.Fatalf("首次补记应 recorded: %v %+v", err, oc)
+	}
+	if n := len(findAudit(t, svc, audit.ActionVoucherCreate)); n != 1 {
+		t.Fatalf("应有 1 条创建日志，实际 %d", n)
+	}
+
+	// 模拟「Append 成功、SetAuditState 失败」：状态卡在
+	// repairing 且认领已过期（直接改库演半完成态）。
+	if _, err := svc.DB().SQL().ExecContext(ctx, `
+		UPDATE mcp_idempotency SET audit_state='repairing',
+			repair_claim_at='2000-01-01T00:00:00Z'
+		WHERE request_id=?`, key); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重试：查重发现日志已在 → 只修状态，不许再写。
+	_, oc, err := svc.CreateDraftVoucherIdempotent(ctx, in, key, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oc.AuditState != "recorded" {
+		t.Fatalf("查重命中应直接 recorded，实际 %q: %s", oc.AuditState, oc.AuditError)
+	}
+	if n := len(findAudit(t, svc, audit.ActionVoucherCreate)); n != 1 {
+		t.Fatalf("查重命中不该再写，创建日志仍 %d 条", n)
+	}
+}

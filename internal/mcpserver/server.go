@@ -9,6 +9,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -224,13 +225,19 @@ func yuanStr(m money.Money) string { return m.String() }
 
 // mustJSON 把任意值转成 map/slice —— 工具输出统一走
 // StructuredContent，JSON 往返是拿现成结构的最短路径。
+// ★ 必须 UseNumber：普通解出的 float64 会吃掉 >2^53 的 id
+// （9007199254740993 → ...992），把这条数据再 marshal 出去，
+// 客户端照抄 id 就改到另一条档案上。json.Number 保字面量，
+// 重新序列化原样输出。
 func mustJSON(v any) any {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
 	var out any
-	if err := json.Unmarshal(b, &out); err != nil {
+	if err := dec.Decode(&out); err != nil {
 		return map[string]any{"error": err.Error()}
 	}
 	return out
@@ -275,9 +282,11 @@ func yuanWalk(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			if f, ok := val.(float64); ok && moneyKeys[strings.ToLower(k)] {
-				t[k] = yuanStr(money.Money(int64(f)))
-				continue
+			if n, ok := val.(json.Number); ok && moneyKeys[strings.ToLower(k)] {
+				if cents, err := n.Int64(); err == nil {
+					t[k] = yuanStr(money.Money(cents))
+					continue
+				}
 			}
 			t[k] = yuanWalk(val)
 		}

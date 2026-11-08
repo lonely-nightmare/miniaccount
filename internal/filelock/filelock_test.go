@@ -3,7 +3,9 @@ package filelock
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -240,5 +242,91 @@ func TestOwnerRecordRewritesAliasPath(t *testing.T) {
 	if eff := s2.EffectivePath(); eff != CanonicalPath(a) {
 		t.Fatalf("别名打开应归并到首开端路径 %q，实际 %q",
 			CanonicalPath(a), eff)
+	}
+}
+
+// 恢复暂存原库时目标路径短暂不存在，指向它的符号链接变成
+// 悬空链接 —— CanonicalPath 必须按 Readlink 跳到目标路径，
+// 否则「新建占位」算出另一把 p- 身份，把库文件写穿链接
+// 落在恢复目标上，绕过恢复锁。
+func TestCanonicalPathDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "book.db")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.db")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("此平台不支持符号链接")
+	}
+	// 恢复先对目标取独占（文件还在），再暂存目标 → 链接悬空。
+	x, err := AcquireExclusive(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Release()
+	stashed := target + ".stashed"
+	if err := os.Rename(target, stashed); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Rename(stashed, target)
+	if got := CanonicalPath(link); got != CanonicalPath(target) {
+		t.Fatalf("悬空链接应规约到目标: %q vs %q", got, target)
+	}
+	// 「文件不存在 → 新建占位」的分支：链接的路径身份必须
+	// 归并到目标那把 p- 闸门上，恢复独占期间占位被拒。
+	pid, err := PathIdentity(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireIdentity(pid, false); !errors.Is(err, ErrOccupied) {
+		t.Fatalf("恢复独占期间经悬空链接占位应被拒: %v", err)
+	}
+}
+
+// owner 表按行存「pid→实际打开路径」：登记进程退出后，
+// 其它持锁行的路径继续生效——后开者仍归并到那本账，
+// 不会因为「写表的人死了」就换路径名去读另一份 WAL。
+func TestOwnerTableSurvivesRegistrarExit(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "book.db")
+	alias := filepath.Join(dir, "alias.db")
+	if err := os.WriteFile(db, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(db, alias); err != nil {
+		t.Skip("此平台不支持硬链接")
+	}
+	// 预写一张表：登记进程（已死）用原名，我们（写进程角色）
+	// 也用原名 —— 演「登记者退出、活着的持有者继续用原名」。
+	id, err := IdentityOf(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockDir, err := Dir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := filepath.Join(lockDir, id.Key+".owner")
+	canon := CanonicalPath(db)
+	// 死 pid：找一个肯定不活的 —— 拉一个短命进程的 pid。
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Skip("拿不到一个已退出进程的 pid")
+	}
+	deadPid := cmd.Process.Pid
+	content := strconv.Itoa(deadPid) + "\t" + canon + "\n" +
+		strconv.Itoa(os.Getpid()) + "\t" + canon + "\n"
+	if err := os.WriteFile(owner, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 经别名取共享锁：首个活行是我们的行（canon），返回它。
+	s, err := AcquireShared(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Release()
+	if eff := s.EffectivePath(); eff != canon {
+		t.Fatalf("登记者死后应继承在活行的路径 %q，实际 %q", canon, eff)
 	}
 }

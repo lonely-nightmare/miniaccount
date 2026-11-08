@@ -195,3 +195,23 @@ func TestDecodeMapArgsPreservesBigInt(t *testing.T) {
 		t.Fatal("小数 id 应被拒")
 	}
 }
+
+// ★ 输出侧精度（实测复现）：mustJSON 普通解码把 int64 变
+// float64，>2^53 的 id 在电文上就是错的——客户端照抄
+// 列表里的 id 会改到另一条档案。UseNumber 保字面量。
+func TestMustJSONPreservesBigInt(t *testing.T) {
+	out := mustJSON(map[string]any{"id": int64(9007199254740993)})
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "9007199254740993") {
+		t.Fatalf("电文 id 应保留精确值，实际 %s", b)
+	}
+	// 分页封套同样保留。
+	p := pageOf([]map[string]any{{"id": int64(9007199254740993)}}, pageIn{})
+	b, _ = json.Marshal(p)
+	if !strings.Contains(string(b), "9007199254740993") {
+		t.Fatalf("分页封套里 id 应保留精确值，实际 %s", b)
+	}
+}
