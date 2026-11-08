@@ -151,6 +151,22 @@ async function boot() {
   Object.defineProperty(globalThis, 'window', {
     value: win, configurable: true, writable: true,
   })
+  // ★ localStorage / sessionStorage 要**强制**用 jsdom 的。
+  //
+  // Node ≥25 在 globalThis 上自带一个 Web Storage 桩 —— 上面的
+  // 「只补缺」循环看见已存在就跳过，于是界面里的 localStorage
+  // 解析到 Node 的桩上：没传 --localstorage-file 时它一碰就抛
+  // 「localStorage is not available」。
+  // 这个异常挂在 App 的 mounted 钩子里，refreshBook 永远没跑 ——
+  // 界面一直停在「尚未打开账套」，所有页面测试跟着全灭。
+  // 浏览器语义归浏览器实现：jsdom 的 Storage 才是这份界面要跑的。
+  for (const k of ['localStorage', 'sessionStorage']) {
+    try {
+      Object.defineProperty(globalThis, k, {
+        value: win[k], configurable: true, writable: true,
+      })
+    } catch { /* 装不上就算了 */ }
+  }
   globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0)
   globalThis.cancelAnimationFrame = (h) => clearTimeout(h)
   win.matchMedia ||= () => ({ matches: false, addEventListener() {}, removeEventListener() {} })
@@ -756,7 +772,7 @@ test('★ 凭证录完只是草稿，结账时才过账', async () => {
   await page.type(page.input('input[placeholder="结账 / 反结账时签名用"]'), '回归测试员')
   await settle(30)
   for (const n of [...bundle.api.notices.items]) bundle.api.dismiss(n.id)
-  await page.click('结账')
+  await page.clickExact('结账')
   await settle(150)
 
   // 预览要把「结账会先过账几张草稿」说在前面
@@ -765,7 +781,7 @@ test('★ 凭证录完只是草稿，结账时才过账', async () => {
   assert.ok(pv.data.draftCount >= 1,
     `预览没报出待过账的草稿张数：${JSON.stringify({ draftCount: pv.data.draftCount })}`)
 
-  await page.click('确认结账')
+  await page.clickExact('确认结账')
   await settle(200)
   const toast = bundle.api.notices.items.map((n) => n.message).join(' | ')
   assert.ok(/过账本期 \d+ 张草稿/.test(toast),
@@ -782,9 +798,9 @@ test('★ 凭证录完只是草稿，结账时才过账', async () => {
   // 收尾：反结账回来，别影响后面的测试
   await page.goto('/periods')
   await settle(80)
-  await page.click('反结账')
+  await page.clickExact('反结账')
   await settle(120)
-  await page.click('确认反结账')
+  await page.clickExact('确认反结账')
   await settle(150)
 })
 
@@ -802,14 +818,19 @@ test('★ 固定资产次月起提、待摊当月就摊，计提出来是草稿'
   await page.goto('/assets')
   await settle(80)
 
-  // 用**第一个**已启用期间：这样次月也是已启用的，
-  // 「次月起提」才验证得了（用最后一个的话，次月还没启用，提不了）
+  // 用**第一个**已启用期间，「次月」取它的下一期。
+  //
+  // ★ 不假设 next 已经启用：套件前面有「真·结账」用例，
+  // 而反结账会把后面的启用期退回 future —— 账上很可能只剩一个
+  // open。所以第 5 步**自己把 first 结掉来启用 next**，
+  // 这也正是真实的记账顺序：想记次月的账，先把这个月结掉。
   const per = await bundle.api.api.periods()
   const opens = (per.data.periods ?? []).filter((p) => p.status === 'open')
-  assert.ok(opens.length >= 2, `已启用期间不足两个：${opens.length}`)
+  assert.ok(opens.length >= 1, `没有可记账的期间：${opens.length}`)
   const first = opens[0]
-  const next = opens[1]
-  assert.equal(nextPeriodLabel(first), next.label, '已启用期间不连续，这条测试的前提不成立')
+  const ny = first.month === 12 ? first.year + 1 : first.year
+  const nm = first.month === 12 ? 1 : first.month + 1
+  const next = { year: ny, month: nm, label: `${ny}-${String(nm).padStart(2, '0')}` }
   const day = `${first.year}-${String(first.month).padStart(2, '0')}-15`
 
   // ---- 1. 登记一张固定资产（走界面）----
@@ -922,7 +943,9 @@ test('★ 固定资产次月起提、待摊当月就摊，计提出来是草稿'
   assert.ok(/已经(计提|摊销)过/.test(again.fault?.message ?? ''),
     `重复计提的错误要说清楚是重复：${again.fault?.message}`)
 
-  // ---- 5. 次月：这回固定资产提上了 ----
+  // ---- 5. 次月：先结掉本月启用下期，这回固定资产提上了 ----
+  const cls = await bundle.api.api.close({ year: first.year, month: first.month, by: '回归测试员' })
+  assert.equal(cls.ok, true, `结掉 ${first.label} 才能启用 ${next.label}：${cls.fault?.message}`)
   const acc2 = await bundle.api.api.accrue({ year: next.year, month: next.month, by: '回归测试员' })
   assert.equal(acc2.ok, true, acc2.fault?.message)
   assert.ok(acc2.data.depreciationVoucherId > 0,
@@ -1121,7 +1144,7 @@ test('★ 结账真的能结掉（不是只把弹窗打开）', async () => {
   assert.ok(openOne, `演示账套里没有可结账的期间：${JSON.stringify(before.data.periods)}`)
 
   // 打开结账弹窗（这一步原来就是好的，问题在下一步）
-  await page.click('结账')
+  await page.clickExact('结账')
   await settle(120)
 
   // ★ 弹窗里必须带着「结哪个期间」。缺了它，请求里的 year/month 就是
@@ -1133,7 +1156,7 @@ test('★ 结账真的能结掉（不是只把弹窗打开）', async () => {
   assert.equal(preview.data.month, openOne.month, 'ClosingPreview 没带 month')
 
   // 真点「确认结账」
-  await page.click('确认结账')
+  await page.clickExact('确认结账')
   await settle(150)
 
   const after = await bundle.api.api.periods()
@@ -1147,9 +1170,9 @@ test('★ 结账真的能结掉（不是只把弹窗打开）', async () => {
   // 收尾：反结账回来
   await page.goto('/periods')
   await settle(80)
-  await page.click('反结账')
+  await page.clickExact('反结账')
   await settle(120)
-  await page.click('确认反结账')
+  await page.clickExact('确认反结账')
   await settle(150)
   const back = await bundle.api.api.periods()
   const reopened = (back.data.periods ?? []).find(
@@ -1411,7 +1434,8 @@ test('★ 审计底稿：三个门槛算得对，生成凭证不等于已入账'
   await settle(80)
 
   const per = await bundle.api.api.periods()
-  // 用最后**一期已启用**的期间。
+  // 用**当前**已启用期间 —— 页面下拉默认选中的就是它，
+  // 中途切走再回来时不会跳到别的期间。
   //
   // ★ 不能用未启用的期间：调整凭证同样是凭证，往一个没开的月份里
   // 塞草稿会被 `期间未启用` 拦下（这条规则本身是对的 ——
@@ -1419,7 +1443,7 @@ test('★ 审计底稿：三个门槛算得对，生成凭证不等于已入账'
   // 底稿可以按任意期间编，但「生成凭证」这一步要求期间是开的。
   const opens = (per.data.periods ?? []).filter((p) => p.status === 'open')
   assert.ok(opens.length > 0, '演示账套没有已启用的期间')
-  const target = opens[opens.length - 1]
+  const target = opens[0]
   const y = target.year
   const m = String(target.month).padStart(2, '0')
 
@@ -1575,7 +1599,7 @@ test('★ 审计证据链：挂依据、判重、原件丢了要说出来', asyn
   const per = await bundle.api.api.periods()
   const opens = (per.data.periods ?? []).filter((p) => p.status === 'open')
   assert.ok(opens.length > 0, '演示账套没有已启用的期间')
-  const target = opens[opens.length - 1]
+  const target = opens[0]
   const sel = [...win.document.body.querySelectorAll('select')][0]
   sel.value = target.label
   sel.dispatchEvent(new win.Event('change', { bubbles: true }))
@@ -1698,7 +1722,7 @@ test('★ 税务计算表：三张表算得出数，且标明不可直接申报'
   const per = await bundle.api.api.periods()
   const opens = (per.data.periods ?? []).filter((p) => p.status === 'open')
   assert.ok(opens.length > 0, '演示账套没有已启用的期间')
-  const target = opens[opens.length - 1]
+  const target = opens[0]
   const sel = [...win.document.body.querySelectorAll('select')][0]
   sel.value = target.label
   sel.dispatchEvent(new win.Event('change', { bubbles: true }))
@@ -1801,7 +1825,7 @@ test('★ 审计文书：三份草稿都标明不可直接出具，待补事项�
   const per = await bundle.api.api.periods()
   const opens = (per.data.periods ?? []).filter((p) => p.status === 'open')
   assert.ok(opens.length > 0, '演示账套没有已启用的期间')
-  const target = opens[opens.length - 1]
+  const target = opens[0]
   const sel = [...win.document.body.querySelectorAll('select')][0]
   sel.value = target.label
   sel.dispatchEvent(new win.Event('change', { bubbles: true }))
@@ -1903,7 +1927,7 @@ test('★ 申报台账：登记、重复拦截、作废重报、与计算表对�
   const per = await bundle.api.api.periods()
   const opens = (per.data.periods ?? []).filter((p) => p.status === 'open')
   assert.ok(opens.length > 0, '演示账套没有已启用的期间')
-  const target = opens[opens.length - 1]
+  const target = opens[0]
   const sel = [...win.document.body.querySelectorAll('select')][0]
   sel.value = target.label
   sel.dispatchEvent(new win.Event('change', { bubbles: true }))

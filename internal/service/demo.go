@@ -96,6 +96,20 @@ func (s *Service) CreateDemoBook(ctx context.Context, toMonth int) (*DemoResult,
 		}
 		res.ClosedMonths++
 	}
+
+	// 再把「次月」启用。
+	//
+	// 否则整个账套只剩一个 open 期间：登记一张固定资产后，
+	// 「次月起提」没有可记账的期间，演示走到计提就卡在
+	// 「期间未启用」—— 演示账套的意义是不用结账也能逛一圈。
+	// 与结账启用下期是同一个动作；toMonth=12 时由 EnsureNextOpen
+	// 的跨年分支补出次年期间行再启用。
+	if err := s.db.WithTx(ctx, func(tx *sqlite.Tx) error {
+		return s.db.Periods().EnsureNextOpen(ctx, tx, period.NewKey(DemoYear, toMonth))
+	}); err != nil {
+		res.Warnings = append(res.Warnings,
+			fmt.Sprintf("启用 %d 月的下一期间失败：%v", toMonth, err))
+	}
 	return res, nil
 }
 

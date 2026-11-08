@@ -34,6 +34,23 @@ func TestCreateDemoBookAsGUIUsesIt(t *testing.T) {
 		t.Errorf("生成过程有告警：%s", w)
 	}
 
+	// ★ 演示账套要留「当前月 + 次月」两个可记账期间 ——
+	// 否则登记一张固定资产后，「次月起提」没有可记账期间，
+	// 演示走到计提就卡在「期间未启用」（GUI 冒烟曾因此长期失败）。
+	info, f := a.Periods()
+	if f != nil {
+		t.Fatalf("取期间失败: %v", f)
+	}
+	var openMonths []int
+	for _, p := range info.Periods {
+		if p.Year == service.DemoYear && p.Status == "open" {
+			openMonths = append(openMonths, p.Month)
+		}
+	}
+	if len(openMonths) != 2 || openMonths[0] != 3 || openMonths[1] != 4 {
+		t.Errorf("演示账套的 open 期间应是 3 月与 4 月，实际 %v", openMonths)
+	}
+
 	// 演示账套要能立刻出报表 —— 这正是它存在的意义
 	if _, f := a.Report(ReportRequest{Kind: "bs", Year: service.DemoYear, Month: 3}); f != nil {
 		t.Errorf("演示账套应能出资产负债表: %v", f)

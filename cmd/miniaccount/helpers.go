@@ -289,9 +289,6 @@ type demoResult struct {
 //	计提结转     → 期末结转损益
 func money100(yuan int64) money.Money { return money.Money(yuan) * money.Yuan }
 
-// demoYear 是演示账套使用的年度。
-const demoYear = 2025
-
 // ---------------------------------------------------------------------------
 // demo 命令
 // ---------------------------------------------------------------------------
@@ -326,51 +323,24 @@ func cmdDemo(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if _, err := svc.CreateBook(ctx, service.CreateBookInput{
-		CompanyName: "杭州云帆软件有限公司",
-		CreditCode:  "91330100MA2EXAMPLE",
-		LegalPerson: "张三",
-		// 演示账套按一般纳税人 + 小型企业建，与界面上的
-		// 「生成演示账套」按钮保持一致（两边共用同一份生成逻辑）。
-		VATStatus:       "general",
-		EnterpriseScale: "small",
-		StartYear:       demoYear, StartMonth: 1,
-		ThroughYear: demoYear,
-		CurrentYear: demoYear, CurrentMonth: *toMonth,
-	}); err != nil {
-		return err
-	}
-
-	fmt.Printf("正在生成演示账套（%d 年 1 月 ~ %d 月）…\n\n", demoYear, *toMonth)
-	res, err := svc.SeedDemo(ctx, demoYear, 1, *toMonth)
+	// 建账 + 灌数据 + 结旧期 + 启用次月，全部收敛到 service.CreateDemoBook ——
+	// 与界面上「生成演示账套」按钮共用同一份实现，两边不再漂移。
+	fmt.Printf("正在生成演示账套（%d 年 1 月 ~ %d 月）…\n\n", service.DemoYear, *toMonth)
+	res, err := svc.CreateDemoBook(ctx, *toMonth)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("✓ 已写入 %d 张已过账凭证\n", res.Posted)
+	if res.ClosedMonths > 0 {
+		fmt.Printf("✓ 已结账 %d 个月（1 ~ %d 月）\n", res.ClosedMonths, *toMonth-1)
+	}
 	for _, w := range res.Warnings {
 		fmt.Printf("  ! %s\n", w)
 	}
 
-	// 把之前各月结账，让「当前可记账期间」落在最后一个月。
-	//
-	// 这不只是为了演示好看：会计本来就该按期结账，
-	// 跳过 1、2 月直接看 3 月的首页概览，看到的是 1 月的数字 ——
-	// 而「当前期间永远是最早的未结账期间」正是本软件刻意坚持的规则。
-	if *toMonth > 1 {
-		closed := 0
-		for m := 1; m < *toMonth; m++ {
-			if _, err := svc.Close(ctx, period.NewKey(demoYear, m), "王主管"); err != nil {
-				fmt.Printf("  ! %d 月结账失败：%v\n", m, err)
-				continue
-			}
-			closed++
-		}
-		fmt.Printf("✓ 已结账 %d 个月（1 ~ %d 月）\n", closed, *toMonth-1)
-	}
-
 	// 直接跑一遍体检与报表，证明链路是通的
 	fmt.Printf("\n--- 结账前体检 ---\n")
-	h, err := svc.CheckHealth(ctx, period.NewKey(demoYear, *toMonth))
+	h, err := svc.CheckHealth(ctx, period.NewKey(service.DemoYear, *toMonth))
 	if err != nil {
 		return err
 	}
@@ -398,10 +368,10 @@ func cmdDemo(ctx context.Context, args []string) error {
 	fmt.Printf("\n账套文件：%s\n", dbPath)
 	fmt.Printf("接下来可以试试：\n")
 	fmt.Printf("  miniaccount bs       --db %s\n", dbPath)
-	fmt.Printf("  miniaccount pl       --db %s --period %d-%02d\n", dbPath, demoYear, *toMonth)
-	fmt.Printf("  miniaccount cashflow --db %s --period %d-%02d\n", dbPath, demoYear, *toMonth)
+	fmt.Printf("  miniaccount pl       --db %s --period %d-%02d\n", dbPath, service.DemoYear, *toMonth)
+	fmt.Printf("  miniaccount cashflow --db %s --period %d-%02d\n", dbPath, service.DemoYear, *toMonth)
 	fmt.Printf("  miniaccount close    --db %s --period %d-%02d --preview\n",
-		dbPath, demoYear, *toMonth)
+		dbPath, service.DemoYear, *toMonth)
 	fmt.Printf("  miniaccount backup   --db %s --out demo.mabak\n", dbPath)
 	return nil
 }
