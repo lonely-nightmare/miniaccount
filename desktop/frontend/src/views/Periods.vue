@@ -47,6 +47,14 @@ const busy = ref(false)
 // 不要指望后端返回的预览对象顺带带着它。
 const target = ref({ year: 0, month: 0, label: '' })
 
+// ★ 弹窗开着且目标期间没换，响应才有效。
+// 关掉 A 期间的体检再开 B 期间：A 的请求若晚到，会把 A 的结果
+// 铺进 B 的弹窗 —— 两个期间的体检结论混在一起。
+function stillTarget(p) {
+  return dialog.value !== null &&
+    target.value.year === p.year && target.value.month === p.month
+}
+
 async function load() {
   loading.value = true
   const r = await api.periods()
@@ -76,6 +84,7 @@ async function openClose(p) {
     api.previewClose({ year: p.year, month: p.month }),
     api.health({ year: p.year, month: p.month }),
   ])
+  if (!stillTarget(p)) return
   if (pv.ok) preview.value = pv.data
   else notify(pv.fault.message, 'error', pv.fault.detail)
   if (h.ok) health.value = h.data
@@ -89,6 +98,7 @@ async function openReopen(p) {
   // 会短暂显示「3 月的体检结论」，用户拿它点了确认。
   health.value = null
   const h = await api.health({ year: p.year, month: p.month })
+  if (!stillTarget(p)) return
   health.value = h.ok ? h.data : null
 }
 
@@ -101,6 +111,7 @@ async function openHealth(p) {
   preview.value = { period: p.label, steps: [] }
   health.value = null
   const h = await api.health({ year: p.year, month: p.month })
+  if (!stillTarget(p)) return
   if (h.ok) health.value = h.data
   else notify(h.fault.message, 'error', h.fault.detail)
 }

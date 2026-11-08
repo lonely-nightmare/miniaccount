@@ -40,6 +40,10 @@ const reqSeq = ref(0)
 
 async function load() {
   if (!filter.value.accountCode) {
+    // ★ 提前返回也要清 loading：上一个在飞的请求回来时
+    // 会因序号过期直接丢弃、不再复位 loading —— 若这里不清，
+    // 「生成」按钮就一直停在禁用态。
+    loading.value = false
     notify('请先选择要核对的银行科目', 'error')
     return
   }
@@ -51,6 +55,7 @@ async function load() {
   } else {
     const n = Number(String(filter.value.bankBalance).replace(/,/g, ''))
     if (!Number.isFinite(n)) {
+      loading.value = false
       notify('银行对账单余额不是有效数字', 'error')
       return
     }

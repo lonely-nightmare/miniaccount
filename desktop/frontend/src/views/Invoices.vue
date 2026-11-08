@@ -111,14 +111,10 @@ async function post(row) {
   if (!operator.value.trim()) { notify('请填写记账人', 'warn'); return }
   if (!confirm(`为发票 ${row.number || row.code} 生成凭证？\n\n进项票会自动挂「应付账款」，销项票挂「应收账款」。`)) return
   busy.value = true
-  // ★ 费用科目/部门是「生成凭证那一刻」的参数，不属于发票档案。
-  // 仅当表单编辑的正是这张发票时才附带 —— 否则会把新建表单里
-  // 给**另一张**发票填的科目，偷渡到这张发票的凭证上。
-  const sameInvoice = form.value.id === row.id
+  // ★ 费用科目/部门随发票入库（0016 起），过账时后端从档案取 ——
+  // 前端不再传，也就不会再出现「拿 A 发票的表单值贴到 B 发票上」。
   const r = await api.postInvoice({
     id: row.id, postingBy: operator.value.trim(),
-    expenseAccount: sameInvoice ? form.value.expenseAccount : '',
-    deptId: sameInvoice ? form.value.deptId : null,
   })
   busy.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }

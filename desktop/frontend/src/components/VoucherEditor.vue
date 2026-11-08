@@ -175,8 +175,24 @@ function needKeys(line) {
   return a?.auxKeys ?? []
 }
 
-const AUX_LABEL = { customer: '客户', supplier: '供应商', employee: '员工', dept: '部门', project: '项目' }
-const AUX_FIELD = { customer: 'contactId', supplier: 'contactId', employee: 'employeeId', dept: 'deptId', project: 'projectId' }
+const AUX_LABEL = {
+  customer: '客户', supplier: '供应商', shareholder: '股东',
+  other: '其他往来', employee: '员工', dept: '部门', project: '项目',
+}
+// 后端七维：customer/supplier/shareholder/other 都落到 contactId
+const AUX_FIELD = {
+  customer: 'contactId', supplier: 'contactId', shareholder: 'contactId',
+  other: 'contactId', employee: 'employeeId', dept: 'deptId', project: 'projectId',
+}
+// 选择器里能放哪些 kind —— 与后端 auxMatchesContact 一一对应：
+// customer 收 customer|both，supplier 收 supplier|both，
+// shareholder 只收股东档案，other 不限类型（null = 不过滤）。
+const CONTACT_KINDS = {
+  customer: ['customer', 'both'],
+  supplier: ['supplier', 'both'],
+  shareholder: ['shareholder'],
+  other: null,
+}
 
 // 一维一钮：每维独立选择，各自的档案互不串门
 // （应收科目只能选客户，不该把供应商也列出来让人挑错）。
@@ -188,9 +204,10 @@ const auxPickerItems = computed(() => {
   const hit = (s) => !q || (s ?? '').toLowerCase().includes(q)
   const key = auxKey.value
   let list = []
-  if (key === 'customer' || key === 'supplier') {
+  if (key in CONTACT_KINDS) {
+    const kinds = CONTACT_KINDS[key]
     list = (meta.value?.contacts ?? [])
-      .filter((c) => (key === 'customer' ? c.kind === 'customer' : c.kind === 'supplier'))
+      .filter((c) => kinds === null || kinds.includes(c.kind))
       .map((c) => ({ id: c.id, name: c.name, tag: c.kindLabel }))
   } else if (key === 'employee') {
     list = (meta.value?.employees ?? []).map((e) => ({ id: e.id, name: e.name, tag: e.kindLabel }))
@@ -212,10 +229,14 @@ function openAuxPicker(idx, key) {
 
 function pickAux(item) {
   const l = form.value.lines[activeLine.value]
-  const field = AUX_FIELD[auxKey.value]
+  const key = auxKey.value
+  const field = AUX_FIELD[key]
   if (field) {
     l[field] = item.id
-    l._auxDesc = item.name
+    // 各维各记一份名：档案若不在选择器列表里（如已停用），
+    // 按 id 查不到时还能显示对的名字而不是别的维度的名。
+    l._auxNames = { ...(l._auxNames || {}), [key]: item.name }
+    l._auxDesc = item.name // 单维场景的后端描述回落
   }
   showAuxPicker.value = false
 }
@@ -223,14 +244,41 @@ function pickAux(item) {
 function clearAux(l, key) {
   const field = AUX_FIELD[key]
   if (field) l[field] = null
+  if (l._auxNames) delete l._auxNames[key]
   l._auxDesc = ''
 }
 
-// 某一维已填值的显示名（载入的草稿只有 _auxDesc 文本时直接用它）
+// 某一维已填值的显示名。
+//
+// ★ 各维各查各的档案：原来所有已填维度都返回同一个 _auxDesc，
+// 先选部门再选客户，两个按钮会一起显示客户名。
+// 按 id 实时查档案列表才是准的 —— 档案改了名也同步。
+function lookupAuxName(key, id) {
+  const m = meta.value
+  if (!m) return null
+  if (key in CONTACT_KINDS) {
+    return (m.contacts ?? []).find((c) => c.id === id)?.name ?? null
+  }
+  if (key === 'employee') return (m.employees ?? []).find((e) => e.id === id)?.name ?? null
+  if (key === 'dept') return (m.departments ?? []).find((d) => d.id === id)?.fullName ?? null
+  return null
+}
+
+// 该行已填辅助维度的个数：_auxDesc 是载入草稿时后端拼的总描述，
+// 只有一个维度已填时它才无歧义地属于那一维。
+function filledAuxCount(l) {
+  return ['contactId', 'employeeId', 'deptId', 'projectId']
+    .filter((f) => l[f] !== null && l[f] !== undefined).length
+}
+
 function auxChipLabel(l, key) {
   const field = AUX_FIELD[key]
-  if (l[field]) return l._auxDesc || `#${l[field]}`
-  return AUX_LABEL[key] ?? key
+  const id = l[field]
+  if (!id) return AUX_LABEL[key] ?? key
+  return lookupAuxName(key, id)
+    ?? l._auxNames?.[key]
+    ?? (filledAuxCount(l) === 1 ? l._auxDesc : null)
+    ?? `#${id}`
 }
 function auxFilled(l, key) {
   const field = AUX_FIELD[key]

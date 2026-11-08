@@ -29,6 +29,11 @@ const taxTable = ref(null)
 const schemes = ref([])
 const schemeEditing = ref(null)
 const schemeBusy = ref(false)
+// ★ 编辑态文本：金额/费率输入框直接绑 schemeEditing 的分值，
+// 每击一键都会「解析→格式化→回填」，正在输入的中间态
+// 被格式化函数吃掉（输入 4 变成 4.00，再按 5 得 4.005）。
+// 输入期间只动文本，保存时才一次性解析回分。
+const schemeText = ref({ baseMin: '', baseMax: '', rates: {} })
 const loading = ref(false)
 const busy = ref(false)
 // 记账人来自本机设置（见 lib/operator.js）：全程序一份，不再各页各存一份
@@ -52,10 +57,53 @@ async function newScheme() {
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
   // 模板的费率全是 0 —— 这是故意的，见 SchemeTemplate 的说明
   schemeEditing.value = { ...r.data, isNew: true }
+  initSchemeText()
+}
+
+// 打开编辑器时把数值翻成文本态初值。
+function initSchemeText() {
+  const s = schemeEditing.value
+  schemeText.value = {
+    baseMin: centsToYuanInput(s.baseMin) || '',
+    baseMax: centsToYuanInput(s.baseMax) || '',
+    rates: Object.fromEntries(
+      RATE_FIELDS.map((f) => [f.key, String(ppmToPct(s.rates?.[f.key] ?? 0))])),
+  }
+}
+
+// 保存时把文本态解析回分/ppm；解析失败拦在界面上，
+// 而不是静默写成另一个数。
+function applySchemeText() {
+  const s = schemeEditing.value
+  const minT = schemeText.value.baseMin.trim()
+  const min = parseYuanToCents(minT)
+  if (minT !== '' && min === null) {
+    notify('社保基数下限不是有效金额', 'error')
+    return false
+  }
+  s.baseMin = min ?? 0
+  const maxT = schemeText.value.baseMax.trim()
+  const max = parseYuanToCents(maxT)
+  if (maxT !== '' && max === null) {
+    notify('社保基数上限不是有效金额', 'error')
+    return false
+  }
+  s.baseMax = max ?? 0 // 留空 = 不限
+  for (const f of RATE_FIELDS) {
+    const t = String(schemeText.value.rates[f.key] ?? '').trim()
+    const n = t === '' ? 0 : Number(t)
+    if (!Number.isFinite(n) || n < 0) {
+      notify(`「${f.label}」费率不是有效数字`, 'error')
+      return false
+    }
+    s.rates[f.key] = Math.round(n * 10000)
+  }
+  return true
 }
 
 async function saveSchemes() {
   if (!schemeEditing.value) return
+  if (!applySchemeText()) return
   const next = schemes.value.map((x) => x.scheme)
   const i = next.findIndex((x) => x.name === schemeEditing.value.name)
   if (i >= 0) next[i] = schemeEditing.value
@@ -92,12 +140,12 @@ async function removeScheme(name) {
 async function editScheme(scheme) {
   // 深拷贝：编辑期间不该动到列表里的那一份
   schemeEditing.value = JSON.parse(JSON.stringify(scheme))
+  initSchemeText()
 }
 
 // 费率在界面上按「百分比」填，模型里是百万分之一（ppm）。
 // 8% → 80000 ppm，所以在界面上除以 10000。
 function ppmToPct(v) { return v ? +(v / 10000).toFixed(4) : 0 }
-function pctToPpm(v) { return Math.round((Number(v) || 0) * 10000) }
 // 合计费率的展示
 function pctText(ppm) { return ppm ? (ppm / 10000).toFixed(2).replace(/\.?0+$/, '') + '%' : '0%' }
 
@@ -398,19 +446,17 @@ const statusTone = (s) => (s === 'posted' ? 'profit' : s === 'confirmed' ? 'defa
         </div>
 
         <div class="grid grid-cols-2 gap-3">
-          <!-- ★ 模型字段是 baseMin/baseMax（分）。原来绑的
-               baseMinYuan/baseMaxYuan 不存在 —— 写进的是孤儿字段，
-               保存后基数根本没变，界面还提示「已保存」。 -->
+          <!-- ★ 绑文本态而非分值：直接绑分会每击一键就
+               「解析→格式化→回填」，把正在输入的中间态吃掉
+               （输入 4 变 4.00）。文本态在保存时一次性解析。 -->
           <div>
             <Label>社保基数下限（元）</Label>
-            <Input :model-value="centsToYuanInput(schemeEditing.baseMin)"
-                   @update:model-value="(v) => schemeEditing.baseMin = parseYuanToCents(v) ?? schemeEditing.baseMin"
+            <Input v-model="schemeText.baseMin"
                    class="mt-1.5" placeholder="如：4000.00" />
           </div>
           <div>
             <Label>社保基数上限（元）</Label>
-            <Input :model-value="centsToYuanInput(schemeEditing.baseMax)"
-                   @update:model-value="(v) => schemeEditing.baseMax = parseYuanToCents(v) ?? schemeEditing.baseMax"
+            <Input v-model="schemeText.baseMax"
                    class="mt-1.5" placeholder="如：25000.00，留空=不限" />
           </div>
         </div>
@@ -420,11 +466,7 @@ const statusTone = (s) => (s === 'posted' ? 'profit' : s === 'confirmed' ? 'defa
           <div class="mt-2 grid grid-cols-2 gap-x-6 gap-y-2">
             <div v-for="f in RATE_FIELDS" :key="f.key" class="flex items-center gap-2">
               <span class="w-32 shrink-0 text-sm">{{ f.label }}</span>
-              <Input
-                :model-value="ppmToPct(schemeEditing.rates[f.key])"
-                class="h-8"
-                @update:model-value="(v) => schemeEditing.rates[f.key] = pctToPpm(v)"
-              />
+              <Input v-model="schemeText.rates[f.key]" class="h-8" />
               <span class="text-xs text-muted-foreground">%</span>
             </div>
           </div>
