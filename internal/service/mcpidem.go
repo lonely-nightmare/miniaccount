@@ -6,6 +6,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -57,6 +58,21 @@ func (s *Service) CreateDraftVoucherIdempotent(ctx context.Context,
 		return nil, nil, err
 	}
 
+	// 审计事件在落库前构造：明细原文随幂等键同事务存进
+	// audit_payload。之后凭证被改过，failed 态的补记也照这份
+	// 原文回放——「当前内容」会把修改记成初始创建，失真。
+	auditSummary := "录入凭证草稿（MCP）"
+	auditDetail := map[string]any{
+		"记账日期": v.BizDate.String(), "摘要": v.Remark,
+		"借方合计": money.Money(v.TotalDebit()).String(),
+		"贷方合计": money.Money(v.TotalCredit()).String(),
+		"分录":   auditLines(v), "制单人": v.CreatedBy,
+		"clientRequestId": requestID,
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"summary": auditSummary, "detail": auditDetail,
+	})
+
 	var vid int64
 	var initStamp string
 	err = s.db.WithTx(ctx, func(tx *sqlite.Tx) error {
@@ -77,7 +93,7 @@ func (s *Service) CreateDraftVoucherIdempotent(ctx context.Context,
 		return s.db.MCPIdem().InsertTx(ctx, tx, sqlite.IdemRow{
 			RequestID: requestID, RequestHash: requestHash,
 			VoucherID: vid, InitialUpdatedAt: initStamp,
-			AuditState: "pending",
+			AuditState: "pending", AuditPayload: string(payload),
 		})
 	})
 	if err != nil {
@@ -93,15 +109,9 @@ func (s *Service) CreateDraftVoucherIdempotent(ctx context.Context,
 	// 提交后写审计；成败落 audit_state —— 重试凭它证明留痕。
 	auditErr := s.recordAudit(ctx, AuditEvent{
 		Action:  audit.ActionVoucherCreate,
-		Summary: "录入凭证草稿（MCP）",
+		Summary: auditSummary,
 		Entity:  "voucher", EntityID: fmt.Sprintf("%d", vid),
-		Detail: map[string]any{
-			"记账日期": v.BizDate.String(), "摘要": v.Remark,
-			"借方合计": money.Money(v.TotalDebit()).String(),
-			"贷方合计": money.Money(v.TotalCredit()).String(),
-			"分录":   auditLines(v), "制单人": v.CreatedBy,
-			"clientRequestId": requestID,
-		},
+		Detail: auditDetail,
 	})
 	out := &IdemOutcome{}
 	if auditErr != nil {
@@ -138,11 +148,25 @@ func (s *Service) resolveIdem(ctx context.Context, row *sqlite.IdemRow,
 	switch row.AuditState {
 	case "recorded":
 		out.AuditState = "recorded"
-	case "failed":
-		// failed 表示当时确实没落日志 —— 补写是安全的（审计
-		// 内容由已落库凭证确定性重建）。短暂锁竞争不该留
-		// 永久缺口：同键重试到这里时顺手补记一条。
-		if repairErr := s.repairCreateAudit(ctx, d, row.RequestID); repairErr != nil {
+	case "failed", "repairing":
+		// failed = 当时确实没落日志；repairing = 上次补记途中
+		// 崩溃。两者都可补写 —— 但先 CAS 认领：并发重试只能
+		// 有一个赢家写日志，否则一条创建日志会变成两条。
+		claimed, cerr := s.db.MCPIdem().ClaimAuditRepair(ctx, row.RequestID)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		if !claimed {
+			// 别人在补：重读最新状态如实回答。
+			if cur, gerr := s.db.MCPIdem().Get(ctx, row.RequestID); gerr == nil && cur != nil {
+				out.AuditState = cur.AuditState
+				out.AuditError = cur.AuditError
+			} else {
+				out.AuditState = "repairing"
+			}
+			return d, out, nil
+		}
+		if repairErr := s.repairCreateAudit(ctx, d, row); repairErr != nil {
 			s.db.MCPIdem().SetAuditState(ctx, row.RequestID, "failed", repairErr.Error())
 			out.AuditState, out.AuditError = "failed", repairErr.Error()
 		} else {
@@ -159,9 +183,25 @@ func (s *Service) resolveIdem(ctx context.Context, row *sqlite.IdemRow,
 }
 
 // repairCreateAudit 为「审计写失败」的幂等命中补记创建日志。
-// 事件内容与首次创建审计一致，数据全部取自已落库凭证；
-// 「补记」标记让日志能看出这条不是当时写的。
-func (s *Service) repairCreateAudit(ctx context.Context, d *VoucherDetail, requestID string) error {
+// 内容回放幂等行里存的 audit_payload（首次落库时的原文）：
+// 凭证落库后被改过的话，拿「当前凭证」重建会把修改记成
+// 初始创建内容 —— 日志失真，等于造假。payload 为空只可能
+// 是旧版本写的幂等行，那时才退回按当前凭证重建并额外标注。
+func (s *Service) repairCreateAudit(ctx context.Context, d *VoucherDetail, row *sqlite.IdemRow) error {
+	var stored struct {
+		Summary string         `json:"summary"`
+		Detail  map[string]any `json:"detail"`
+	}
+	if row.AuditPayload != "" &&
+		json.Unmarshal([]byte(row.AuditPayload), &stored) == nil &&
+		stored.Detail != nil {
+		return s.recordAudit(ctx, AuditEvent{
+			Action:  audit.ActionVoucherCreate,
+			Summary: stored.Summary + "（幂等重试补记）",
+			Entity:  "voucher", EntityID: fmt.Sprintf("%d", d.ID),
+			Detail: stored.Detail,
+		})
+	}
 	lines := make([]map[string]any, 0, len(d.Lines))
 	for _, e := range d.Lines {
 		lines = append(lines, map[string]any{
@@ -171,14 +211,14 @@ func (s *Service) repairCreateAudit(ctx context.Context, d *VoucherDetail, reque
 	}
 	return s.recordAudit(ctx, AuditEvent{
 		Action:  audit.ActionVoucherCreate,
-		Summary: "录入凭证草稿（MCP，幂等重试补记）",
+		Summary: "录入凭证草稿（MCP，幂等重试补记，内容为当前状态）",
 		Entity:  "voucher", EntityID: fmt.Sprintf("%d", d.ID),
 		Detail: map[string]any{
 			"记账日期": d.Date, "摘要": d.Remark,
 			"借方合计": d.TotalDebit.String(),
 			"贷方合计": d.TotalCredit.String(),
 			"分录":   lines, "制单人": d.CreatedBy,
-			"clientRequestId": requestID,
+			"clientRequestId": row.RequestID,
 		},
 	})
 }

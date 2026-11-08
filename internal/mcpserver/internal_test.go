@@ -6,6 +6,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"miniaccount/internal/service"
 )
@@ -28,8 +31,7 @@ func (f *fakeBookProvider) Call(ctx context.Context,
 	fn func(ctx context.Context, svc *service.Service) (any, error)) (any, error) {
 	return fn(ctx, f.svc)
 }
-func (f *fakeBookProvider) BookID() string    { return f.bookID }
-func (f *fakeBookProvider) Generation() int64 { return f.gen }
+func (f *fakeBookProvider) BookSnapshot() (string, int64) { return f.bookID, f.gen }
 
 func TestProviderSourceRechecksGeneration(t *testing.T) {
 	p := &fakeBookProvider{gen: 5, bookID: "/tmp/b.db"}
@@ -101,8 +103,7 @@ func (p *ctxProbe) Call(ctx context.Context,
 	p.mu.Unlock()
 	return fn(ctx, p.svc)
 }
-func (p *ctxProbe) BookID() string    { return p.bookID }
-func (p *ctxProbe) Generation() int64 { return p.gen.Load() }
+func (p *ctxProbe) BookSnapshot() (string, int64) { return p.bookID, p.gen.Load() }
 
 func openInternalBook(t *testing.T) *service.Service {
 	t.Helper()
@@ -165,5 +166,32 @@ func TestHTTPSessionIDReachesCall(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "session_stale") &&
 		!strings.Contains(rec.Body.String(), "账套已切换") {
 		t.Fatalf("窗口内换账应被锁内复核拒绝: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ★ 大整数 ID（实测复现）：JSON 数字先过 float64 会把
+// 9007199254740993 静默取整成 ...992，补丁打到另一条记录上。
+// decodeMapArgs 必须用 UseNumber 保精度。
+func TestDecodeMapArgsPreservesBigInt(t *testing.T) {
+	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
+		Name:      "update_employee",
+		Arguments: json.RawMessage(`{"id":9007199254740993,"name":"x"}`),
+	}}
+	m, err := decodeMapArgs(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i, err := idFromJSON(m["id"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i != 9007199254740993 {
+		t.Fatalf("大整数 id 被取整: %d", i)
+	}
+	// 带小数依旧拒。
+	req.Params.Arguments = json.RawMessage(`{"id":5.9}`)
+	m, _ = decodeMapArgs(req)
+	if _, err := idFromJSON(m["id"]); err == nil {
+		t.Fatal("小数 id 应被拒")
 	}
 }

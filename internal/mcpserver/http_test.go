@@ -43,9 +43,10 @@ func (p *fakeProvider) Call(ctx context.Context,
 	fn func(ctx context.Context, svc *service.Service) (any, error)) (any, error) {
 	return fn(ctx, p.svc)
 }
-func (p *fakeProvider) BookID() string    { return "/tmp/book.db" }
-func (p *fakeProvider) Generation() int64 { return p.gen.Load() }
-func (p *fakeProvider) bump()             { p.gen.Add(1) }
+func (p *fakeProvider) BookSnapshot() (string, int64) {
+	return "/tmp/book.db", p.gen.Load()
+}
+func (p *fakeProvider) bump() { p.gen.Add(1) }
 
 func newHTTPTestService(t *testing.T, p *fakeProvider, token string) *mcpserver.HTTPService {
 	t.Helper()

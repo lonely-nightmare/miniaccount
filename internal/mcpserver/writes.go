@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -204,8 +205,12 @@ func (s *Server) registerWriteTools() {
 		Name: "upsert_contact",
 		Description: "新建或部分更新往来单位。id 缺席=新建；字段缺席=保持原值，" +
 			"字段为 null=清空，字段有值=设置。",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
+		in, err := decodeMapArgs(req)
+		if err != nil {
+			return toolError(&service.InvalidInput{Msg: "参数不是合法 JSON 对象：" + err.Error()})
+		}
 		if err := checkPatchKeys(in, contactPatchKeys, "upsert_contact"); err != nil {
 			return toolError(err)
 		}
@@ -265,8 +270,12 @@ func (s *Server) registerWriteTools() {
 		Name: "save_department",
 		Description: "新建或部分更新部门。id 缺席=新建；parentId=null 表示顶层部门。" +
 			"三态规则同 upsert_contact。",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
+		in, err := decodeMapArgs(req)
+		if err != nil {
+			return toolError(&service.InvalidInput{Msg: "参数不是合法 JSON 对象：" + err.Error()})
+		}
 		if err := checkPatchKeys(in, departmentPatchKeys, "save_department"); err != nil {
 			return toolError(err)
 		}
@@ -314,8 +323,12 @@ func (s *Server) registerWriteTools() {
 		Description: "部分更新员工档案（仅修改，不建人）。可调字段：name/phone/idCard/" +
 			"bankName/bankAccount/expenseAccountCode/companyAccountCode/remark。" +
 			"薪酬基数、部门、离职、启用各有业务动作，不在此工具内。",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
 		ctx, warn := s.callCtx(ctx)
+		in, err := decodeMapArgs(req)
+		if err != nil {
+			return toolError(&service.InvalidInput{Msg: "参数不是合法 JSON 对象：" + err.Error()})
+		}
 		v, ok := in["id"]
 		if !ok || v == nil {
 			return toolError(&service.InvalidInput{Msg: "update_employee 必须提供员工 id"})
@@ -556,21 +569,51 @@ func (e *patchErrs) patchInt(in map[string]any, key string) service.Field[int64]
 	if v == nil {
 		return service.Field[int64]{Set: true, Null: true}
 	}
-	f, ok := v.(float64)
-	if !ok || f != math.Trunc(f) || f > math.MaxInt64 || f < math.MinInt64 {
+	i, err := int64FromJSON(v)
+	if err != nil {
 		e.fail(key, "整数", v)
 		return service.Field[int64]{}
 	}
-	return service.Field[int64]{Set: true, Value: int64(f)}
+	return service.Field[int64]{Set: true, Value: i}
 }
 
-// idFromJSON 把 map 输入的 id 解成 int64 —— 非数字、带小数
-// （int64 截断会把 {"id":5.9} 静默写成 id=5）、超界一律
-// invalid_params，不许悄悄落到别的记录上。
+// decodeMapArgs 用 UseNumber 重解原始参数体。
+// SDK 提前解好的 map[string]any 把数字全变 float64——
+// >2^53 的 id 会被静默取整，{"id":9007199254740993} 落到
+// 9007199254740992 那条记录上，改错档案还没法察觉。
+func decodeMapArgs(req *mcp.CallToolRequest) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(req.Params.Arguments))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// int64FromJSON 把 JSON 数字解成 int64——json.Number 精确解析
+// （UseNumber 解出的），float64 是测试直接构造输入的兜底。
+// 小数、超界一律报错，不许截断。
+func int64FromJSON(v any) (int64, error) {
+	switch n := v.(type) {
+	case json.Number:
+		return n.Int64()
+	case float64:
+		if n != math.Trunc(n) || n > math.MaxInt64 || n < math.MinInt64 {
+			return 0, fmt.Errorf("不是合法整数: %v", n)
+		}
+		return int64(n), nil
+	default:
+		return 0, fmt.Errorf("不是数字: %v", v)
+	}
+}
+
+// idFromJSON 把 map 输入的 id 解成 int64 —— 非数字、带小数、
+// 超界一律 invalid_params，不许悄悄落到别的记录上。
 func idFromJSON(v any) (int64, error) {
-	f, ok := v.(float64)
-	if !ok || f != math.Trunc(f) || f > math.MaxInt64 || f < math.MinInt64 || f <= 0 {
+	i, err := int64FromJSON(v)
+	if err != nil || i <= 0 {
 		return 0, &service.InvalidInput{Msg: fmt.Sprintf("id 必须是正整数，收到 %v", v)}
 	}
-	return int64(f), nil
+	return i, nil
 }

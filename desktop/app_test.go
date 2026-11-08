@@ -932,3 +932,24 @@ func TestNotFoundIsNotReportedAsInternal(t *testing.T) {
 		}
 	}
 }
+
+// ★ 写者锁自拒（实测复现）：重开当前账套（或别名同文件）
+// 必须先关旧连接，否则被自己的写者锁拒掉。
+func TestOpenBookReopenSamePath(t *testing.T) {
+	a, path := newApp(t)
+	if _, f := a.OpenBook(path); f != nil {
+		t.Fatalf("首次打开失败: %v", f)
+	}
+	if _, f := a.OpenBook(path); f != nil {
+		t.Fatalf("重开同一账套不应被自己的写者锁拒: %v", f)
+	}
+	// OpenBook 只开文件不建账——Open=false 但 Path 必须留着，
+	// 且新连接可用（能继续建账）。
+	st, f := a.CurrentBook()
+	if f != nil || st.Path == "" {
+		t.Fatalf("重开后连接应可用: %+v %v", st, f)
+	}
+	if _, f := a.CreateDemoBook(1); f != nil {
+		t.Fatalf("重开后的连接应可正常建账: %v", f)
+	}
+}

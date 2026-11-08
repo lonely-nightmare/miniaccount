@@ -92,6 +92,12 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		}
 	}
 	pathOnly := false
+	// openPath 是 SQLite 实际打开的路径：规约后的真实位置。
+	// 经硬链接别名打开一个已被别的进程持有的账套时，占用锁
+	// 里的 owner 记录会把它再归并到首个持锁者的路径——WAL
+	// 按打开路径字符串命名，不用归并路径就是两份 WAL，
+	// 只读端会静默读到过期数据。
+	openPath := filelock.CanonicalPath(opts.Path)
 	if opts.Path != ":memory:" {
 		var err error
 		if _, statErr := os.Stat(opts.Path); errors.Is(statErr, os.ErrNotExist) {
@@ -103,6 +109,11 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 			pathOnly = true
 		} else {
 			occ, err = filelock.AcquireShared(opts.Path)
+			if err == nil {
+				if eff := occ.EffectivePath(); eff != "" {
+					openPath = eff
+				}
+			}
 		}
 		if err != nil {
 			if errors.Is(err, filelock.ErrOccupied) {
@@ -112,7 +123,7 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		}
 		if !opts.ReadOnly {
 			var werr error
-			wlock, werr = writerLock(opts.Path, !pathOnly)
+			wlock, werr = writerLock(openPath, !pathOnly)
 			if werr != nil {
 				release()
 				if errors.Is(werr, filelock.ErrOccupied) {
@@ -123,7 +134,7 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		}
 	}
 	db, err := sqlite.Open(ctx, sqlite.Options{
-		Path: opts.Path, ReadOnly: opts.ReadOnly,
+		Path: openPath, ReadOnly: opts.ReadOnly,
 	})
 	if err != nil {
 		release()
@@ -135,13 +146,26 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		if lk, err := filelock.AcquireShared(opts.Path); err == nil {
 			occ.Release()
 			occ = lk
+			if eff := lk.EffectivePath(); eff != "" && eff != openPath {
+				// 落位间隙里别人用别名登过记：库已按 openPath
+				// 打开，重开成登记路径才算同一本账。
+				if err2 := db.Close(); err2 == nil {
+					db, err = sqlite.Open(ctx, sqlite.Options{
+						Path: eff, ReadOnly: opts.ReadOnly})
+					if err != nil {
+						release()
+						return nil, err
+					}
+					openPath = eff
+				}
+			}
 		}
 		if wlock != nil {
 			// 写者锁换不到真实身份必须失败，不能降级保留 w-p：
 			// 经别名路径并发建账时两边各持不同 w- 键，
 			// 「保留占位」等于放行双写。而 occ 的路径锁降级
 			// 保留是安全的——open/restore 都过同一把 p- 闸门。
-			wl, werr := writerLock(opts.Path, true)
+			wl, werr := writerLock(openPath, true)
 			if werr != nil {
 				_ = db.Close()
 				release()
@@ -167,7 +191,7 @@ func Open(ctx context.Context, opts Options) (*Service, error) {
 		release()
 		return nil, err
 	}
-	s := &Service{db: db, path: opts.Path, filesDir: strings.TrimSpace(opts.FilesDir), occup: occ, wlock: wlock}
+	s := &Service{db: db, path: openPath, filesDir: strings.TrimSpace(opts.FilesDir), occup: occ, wlock: wlock}
 	if !opts.ReadOnly {
 		s.migrateLegacyFilesDir(ctx)
 	}

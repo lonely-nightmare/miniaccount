@@ -96,3 +96,50 @@ func TestReadonlyCoexistsWithRW(t *testing.T) {
 	}
 	defer ro2.Shutdown()
 }
+
+// 硬链接别名的只读打开必须归并到持锁者的打开路径——
+// SQLite 的 WAL 按「打开路径字符串」命名，经别名打开就用
+// 另一份（不存在的）WAL，把已写入的草稿读成 0 条。
+func TestReadonlyAliasSeesWriterWAL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "book.db")
+	link := filepath.Join(dir, "alias.db")
+
+	svc, err := service.Open(ctx, service.Options{Path: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Shutdown()
+	if _, err := svc.CreateBook(ctx, service.CreateBookInput{
+		CompanyName: "别名可见性", StartYear: 2025, StartMonth: 1,
+		ThroughYear: 2025, CurrentYear: 2025, CurrentMonth: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 写一张草稿——它躺在 book.db-wal 里，未经别名规约的
+	// 只读打开只看得见主库，会漏读。
+	sh := mustContact(t, svc, "shareholder", "张三")
+	in := basicInput()
+	in.Lines[1].ContactID = &sh
+	d, err := svc.SaveVoucher(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Link(db, link); err != nil {
+		t.Skip("此平台不支持硬链接")
+	}
+	ro, err := service.Open(ctx, service.Options{Path: link, ReadOnly: true})
+	if err != nil {
+		t.Fatalf("硬链接别名的只读打开应成功: %v", err)
+	}
+	defer ro.Shutdown()
+	if _, err := ro.Voucher(ctx, d.ID); err != nil {
+		t.Fatalf("别名只读端应看到写者 WAL 里的草稿: %v", err)
+	}
+	// 归并后服务报告的账套路径也必须是持锁者的路径。
+	if ro.Path() != svc.Path() {
+		t.Fatalf("别名只读应归并到 %q，实际 %q", svc.Path(), ro.Path())
+	}
+}

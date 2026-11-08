@@ -30,6 +30,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // ErrOccupied 表示目标已被其它进程占用（TryLock 语义，非阻塞）。
@@ -42,9 +45,14 @@ var ErrNoIdentity = errors.New("无法确定账套文件身份")
 // Lock 是一把已持有的文件锁。进程崩溃由 OS 释放；
 // 正常路径必须 Release。gate 是独占获取时连带持有的
 // 路径闸门锁，Release 时先放主锁再放闸门。
+// effective 是经 owner 记录归并后的实际打开路径：
+// 同一文件被另一进程经别的路径名持有（硬链接别名）时，
+// 必须用它登记的路径打开——SQLite 的 WAL 按打开路径字符串
+// 命名，经别名打开会用另一份 WAL，读到的是过期数据。
 type Lock struct {
-	f    *os.File
-	gate *Lock
+	f         *os.File
+	gate      *Lock
+	effective string
 }
 
 // Identity 是文件系统级别的文件身份，跨路径别名稳定。
@@ -66,16 +74,33 @@ func Dir() (string, error) {
 	return d, nil
 }
 
+// CanonicalPath 把路径规约到「真实位置」：
+//   - 文件存在：全路径 EvalSymlinks —— 连末段的文件符号链接
+//     一起解析（/link/b.db → /real/b.db）。这步不能省：
+//     只解析父目录会让「指向恢复目标的文件符号链接」算出
+//     不同的路径身份，绕过路径闸门去读刚被替换的新文件。
+//   - 文件不存在：解析最深存在的祖先（父目录）再接回文件名。
+//
+// 锁身份、SQLite 实际打开路径一律用规约结果——SQLite 的 WAL
+// 文件按「打开时传入的路径字符串」命名，两个名字=两份 WAL。
+func CanonicalPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		return r
+	}
+	dir, base := filepath.Dir(abs), filepath.Base(abs)
+	if rd, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Join(rd, base)
+	}
+	return abs
+}
+
 // IdentityOf 解析路径并取文件身份。文件必须已存在。
 func IdentityOf(path string) (Identity, error) {
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return Identity{}, err
-	}
-	abs, err := filepath.Abs(resolved)
-	if err != nil {
-		return Identity{}, err
-	}
+	abs := CanonicalPath(path)
 	raw, err := fileIdentity(abs)
 	if err != nil {
 		return Identity{}, err
@@ -87,19 +112,11 @@ func IdentityOf(path string) (Identity, error) {
 	return Identity{Key: hex.EncodeToString(sum[:16]), raw: raw}, nil
 }
 
-// PathIdentity 给尚不存在的文件一个锁身份：父目录 EvalSymlinks
-// + 文件名。仅用于「新建账套」在文件落位前先占位。
+// PathIdentity 给尚不存在的文件一个锁身份：规约路径哈希。
+// 仅用于「新建账套」在文件落位前先占位；已存在文件经
+// CanonicalPath 归并后，所有符号链接别名落到同一把闸门。
 func PathIdentity(path string) (Identity, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return Identity{}, err
-	}
-	dir := filepath.Dir(abs)
-	rd, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		return Identity{}, err
-	}
-	raw := "path:" + filepath.Join(rd, filepath.Base(abs))
+	raw := "path:" + CanonicalPath(path)
 	sum := sha256.Sum256([]byte(raw))
 	return Identity{Key: "p-" + hex.EncodeToString(sum[:16]), raw: raw}, nil
 }
@@ -191,9 +208,22 @@ func acquire(path string, exclusive bool) (*Lock, error) {
 			return nil, err
 		}
 		if id2.Key == id.Key {
+			// 身份锁定后主路径归并：owner 记录存「首个持锁
+			// 进程的规约路径」。经硬链接别名进来的 opener
+			// 规约路径不同但身份相同——必须照登记路径打开，
+			// 才会看到同一份 WAL（WAL 按打开路径字符串命名）。
+			eff, err := claimOpenPath(id, CanonicalPath(path))
+			if err != nil {
+				lk.Release()
+				if keepGate {
+					gate.Release()
+				}
+				return nil, err
+			}
 			if keepGate {
 				lk.gate = gate
 			}
+			lk.effective = eff
 			return lk, nil
 		}
 		lk.Release()
@@ -202,6 +232,75 @@ func acquire(path string, exclusive bool) (*Lock, error) {
 		gate.Release()
 	}
 	return nil, fmt.Errorf("账套文件身份在取锁间隙反复变化：%s", path)
+}
+
+// EffectivePath 返回经 owner 记录归并后的实际打开路径；
+// 无归并（独占获取、路径锁占位）时返回空串，调用方用原路径。
+func (l *Lock) EffectivePath() string { return l.effective }
+
+// claimOpenPath 决定本次打开用哪条路径：读 owner 记录 →
+// 有活进程登记过别的规约路径就换用它；没有就登记自己的。
+//
+// 共享锁不互斥——两个首开进程可能同时看到「没有记录」，
+// 「读→判→写」必须另串行，所以开一把 <身份>.claim 短锁
+// （顺序固定 gate→i→claim，不回头，不死锁）。进程崩溃留
+// 下的陈记录靠 pid 活性 + 「记录路径仍指向同一身份」回收。
+func claimOpenPath(id Identity, mine string) (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	// .claim 只被持有「读一行+写一个文件」这一瞬，但取不到
+	// 也不能直接放弃——短退避等一拍即可。
+	var claim *Lock
+	for i := 0; i < 20; i++ {
+		claim, err = LockFile(filepath.Join(dir, id.Key+".claim"), true)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrOccupied) {
+			return "", err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if claim == nil {
+		return "", fmt.Errorf("等待账套打开路径登记锁超时")
+	}
+	defer claim.Release()
+
+	owner := filepath.Join(dir, id.Key+".owner")
+	if b, err := os.ReadFile(owner); err == nil {
+		if pid, rec := parseOwner(string(b)); pid > 0 && rec != "" &&
+			processAlive(pid) {
+			// 记录路径可能被回收重用过：它必须仍指向同一
+			// 文件身份，否则照它打开会开错账套。
+			if rid, rerr := IdentityOf(rec); rerr == nil && rid.Key == id.Key {
+				return rec, nil
+			}
+		}
+	}
+	tmp := owner + ".tmp"
+	content := strconv.Itoa(os.Getpid()) + "\n" + mine + "\n"
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, owner); err != nil {
+		return "", err
+	}
+	return mine, nil
+}
+
+// parseOwner 解析 owner 记录「pid\n路径」。
+func parseOwner(s string) (int, string) {
+	parts := strings.SplitN(strings.TrimRight(s, "\n"), "\n", 2)
+	if len(parts) != 2 {
+		return 0, ""
+	}
+	pid, err := strconv.Atoi(parts[0])
+	if err != nil || pid <= 0 {
+		return 0, ""
+	}
+	return pid, parts[1]
 }
 
 // WriterKey 由账套身份推导「写者锁」的身份：读写打开在

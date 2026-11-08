@@ -37,3 +37,10 @@ func tryLock(f *os.File, exclusive bool) error {
 func unlock(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
+
+// processAlive 判断 owner 记录里的进程是否还活着。
+// EPERM 也算活——我们只是没权限发信号。
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}

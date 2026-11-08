@@ -746,3 +746,60 @@ URL:  http://127.0.0.1:<端口>/mcp
   不凭空编造 manual。回归：
   `TestUpdatePreservesSource`（bank 来源凭证改摘要后
   仍是 bank）。
+
+### 三轮复查修复记录（验收实测：并发/文件别名/真实进程）
+
+**世代复核死锁（2 个，其一为新引入回归）**
+
+- `providerSource.call` 在 `provider.Call` 的 `a.mu.RLock`
+  临界区内调 `BookID()`——`BookID` 自己也取 `a.mu.RLock`，
+  嵌套读锁遇写者排队即死锁（请求与 CloseBook 互卡）。
+- 同一调用链还藏着**逆序锁**：`providerSource.call` 是
+  `a.mu→sessionTable.mu`，而中间件 `check` 持
+  `sessionTable.mu` 时调 `BookID()` 又是 `t.mu→a.mu`。
+- 根治：`BookProvider` 改单次原子 `BookSnapshot()`
+  （{bookID,generation} 一并返回不撕裂）；desktop 用
+  `atomic.Value` 存快照、`setBookLocked` 写锁内刷新——
+  BookID/Generation 不再经任何锁，两种死锁同消。
+
+**文件别名（2 项）**
+
+- `PathIdentity` 只解析父目录：恢复持锁期间，「指向目标
+  路径的文件符号链接」算出不同 `p-` 键，绕过闸门去开刚被
+  替换的新文件。修法：`CanonicalPath` 对存在文件做**全路径**
+  `EvalSymlinks`（连末段文件链接一起解析），不存在则解析
+  最深存在祖先接回文件名；闸门/锁身份/SQLite 打开路径一律
+  用规约结果。
+- 硬链接别名的只读打开静默读旧数据：SQLite 的 WAL 按
+  **打开路径字符串**命名（`<path>-wal`），经别名打开用
+  另一份（不存在的）WAL——写进程 book.db-wal 里的草稿，
+  别名只读端读到 0 条且无报错。修法：`<身份>.owner` 记录
+  首个持锁进程的「pid+规约路径」（`<身份>.claim` 短锁串行
+  读写；顺序固定 gate→i→claim）；后开者规约路径不同→换用
+  登记路径打开，看到同一份 WAL。陈记录按 pid 活性 +
+  「路径仍指向同一身份」双重校验回收。
+- `service.Open` 全程用归并后 `openPath`（SQLite 打开、
+  `s.path`、写者锁）；`OpenBook` 重开同一文件（含别名）
+  先关旧连接再开新——否则被自己的写者锁拒。
+
+**幂等补记失真与双写（2 项）**
+
+- failed 态补记曾从「当前凭证」重建审计明细：凭证落库后被
+  改过，补记把 900 元修改记成 100 元创建——日志失真。
+  修法：迁移 0018 加 `audit_payload`，审计明细 JSON 与凭证
+  同事务落库，补记只回放原文。
+- 并发同键重试都进 failed 分支各补一条 → 一条创建日志变
+  多条。修法：`repair_claim_at` 认领时间戳 + CAS
+  （failed→repairing，或过期 repairing 重领）；认领窗口
+  内的 repairing 视为「别人在补」如实上报。
+- `shutdownMCP` 排空超时强制 `Close()` 后不再上报
+  DeadlineExceeded——服务已死，报错会让设置页跳过刷新，
+  把已停止显示成运行中。
+
+**JSON 精度（1 项）**
+
+- map 工具的 `id`/`parentId` 先被 SDK 解成 float64：
+  `{"id":9007199254740993}` 静默取整成 ...992，补丁打到
+  另一条记录。修法：`decodeMapArgs` 用 `UseNumber` 重解
+  `req.Params.Arguments`，`idFromJSON`/`patchInt` 精确解析
+  `json.Number`。

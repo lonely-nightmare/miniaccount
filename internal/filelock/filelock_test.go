@@ -150,3 +150,95 @@ func TestWriterKeyBlocksSecondWriter(t *testing.T) {
 		t.Fatalf("写者锁不该挡共享占用: %v", err)
 	}
 }
+
+// CanonicalPath 必须解析「末段文件符号链接」：恢复持锁期间，
+// 指向目标路径的符号链接若只按父目录算，会得出不同的闸门
+// 身份而绕过互斥去开刚被替换的新文件。
+func TestCanonicalPathResolvesFileSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.db")
+	if err := os.WriteFile(real, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.db")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip("此平台不支持符号链接")
+	}
+	if got := CanonicalPath(link); got != CanonicalPath(real) {
+		t.Fatalf("文件符号链接应规约到真实路径: %q vs %q", got, real)
+	}
+	// 目录级符号链接同样归并。
+	linkDir := filepath.Join(dir, "dlink")
+	if err := os.Symlink(dir, linkDir); err != nil {
+		t.Skip("此平台不支持符号链接")
+	}
+	viaDir := filepath.Join(linkDir, "real.db")
+	if got := CanonicalPath(viaDir); got != CanonicalPath(real) {
+		t.Fatalf("目录符号链接应规约: %q vs %q", got, real)
+	}
+	// 不存在的目标：解析存在的祖先再接回文件名。
+	// （EvalSymlinks 的结果是全规约路径，/var→/private/var
+	// 之类系统级链接也会一并展开，不能拿字面 dir 比。）
+	rd, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(linkDir, "new.db")
+	if got := CanonicalPath(missing); got != filepath.Join(rd, "new.db") {
+		t.Fatalf("不存在文件应接回规约父目录: %q", got)
+	}
+}
+
+// 恢复锁（独占）期间，经文件符号链接打开同一目标必须被拒——
+// 闸门按规约路径互斥，别名绕不进。
+func TestSymlinkAliasBlockedDuringExclusive(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.db")
+	if err := os.WriteFile(real, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "alias.db")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip("此平台不支持符号链接")
+	}
+	x, err := AcquireExclusive(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Release()
+	if _, err := AcquireShared(link); !errors.Is(err, ErrOccupied) {
+		t.Fatalf("独占期间经符号链接打开应被拒: %v", err)
+	}
+}
+
+// 硬链接别名打开：owner 记录把第二个 opener 的路径归并到
+// 首个持锁者的规约路径——SQLite 的 WAL 按打开路径字符串
+// 命名，不归并就是两份 WAL，只读端静默读到过期数据。
+func TestOwnerRecordRewritesAliasPath(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.db")
+	b := filepath.Join(dir, "b.db")
+	if err := os.WriteFile(a, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(a, b); err != nil {
+		t.Skip("此平台不支持硬链接")
+	}
+	s1, err := AcquireShared(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Release()
+	if eff := s1.EffectivePath(); eff != CanonicalPath(a) {
+		t.Fatalf("首开应登记自己的规约路径: %q", eff)
+	}
+	s2, err := AcquireShared(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Release()
+	if eff := s2.EffectivePath(); eff != CanonicalPath(a) {
+		t.Fatalf("别名打开应归并到首开端路径 %q，实际 %q",
+			CanonicalPath(a), eff)
+	}
+}

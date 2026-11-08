@@ -3,9 +3,12 @@ package main
 // ---------------------------------------------------------------------------
 // MCP HTTP 服务（设计文档 §2.2/§2.3/§2.11）
 //
-// 账套世代：a.mu 保护 a.svc/a.path，setBookLocked 每次换账套把
-// bookGen 加一 —— HTTP 层会话表钉住 initialize 时的世代，
-// 换账后旧 MCP-Session-Id 一律 404，客户端按规范重新 initialize。
+// 账套世代：a.mu 保护 a.svc/a.path，setBookLocked 每次换账套
+// 推进世代并刷新 bookSnap 原子快照 —— HTTP 层会话表钉住
+// initialize 时的世代，换账后旧 MCP-Session-Id 一律 404，
+// 客户端按规范重新 initialize。快照必须无锁可读：它在
+// provider.Call 的读锁临界区内和会话表锁内都会被取，
+// 经 a.mu 取读锁会嵌套/逆序死锁。
 //
 // 读锁范围：provider.Call 把 App.mu.RLock 覆盖到**一次业务调用**
 // 上，绝不覆盖整个 HTTP 连接；Open/Close/Restore 拿 a.mu.Lock
@@ -45,21 +48,35 @@ func (p bookProvider) Call(ctx context.Context,
 	return fn(ctx, p.a.svc)
 }
 
-// BookID 返回当前账套路径（空串 = 未打开账套）。
-func (p bookProvider) BookID() string {
-	p.a.mu.RLock()
-	defer p.a.mu.RUnlock()
-	return p.a.path
+// bookSnapshot 是 bookSnap 原子值里存的 {路径, 世代} 对。
+type bookSnapshot struct {
+	path string
+	gen  int64
 }
 
-// Generation 返回账套世代；Open/Close/Restore 换账套时递增。
-func (p bookProvider) Generation() int64 { return p.a.bookGen.Load() }
+// snapshot 读账套快照（无锁，可在任何临界区内调用）。
+func (a *App) snapshot() bookSnapshot {
+	if v := a.bookSnap.Load(); v != nil {
+		return v.(bookSnapshot)
+	}
+	return bookSnapshot{}
+}
+
+// BookSnapshot 实现 mcpserver.BookProvider：原子返回
+// {bookID, generation}。无锁——它会在 Call 的读锁临界区内
+// 被调用，经 a.mu 再取读锁会在写者排队时死锁。
+func (p bookProvider) BookSnapshot() (string, int64) {
+	s := p.a.snapshot()
+	return s.path, s.gen
+}
 
 // setBookLocked 在 a.mu.Lock 内换账套并推进世代。
 // 调用方必须已持有写锁。
 func (a *App) setBookLocked(svc *service.Service, path string) {
 	a.svc, a.path = svc, path
-	a.bookGen.Add(1)
+	s := a.snapshot()
+	s.path, s.gen = path, s.gen+1
+	a.bookSnap.Store(s)
 }
 
 // ---------------------------------------------------------------- 服务状态
@@ -249,8 +266,9 @@ func (a *App) takeMCPLocked() *mcpRuntime {
 }
 
 // shutdownMCP 等 HTTP 服务排空退出；不持任何锁。
-// SSE 长连接可能拖过 3s 排空窗口 —— 超时后强制 Close，
-// 不让残留连接把「已停止」拖成半开状态。
+// SSE 长连接可能拖过 3s 排空窗口 —— 超时后强制 Close。
+// 强制关停后服务确实已死，不能再把 DeadlineExceeded 往上传：
+// 设置页收到错误会跳过状态刷新，把已停止显示成运行中。
 func shutdownMCP(rt *mcpRuntime) error {
 	if rt == nil {
 		return nil
@@ -259,6 +277,9 @@ func shutdownMCP(rt *mcpRuntime) error {
 	defer cancel()
 	if err := rt.srv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		_ = rt.srv.Close()
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
 		return err
 	}
 	return nil

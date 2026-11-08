@@ -252,8 +252,14 @@ func TestFilesDirAndBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 附件目录默认落在账套同级、按账套名隔离
-	if got, want := svc.FilesDir(), filepath.Join(dir, "b.files"); got != want {
+	// 附件目录默认落在账套同级、按账套名隔离。
+	// 账套路径按规约后位置报告（macOS 上 /var→/private/var
+	// 会被展开）——WAL/附件目录都跟着规约路径走才一致。
+	rd, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := svc.FilesDir(), filepath.Join(rd, "b.files"); got != want {
 		t.Errorf("附件目录 = %s，期望 %s", got, want)
 	}
 	st, err := svc.Attachments()

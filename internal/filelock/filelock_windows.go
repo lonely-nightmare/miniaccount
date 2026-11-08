@@ -68,3 +68,16 @@ func unlock(f *os.File) error {
 	}
 	return nil
 }
+
+// processAlive 判断 owner 记录里的进程是否还活着。
+// 句柄开得起来就算活（含权限受限场景）；pid 已回收时
+// OpenProcess 直接失败。
+func processAlive(pid int) bool {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	_ = windows.CloseHandle(h)
+	return true
+}

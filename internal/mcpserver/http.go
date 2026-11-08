@@ -45,15 +45,19 @@ const sessionHeader = "Mcp-Session-Id"
 
 // BookProvider 是 HTTP 模式访问「当前账套」的唯一入口。
 // desktop.App 实现它：Call 用 App.mu.RLock 覆盖一次业务调用；
-// Generation 在 Open/Close/Restore 换账套时递增。
+// generation 在 Open/Close/Restore 换账套时递增。
 type BookProvider interface {
 	// Call 在持读锁的临界区内执行一次业务调用。
 	// 未打开账套时返回 service.ErrNoBook。
 	Call(ctx context.Context, fn func(ctx context.Context, svc *service.Service) (any, error)) (any, error)
-	// BookID 返回当前账套标识（= 数据库路径）。
-	BookID() string
-	// Generation 返回当前账套世代；账套一切换就递增。
-	Generation() int64
+	// BookSnapshot 原子返回 {bookID, generation}。
+	//
+	// ★ 实现必须无锁：它会在 Call 的读锁临界区内被调用——
+	// 经同一把 RWMutex 取读锁是嵌套读锁，写者排队即死锁；
+	// 会话表锁内调它则是 t.mu→a.mu 与 Call 的 a.mu→t.mu
+	// 逆序，同样死锁。实现方应把快照放进 atomic.Value，
+	// 换账时在写锁内一并刷新。
+	BookSnapshot() (bookID string, generation int64)
 }
 
 // errStaleSession 表示请求到达时账套已切换（中间件检查
@@ -76,8 +80,8 @@ func (p providerSource) call(ctx context.Context,
 		// 调用钉死在这本账上，旧会话写不进新账套。
 		if sid, ok := ctx.Value(sessionIDKey{}).(string); ok && p.table != nil {
 			meta, found := p.table.get(sid)
-			if !found || meta.generation != p.p.Generation() ||
-				meta.bookID != p.p.BookID() {
+			bookID, gen := p.p.BookSnapshot()
+			if !found || meta.generation != gen || meta.bookID != bookID {
 				return nil, errStaleSession
 			}
 		}
@@ -232,9 +236,12 @@ func (t *sessionTable) get(id string) (sessMeta, bool) {
 // 否则清扫只认 initialize 时的 at，长活会话会被误删，
 // 之后锁内复核永远拿不到钉住世代，业务调用被误拒。
 func (t *sessionTable) check(id string, p BookProvider) (sessMeta, bool) {
+	// 快照在表锁外取：单次原子读无撕裂，也不引入 t.mu→a.mu
+	// 的逆序（providerSource.call 是 a.mu→t.mu）。
+	bookID, gen := p.BookSnapshot()
 	t.mu.Lock()
 	meta, ok := t.m[id]
-	if !ok || meta.bookID != p.BookID() || meta.generation != p.Generation() {
+	if !ok || meta.bookID != bookID || meta.generation != gen {
 		delete(t.m, id)
 		t.mu.Unlock()
 		return sessMeta{}, false
@@ -449,7 +456,7 @@ func NewHTTPService(opts HTTPOpts) (*HTTPService, error) {
 		// 同时把 (bookID, generation) 钉进注册表。
 		bw := &bufferWriter{ResponseWriter: w}
 		inner.ServeHTTP(bw, r)
-		bookID, gen := opts.Provider.BookID(), opts.Provider.Generation()
+		bookID, gen := opts.Provider.BookSnapshot()
 		bw.flush(map[string]any{"bookId": bookID, "generation": gen})
 		if sid := w.Header().Get(sessionHeader); sid != "" {
 			h.table.put(sid, sessMeta{bookID: bookID, generation: gen})

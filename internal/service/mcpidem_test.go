@@ -135,3 +135,88 @@ func TestIdempotentRetryRepairsFailedAudit(t *testing.T) {
 		t.Fatal("补记应真的落一条创建日志")
 	}
 }
+
+// ★ 补记失真修复（实测复现）：failed 态补记必须回放「首次
+// 落库时的审计原文」——凭证被改后补记若拿当前内容重建，
+// 会把 900 元的修改记成初始创建；并发重试还会各补一条，
+// 一条创建日志变两条。
+func TestIdempotentRepairReplaysOriginalOnce(t *testing.T) {
+	ctx := context.Background()
+
+	service.SetAuditDir("")
+	service.CloseAudit()
+	svc := newSvc(t, 3)
+	sh := mustContact(t, svc, "shareholder", "张三")
+	in := basicInput()
+	in.Lines[1].ContactID = &sh
+	const key, hash = "req-race", "h-race"
+
+	d1, oc1, err := svc.CreateDraftVoucherIdempotent(ctx, in, key, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oc1.AuditState != "failed" {
+		t.Fatalf("无审计目录时应 failed: %+v", oc1)
+	}
+
+	// 凭证落库后改成 900 元。
+	upd := basicInput()
+	upd.ID = d1.ID
+	upd.Lines[0].Debit = 900000
+	upd.Lines[1].Credit = 900000
+	upd.Lines[1].ContactID = &sh
+	cur, _ := svc.Voucher(ctx, d1.ID)
+	upd.ExpectedUpdatedAt = cur.UpdatedAt
+	if _, err := svc.SaveVoucher(ctx, upd); err != nil {
+		t.Fatal(err)
+	}
+
+	// 开审计后并发重试同一键。
+	service.SetAuditDir(filepath.Join(t.TempDir(), "logs"))
+	t.Cleanup(func() {
+		service.CloseAudit()
+		service.SetAuditDir("")
+	})
+	const n = 6
+	type result struct {
+		err   error
+		state string
+	}
+	res := make(chan result, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			d2, oc, err := svc.CreateDraftVoucherIdempotent(ctx, in, key, hash)
+			switch {
+			case err != nil:
+				res <- result{err: err}
+			case !oc.Idempotent || d2.ID != d1.ID:
+				res <- result{err: errors.New("应命中原凭证")}
+			default:
+				res <- result{state: oc.AuditState}
+			}
+		}()
+	}
+	recorded := 0
+	for i := 0; i < n; i++ {
+		r := <-res
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.state == "recorded" {
+			recorded++
+		}
+	}
+	if recorded == 0 {
+		t.Fatal("并发重试收敛后至少一个应看到 recorded")
+	}
+
+	// 只许补一条创建日志，且内容是落库时的原文（100,000.00），
+	// 不是修改后的 9,000.00。
+	creates := findAudit(t, svc, audit.ActionVoucherCreate)
+	if len(creates) != 1 {
+		t.Fatalf("并发补记应只落一条创建日志，实际 %d 条", len(creates))
+	}
+	if got := creates[0].Detail["借方合计"]; got != "100,000.00" {
+		t.Fatalf("补记应回放原始金额 100,000.00，实际记成 %v（=改后内容失真）", got)
+	}
+}

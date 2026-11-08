@@ -37,6 +37,7 @@ import (
 	"miniaccount/internal/domain/money"
 	"miniaccount/internal/domain/period"
 	"miniaccount/internal/domain/voucher"
+	"miniaccount/internal/filelock"
 	"miniaccount/internal/service"
 	"miniaccount/internal/store/sqlite"
 )
@@ -52,9 +53,12 @@ type App struct {
 	svc  *service.Service
 	path string
 
-	// bookGen 是账套世代计数：每次换账套（Open/Close/Restore/
-	// shutdown）加一；MCP HTTP 会话据此判定失效（§2.3）。
-	bookGen atomic.Int64
+	// bookSnap 是「当前账套路径+世代」的原子快照。
+	// MCP 的 BookProvider.BookSnapshot 会在 provider.Call 的
+	// 读锁临界区内、以及会话表锁内被调用——走 a.mu 取读锁
+	// 就是嵌套读锁/逆序锁，写者排队即死锁，所以必须无锁可读。
+	// setBookLocked 持写锁时一并刷新，path 与 gen 绝不撕裂。
+	bookSnap atomic.Value // bookSnapshot
 	// mcp 是运行中的 MCP HTTP 服务（未开启为 nil）。
 	mcp *mcpRuntime
 }
@@ -358,6 +362,32 @@ func (a *App) OpenBook(path string) (out BookStatus, err error) {
 				Kind:    FaultIO,
 				Message: "建不了目录 " + dir + "：" + err.Error(),
 			}
+		}
+	}
+
+	// ★ 重开当前账套（或经硬链接/符号链接别名指向同一文件）
+	// 必须先关旧连接：文件身份相同，新连接会被自己的写者锁
+	// 拒掉 —— 「先开后换」的顺序只对「换一本账」有效。
+	a.mu.RLock()
+	curPath := a.path
+	a.mu.RUnlock()
+	if curPath != "" {
+		var same bool
+		if idNew, err1 := filelock.IdentityOf(abs); err1 == nil {
+			if idOld, err2 := filelock.IdentityOf(curPath); err2 == nil {
+				same = idNew.Key == idOld.Key
+			}
+		}
+		if !same && filelock.CanonicalPath(abs) == filelock.CanonicalPath(curPath) {
+			same = true
+		}
+		if same {
+			a.mu.Lock()
+			if a.svc != nil {
+				_ = a.svc.Shutdown()
+			}
+			a.setBookLocked(nil, "")
+			a.mu.Unlock()
 		}
 	}
 
