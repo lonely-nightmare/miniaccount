@@ -13,6 +13,8 @@ import CardContent from '@/components/ui/CardContent.vue'
 import Button from '@/components/ui/Button.vue'
 import Input from '@/components/ui/Input.vue'
 import Label from '@/components/ui/Label.vue'
+import Badge from '@/components/ui/Badge.vue'
+import Spinner from '@/components/ui/Spinner.vue'
 
 const emit = defineEmits(['book-changed'])
 const router = useRouter()

@@ -85,12 +85,20 @@ async function openReopen(p) {
   dialog.value = 'reopen'
   target.value = { year: p.year, month: p.month, label: p.label }
   preview.value = { period: p.label, reversed: [], steps: [] }
+  // ★ 等返回前先清掉上一次的结果：不然「反结账 4 月」的弹窗里
+  // 会短暂显示「3 月的体检结论」，用户拿它点了确认。
+  health.value = null
   const h = await api.health({ year: p.year, month: p.month })
   health.value = h.ok ? h.data : null
 }
 
 async function openHealth(p) {
   dialog.value = 'health'
+  target.value = { year: p.year, month: p.month, label: p.label }
+  // ★ 弹窗主体是 v-if="preview" —— 不给 preview 一个占位，
+  // 上一次「结账预览」的对象还留在里面：体检弹窗会显示
+  // 上一个期间的损益预览，配着本期的体检结论，两个期间混在一起。
+  preview.value = { period: p.label, steps: [] }
   health.value = null
   const h = await api.health({ year: p.year, month: p.month })
   if (h.ok) health.value = h.data

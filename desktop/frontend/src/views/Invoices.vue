@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { Plus, Save, FileCheck2, Info, RefreshCw } from 'lucide-vue-next'
 import { api, notify, DRAFT_HINT } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
-import { fmtMoney, parseYuanToCents } from '@/lib/format'
+import { fmtMoney, parseYuanToCents, todayISO } from '@/lib/format'
 import Card from '@/components/ui/Card.vue'
 import CardHeader from '@/components/ui/CardHeader.vue'
 import CardTitle from '@/components/ui/CardTitle.vue'
@@ -83,7 +83,7 @@ const totalPreview = computed(() => fmtMoney(computed2.value.total))
 function openNew() {
   form.value = emptyInvoice()
   form.value.direction = tab.value
-  form.value.invoiceDate = new Date().toISOString().slice(0, 10)
+  form.value.invoiceDate = todayISO()
   formOpen.value = true
 }
 
@@ -111,10 +111,14 @@ async function post(row) {
   if (!operator.value.trim()) { notify('请填写记账人', 'warn'); return }
   if (!confirm(`为发票 ${row.number || row.code} 生成凭证？\n\n进项票会自动挂「应付账款」，销项票挂「应收账款」。`)) return
   busy.value = true
+  // ★ 费用科目/部门是「生成凭证那一刻」的参数，不属于发票档案。
+  // 仅当表单编辑的正是这张发票时才附带 —— 否则会把新建表单里
+  // 给**另一张**发票填的科目，偷渡到这张发票的凭证上。
+  const sameInvoice = form.value.id === row.id
   const r = await api.postInvoice({
     id: row.id, postingBy: operator.value.trim(),
-    expenseAccount: form.value.expenseAccount,
-    deptId: form.value.deptId,
+    expenseAccount: sameInvoice ? form.value.expenseAccount : '',
+    deptId: sameInvoice ? form.value.deptId : null,
   })
   busy.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
@@ -304,7 +308,7 @@ const kindTone = (k) => (k === 'special' ? 'default' : 'muted')
         <div>
           <Label>税率</Label>
           <select v-model.number="form.taxRatePpm" class="mt-1.5 h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-            <option v-for="r in rates" :key="r.ppM" :value="r.ppM">{{ r.label }}</option>
+            <option v-for="r in rates" :key="r.ppm" :value="r.ppm">{{ r.label }}</option>
             <option :value="0">免税 / 0%</option>
           </select>
         </div>

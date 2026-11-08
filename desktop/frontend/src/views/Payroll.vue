@@ -5,7 +5,7 @@ import {
 } from 'lucide-vue-next'
 import { api, notify, DRAFT_HINT } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
-import { fmtMoney } from '@/lib/format'
+import { fmtMoney, centsToYuanInput, parseYuanToCents } from '@/lib/format'
 import Card from '@/components/ui/Card.vue'
 import CardHeader from '@/components/ui/CardHeader.vue'
 import CardTitle from '@/components/ui/CardTitle.vue'
@@ -398,15 +398,20 @@ const statusTone = (s) => (s === 'posted' ? 'profit' : s === 'confirmed' ? 'defa
         </div>
 
         <div class="grid grid-cols-2 gap-3">
+          <!-- ★ 模型字段是 baseMin/baseMax（分）。原来绑的
+               baseMinYuan/baseMaxYuan 不存在 —— 写进的是孤儿字段，
+               保存后基数根本没变，界面还提示「已保存」。 -->
           <div>
             <Label>社保基数下限（元）</Label>
-            <Input v-model="schemeEditing.baseMinYuan" class="mt-1.5"
-                   :placeholder="fmtMoney(schemeEditing.baseMin)" />
+            <Input :model-value="centsToYuanInput(schemeEditing.baseMin)"
+                   @update:model-value="(v) => schemeEditing.baseMin = parseYuanToCents(v) ?? schemeEditing.baseMin"
+                   class="mt-1.5" placeholder="如：4000.00" />
           </div>
           <div>
             <Label>社保基数上限（元）</Label>
-            <Input v-model="schemeEditing.baseMaxYuan" class="mt-1.5"
-                   :placeholder="fmtMoney(schemeEditing.baseMax)" />
+            <Input :model-value="centsToYuanInput(schemeEditing.baseMax)"
+                   @update:model-value="(v) => schemeEditing.baseMax = parseYuanToCents(v) ?? schemeEditing.baseMax"
+                   class="mt-1.5" placeholder="如：25000.00，留空=不限" />
           </div>
         </div>
 

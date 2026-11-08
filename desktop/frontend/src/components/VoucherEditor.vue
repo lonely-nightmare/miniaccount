@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
   Plus, Trash2, Save, ShieldCheck, AlertTriangle, Info, Search,
-  Paperclip, X, FileText,
+  Paperclip, X, FileText, CheckCircle2,
 } from 'lucide-vue-next'
 import { api, notify } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
@@ -80,8 +80,11 @@ async function loadVoucher() {
       accountCode: l.accountCode, summary: l.summary,
       debitYuan: l.debit ? (l.debit / 100).toFixed(2) : '',
       creditYuan: l.credit ? (l.credit / 100).toFixed(2) : '',
-      contactId: null, employeeId: null, deptId: null, projectId: null,
-      // 编辑草稿时保留原有的辅助核算展示（改科目会清空）
+      // ★ 辅助核算的实体 id 必须回填 —— 原来全部置 null，
+      // 保存时四维被静默清空，而界面上往来单位名照常在
+      // _auxDesc 里显示着，用户完全无感知。
+      contactId: l.contactId ?? null, employeeId: l.employeeId ?? null,
+      deptId: l.deptId ?? null, projectId: l.projectId ?? null,
       _auxDesc: l.auxDesc,
     })),
   }
@@ -165,22 +168,73 @@ function needAux(line) {
   const a = accountOf(line.accountCode)
   return a?.auxTypes ?? []
 }
+// 维度 key（customer|supplier|employee|dept|project）：选档案用它，
+// 中文名只负责显示 —— 拿「客户」两个字反推不出该开哪个选择器。
+function needKeys(line) {
+  const a = accountOf(line.accountCode)
+  return a?.auxKeys ?? []
+}
 
-const showContactPicker = ref(false)
-const contactQuery = ref('')
-const filteredContacts = computed(() => {
-  const q = contactQuery.value.trim().toLowerCase()
-  const all = meta.value?.contacts ?? []
-  if (!q) return all.slice(0, 60)
-  return all.filter((c) =>
-    c.name.toLowerCase().includes(q) || (c.shortName ?? '').toLowerCase().includes(q)).slice(0, 60)
+const AUX_LABEL = { customer: '客户', supplier: '供应商', employee: '员工', dept: '部门', project: '项目' }
+const AUX_FIELD = { customer: 'contactId', supplier: 'contactId', employee: 'employeeId', dept: 'deptId', project: 'projectId' }
+
+// 一维一钮：每维独立选择，各自的档案互不串门
+// （应收科目只能选客户，不该把供应商也列出来让人挑错）。
+const showAuxPicker = ref(false)
+const auxKey = ref('')
+const auxQuery = ref('')
+const auxPickerItems = computed(() => {
+  const q = auxQuery.value.trim().toLowerCase()
+  const hit = (s) => !q || (s ?? '').toLowerCase().includes(q)
+  const key = auxKey.value
+  let list = []
+  if (key === 'customer' || key === 'supplier') {
+    list = (meta.value?.contacts ?? [])
+      .filter((c) => (key === 'customer' ? c.kind === 'customer' : c.kind === 'supplier'))
+      .map((c) => ({ id: c.id, name: c.name, tag: c.kindLabel }))
+  } else if (key === 'employee') {
+    list = (meta.value?.employees ?? []).map((e) => ({ id: e.id, name: e.name, tag: e.kindLabel }))
+  } else if (key === 'dept') {
+    list = (meta.value?.departments ?? [])
+      .filter((d) => d.enabled).map((d) => ({ id: d.id, name: d.fullName, tag: '部门' }))
+  } else if (key === 'project') {
+    list = []
+  }
+  return list.filter((x) => hit(x.name)).slice(0, 60)
 })
 
-function pickContact(c) {
+function openAuxPicker(idx, key) {
+  activeLine.value = idx
+  auxKey.value = key
+  auxQuery.value = ''
+  showAuxPicker.value = true
+}
+
+function pickAux(item) {
   const l = form.value.lines[activeLine.value]
-  l.contactId = c.id
-  l._auxDesc = c.name
-  showContactPicker.value = false
+  const field = AUX_FIELD[auxKey.value]
+  if (field) {
+    l[field] = item.id
+    l._auxDesc = item.name
+  }
+  showAuxPicker.value = false
+}
+
+function clearAux(l, key) {
+  const field = AUX_FIELD[key]
+  if (field) l[field] = null
+  l._auxDesc = ''
+}
+
+// 某一维已填值的显示名（载入的草稿只有 _auxDesc 文本时直接用它）
+function auxChipLabel(l, key) {
+  const field = AUX_FIELD[key]
+  if (l[field]) return l._auxDesc || `#${l[field]}`
+  return AUX_LABEL[key] ?? key
+}
+function auxFilled(l, key) {
+  const field = AUX_FIELD[key]
+  return l[field] !== null && l[field] !== undefined
 }
 
 // ---------------------------------------------------------------- 操作
@@ -390,15 +444,17 @@ async function save() {
                 </button>
               </td>
               <td class="px-2 py-1">
-                <div v-if="needAux(l).length" class="flex items-center gap-1">
+                <div v-if="needKeys(l).length" class="flex flex-wrap items-center gap-1">
                   <button
+                    v-for="key in needKeys(l)" :key="key"
                     class="truncate rounded px-1.5 py-0.5 text-xs"
-                    :class="l.contactId
+                    :class="auxFilled(l, key)
                       ? 'bg-[var(--profit)]/12 text-[var(--profit)]'
                       : 'bg-[var(--warn)]/18 text-[var(--warn)]'"
-                    @click="activeLine = i; contactQuery = ''; showContactPicker = true"
+                    :title="`选择${AUX_LABEL[key] ?? key}`"
+                    @click="openAuxPicker(i, key)"
                   >
-                    {{ l._auxDesc || needAux(l).join('、') }}
+                    {{ auxChipLabel(l, key) }}
                   </button>
                 </div>
                 <span v-else class="text-xs text-muted-foreground">—</span>
@@ -557,22 +613,23 @@ async function save() {
     </div>
   </Modal>
 
-  <!-- 往来单位选择器 -->
-  <Modal v-model:open="showContactPicker" title="选择往来单位" width="max-w-xl">
+  <!-- 辅助核算选择器：客户/供应商/员工/部门/项目 共用一个，
+       列表按当前维度切换 —— 应收列客户、应付列供应商，不会选错档案。 -->
+  <Modal v-model:open="showAuxPicker" :title="`选择${AUX_LABEL[auxKey] ?? '辅助核算'}`" width="max-w-xl">
     <div class="flex flex-col gap-3">
-      <Input v-model="contactQuery" placeholder="输入名称或简称" />
+      <Input v-model="auxQuery" placeholder="输入名称" />
       <div class="max-h-[24rem] overflow-auto rounded-lg border">
         <button
-          v-for="c in filteredContacts"
+          v-for="c in auxPickerItems"
           :key="c.id"
           class="flex w-full items-center gap-2 border-b px-3 py-2 text-left text-sm last:border-0 hover:bg-accent/50"
-          @click="pickContact(c)"
+          @click="pickAux(c)"
         >
           <span class="flex-1 truncate">{{ c.name }}</span>
-          <Badge variant="muted">{{ c.kindLabel }}</Badge>
+          <Badge v-if="c.tag" variant="muted">{{ c.tag }}</Badge>
         </button>
-        <p v-if="filteredContacts.length === 0" class="p-6 text-center text-sm text-muted-foreground">
-          没有匹配的往来单位，请先在设置里新增
+        <p v-if="auxPickerItems.length === 0" class="p-6 text-center text-sm text-muted-foreground">
+          没有可选的档案 —— 先到「辅助核算」页建{{ AUX_LABEL[auxKey] ?? '' }}档案
         </p>
       </div>
     </div>

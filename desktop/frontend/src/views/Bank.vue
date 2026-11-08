@@ -30,7 +30,9 @@ const busy = ref(false)
 // 记账人来自本机设置（见 lib/operator.js）：全程序一份，不再各页各存一份
 const operator = bookkeeper
 
-const filter = ref({ status: '', counterparty: '', from: '', to: '' })
+// ★ 没有流水过滤 UI：原来这里有个 filter 对象传给 api.bankFlows，
+// 但界面上没有任何控件改它，四个字段永远是空串 —— 死代码容易
+// 让人以为「页面支持筛选」。将来要做筛选时再把查询对象加回来。
 
 // 人工指定对方科目。三层匹配再全也总会有匹配不上的流水 ——
 // 一次性的业务、新出现的对手方、摘要写得莫名其妙的支出。
@@ -60,7 +62,7 @@ const ruleForm = ref({
 async function load() {
   loading.value = true
   const [f, s, r, a] = await Promise.all([
-    api.bankFlows(filter.value),
+    api.bankFlows({}),
     api.bankStats(),
     api.bankRules(),
     api.accountOptions(),

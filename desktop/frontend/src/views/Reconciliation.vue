@@ -34,11 +34,16 @@ async function loadAccounts() {
   }
 }
 
+// ★ 请求序号：快速切换银行科目时旧响应后到，
+// 会把上一个账户的调节表铺在新账户下 —— 过期响应直接丢弃。
+const reqSeq = ref(0)
+
 async function load() {
   if (!filter.value.accountCode) {
     notify('请先选择要核对的银行科目', 'error')
     return
   }
+  const seq = ++reqSeq.value
   // 余额留空 → 自动取对账单最后一笔余额；填 0 是合法值（账户清零），
   // 所以这里用「字符串非空」判断而不是真值判断。
   if (filter.value.bankBalance === '') {
@@ -59,6 +64,7 @@ async function load() {
     from: filter.value.from,
     bankBalance: bankCents.value,
   })
+  if (seq !== reqSeq.value) return
   loading.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); data.value = null; return }
   data.value = r.data

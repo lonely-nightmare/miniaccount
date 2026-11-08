@@ -6,7 +6,7 @@ import {
 } from 'lucide-vue-next'
 import { api, notify } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
-import { fmtBytes } from '@/lib/format'
+import { fmtBytes, todayISO } from '@/lib/format'
 import Card from '@/components/ui/Card.vue'
 import CardHeader from '@/components/ui/CardHeader.vue'
 import CardTitle from '@/components/ui/CardTitle.vue'
@@ -205,7 +205,7 @@ async function doRestore() {
 }
 
 function suggestPath() {
-  const stamp = new Date().toISOString().slice(0, 10)
+  const stamp = todayISO()
   backupPath.value = `${stamp}-小账本备份.mabak`
 }
 

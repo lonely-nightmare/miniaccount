@@ -30,12 +30,16 @@ const prefix = ref('')
 
 const data = ref(null)
 const loading = ref(false)
+// ★ 请求序号：快速切报表类型/期间时旧响应后到，
+// 会把上一张表的数据铺在新标题下 —— 过期响应直接丢弃。
+const reqSeq = ref(0)
 
 // 资产负债表是时点报表，只需要年月；
 // 明细类报表需要区间。这里统一用「年月」，由 Go 侧转成日期区间。
 const needPrefix = computed(() => kind.value === 'contact')
 
 async function load() {
+  const seq = ++reqSeq.value
   loading.value = true
   const r = await api.report({
     kind: kind.value,
@@ -43,6 +47,7 @@ async function load() {
     month: month.value,
     accountPrefix: prefix.value,
   })
+  if (seq !== reqSeq.value) return
   loading.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); data.value = null; return }
   data.value = r.data
@@ -105,7 +110,7 @@ function pickPeriod(p) {
 <template>
   <div class="flex flex-col gap-4">
     <!-- 报表切换 -->
-    <div class="flex flex-wrap items-center gap-2">
+    <div class="flex flex-wrap items-center gap-2 no-print">
       <Button
         v-for="r in REPORTS"
         :key="r.kind"

@@ -70,3 +70,13 @@ export function fmtBytes(n) {
 export function fmtPeriod(year, month) {
   return `${year}-${String(month).padStart(2, '0')}`
 }
+
+/** 今天的本地日期 YYYY-MM-DD。
+ *
+ * ★ 不能用 toISOString().slice(0,10) —— 那是 UTC。东八区下午 8 点之后
+ * 它会返回「明天」，默认值就错了一天，而且是看不出来的那种错。 */
+export function todayISO() {
+  const d = new Date()
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}

@@ -277,8 +277,9 @@ function toggleAux(v) {
     </Card>
 
     <!-- 新增 / 修改 -->
-    <Modal v-if="formOpen" :title="editing ? `修改科目 ${editing.code}` : '新增科目'"
-           @close="formOpen = false">
+    <!-- ★ Modal 的开关协议是 v-model:open，不是 v-if + @close：
+         组件内部 v-if="open" 自己控制显隐，外面不传 open 它永远不渲染。 -->
+    <Modal v-model:open="formOpen" :title="editing ? `修改科目 ${editing.code}` : '新增科目'">
       <div class="flex flex-col gap-3">
         <div class="grid grid-cols-2 gap-3">
           <div>

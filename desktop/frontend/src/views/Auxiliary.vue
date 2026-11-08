@@ -5,7 +5,7 @@ import {
 } from 'lucide-vue-next'
 import { api, notify } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
-import { fmtMoney, centsToYuanInput } from '@/lib/format'
+import { fmtMoney, centsToYuanInput, todayISO } from '@/lib/format'
 import Card from '@/components/ui/Card.vue'
 import CardHeader from '@/components/ui/CardHeader.vue'
 import CardTitle from '@/components/ui/CardTitle.vue'
@@ -162,15 +162,8 @@ function describeContactUsage(u) {
 const deptOpen = ref(false)
 const deptForm = ref(emptyDept())
 
-/** 今天的日期 YYYY-MM-DD。
- *
- * ★ 不能用 toISOString().slice(0,10) —— 那是 UTC。东八区下午 8 点之后
- * 它会返回「明天」，离职日期默认值就错了一天，而且是看不出来的那种错。 */
-function todayISO() {
-  const d = new Date()
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
-}
+/** todayISO 已挪到 lib/format.js —— 它不只是这页用：
+ * 发票、报销、备份文件名都需要「本地今天」而不是 UTC 今天。 */
 
 function emptyDept() {
   return { id: 0, code: '', name: '', parentId: null, enabled: true, remark: '' }

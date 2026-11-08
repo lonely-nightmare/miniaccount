@@ -140,7 +140,7 @@ const closingHint = computed(() => {
             <p class="mt-1.5 flex items-baseline gap-2">
               <span class="text-sm text-muted-foreground">期末余额</span>
               <Badge :variant="dirTone(st.closingDir)">{{ st.closingDir }}</Badge>
-              <span class="num text-2xl font-semibold">{{ fmtMoney(st.closing.abs ? st.closing : st.closing) }}</span>
+              <span class="num text-2xl font-semibold">{{ fmtMoney(Math.abs(st.closing)) }}</span>
             </p>
             <p class="mt-1 text-xs text-muted-foreground">
               {{ closingHint }} · 大写：{{ st.closingUpper }}
@@ -233,7 +233,7 @@ const closingHint = computed(() => {
                 <tr class="border-t-2 bg-muted/40 font-semibold">
                   <td class="px-3 py-2" colspan="3">期末余额</td>
                   <td colspan="2" />
-                  <td class="num px-3 py-2">{{ fmtMoney(st.closing) }}</td>
+                  <td class="num px-3 py-2">{{ fmtMoney(Math.abs(st.closing)) }}</td>
                   <td class="px-3 py-2 text-center">
                     <Badge :variant="dirTone(st.closingDir)">{{ st.closingDir }}</Badge>
                   </td>

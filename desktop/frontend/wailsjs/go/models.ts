@@ -1844,6 +1844,8 @@ export namespace main {
 	export class VoucherMeta {
 	    accounts: service.AccountOption[];
 	    contacts: service.ContactOption[];
+	    departments: service.Department[];
+	    employees: service.EmployeeView[];
 	    words: string[];
 	    currentPeriod: string;
 	    today: string;
@@ -1856,6 +1858,8 @@ export namespace main {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.accounts = this.convertValues(source["accounts"], service.AccountOption);
 	        this.contacts = this.convertValues(source["contacts"], service.ContactOption);
+	        this.departments = this.convertValues(source["departments"], service.Department);
+	        this.employees = this.convertValues(source["employees"], service.EmployeeView);
 	        this.words = source["words"];
 	        this.currentPeriod = source["currentPeriod"];
 	        this.today = source["today"];
@@ -2373,6 +2377,7 @@ export namespace service {
 	    fullName: string;
 	    direction: string;
 	    auxTypes: string[];
+	    auxKeys: string[];
 	    searchText: string;
 	
 	    static createFrom(source: any = {}) {
@@ -2386,6 +2391,7 @@ export namespace service {
 	        this.fullName = source["fullName"];
 	        this.direction = source["direction"];
 	        this.auxTypes = source["auxTypes"];
+	        this.auxKeys = source["auxKeys"];
 	        this.searchText = source["searchText"];
 	    }
 	}
@@ -6252,6 +6258,10 @@ export namespace service {
 	    debit: number;
 	    credit: number;
 	    auxDesc: string;
+	    contactId?: number;
+	    employeeId?: number;
+	    deptId?: number;
+	    projectId?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new VoucherLine(source);
@@ -6266,6 +6276,10 @@ export namespace service {
 	        this.debit = source["debit"];
 	        this.credit = source["credit"];
 	        this.auxDesc = source["auxDesc"];
+	        this.contactId = source["contactId"];
+	        this.employeeId = source["employeeId"];
+	        this.deptId = source["deptId"];
+	        this.projectId = source["projectId"];
 	    }
 	}
 	export class VoucherDetail {
@@ -6467,7 +6481,8 @@ export namespace sqlite {
 	    kind: string;
 	    baseUrl: string;
 	    model: string;
-	    apiKey: string;
+	    apiKey?: string;
+	    hasKey: boolean;
 	    enabled: boolean;
 	    isDefault: boolean;
 	    timeoutMs: number;
@@ -6485,6 +6500,7 @@ export namespace sqlite {
 	        this.baseUrl = source["baseUrl"];
 	        this.model = source["model"];
 	        this.apiKey = source["apiKey"];
+	        this.hasKey = source["hasKey"];
 	        this.enabled = source["enabled"];
 	        this.isDefault = source["isDefault"];
 	        this.timeoutMs = source["timeoutMs"];

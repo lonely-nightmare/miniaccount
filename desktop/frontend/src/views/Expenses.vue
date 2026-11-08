@@ -5,7 +5,7 @@ import {
 } from 'lucide-vue-next'
 import { api, notify, DRAFT_HINT } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
-import { fmtMoney, parseYuanToCents } from '@/lib/format'
+import { fmtMoney, parseYuanToCents, todayISO } from '@/lib/format'
 import Card from '@/components/ui/Card.vue'
 import CardHeader from '@/components/ui/CardHeader.vue'
 import CardTitle from '@/components/ui/CardTitle.vue'
@@ -83,7 +83,7 @@ const total = computed(() => {
 
 function openNew() {
   form.value = emptyClaim()
-  form.value.applyDate = new Date().toISOString().slice(0, 10)
+  form.value.applyDate = todayISO()
   formOpen.value = true
 }
 

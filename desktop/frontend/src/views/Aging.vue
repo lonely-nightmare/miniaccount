@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import {
-  RefreshCw, Printer, AlertTriangle, Download, ChevronRight, ChevronDown,
+  RefreshCw, Printer, AlertTriangle, ChevronRight, ChevronDown,
 } from 'lucide-vue-next'
 import { api, notify } from '@/lib/api'
 import { fmtMoney } from '@/lib/format'
@@ -49,7 +49,7 @@ const rows = computed(() => data.value?.rows ?? [])
 const buckets = computed(() => data.value?.buckets ?? [])
 
 // 只统计「有未结清」的行，避免空行干扰
-const liveRows = computed(() => rows.value.filter((r) => !r.balance === 0))
+const liveRows = computed(() => rows.value.filter((r) => r.balance !== 0))
 
 function fmtPercent(p) {
   if (!p) return ''
@@ -82,7 +82,10 @@ function fmtPercent(p) {
         <RefreshCw :class="loading ? 'animate-spin' : ''" /> 生成
       </Button>
       <Button v-if="data" variant="outline" @click="printPage"><Printer /> 打印 / PDF</Button>
-      <Button v-if="data" variant="outline" @click="$emit('export')"><Download /> 导出 Excel</Button>
+      <!-- ★ 删掉了「导出 Excel」死按钮：它只 $emit('export')，
+           而本页由路由直接渲染、没有父组件接收；后端 ExportKind
+           也没有 aging 类型。将来做账龄导出时在 export.go 加
+           ExportKind + export 包 writer，再把这个按钮接回来。 -->
     </div>
 
     <Spinner v-if="loading" />

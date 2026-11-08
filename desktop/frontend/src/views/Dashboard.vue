@@ -61,7 +61,7 @@ const todos = computed(() => {
       key: 'bank', tone: 'info', icon: Landmark,
       title: `${d.unpostedBankFlows} 条银行流水未生成凭证`,
       detail: '导入的流水需要匹配对方科目后才能生成凭证',
-      to: { path: '/ai' },
+      to: { path: '/bank' },
     })
   }
   if (!balanced.value) {

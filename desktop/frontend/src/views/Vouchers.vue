@@ -40,6 +40,7 @@ const editingId = ref(0)
 const detail = ref(null)
 const detailOpen = ref(false)
 const reverseOpen = ref(false)
+const reversing = ref(false)
 // 记账人来自本机设置（见 lib/operator.js）：全程序一份，不再各页各存一份
 const operator = bookkeeper
 
@@ -53,7 +54,13 @@ async function loadPeriods() {
   }
 }
 
+// ★ 请求序号：快速切期间/状态时旧响应后到，会把「上一个查询」的
+// 数据铺在新期间下面 —— 凭证列表瞬间显示别的期间的凭证。
+// 每次发起都递增序号，响应回来先对号，过期直接丢弃。
+const reqSeq = ref(0)
+
 async function load() {
+  const seq = ++reqSeq.value
   loading.value = true
   const [y, m] = (filter.value.period || '-').split('-')
   const r = await api.vouchers({
@@ -62,6 +69,7 @@ async function load() {
     status: filter.value.status,
     keyword: filter.value.keyword,
   })
+  if (seq !== reqSeq.value) return
   loading.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); rows.value = []; return }
   rows.value = r.data ?? []
@@ -112,9 +120,15 @@ async function onSaved(saved) {
   await load()
 }
 
+// 删除中的草稿 id：防止对同一张草稿连点两次发起两个删除请求
+const removingIds = ref(new Set())
+
 async function removeDraft(row) {
+  if (removingIds.value.has(row.id)) return
   if (!confirm(`确认删除草稿「${row.remark || row.no || '未命名'}」？\n草稿不占凭证号，删除不会造成断号。`)) return
+  removingIds.value = new Set(removingIds.value).add(row.id)
   const r = await api.deleteVoucher(row.id)
+  removingIds.value.delete(row.id)
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
   notify('草稿已删除', 'success')
   await load()
@@ -122,7 +136,12 @@ async function removeDraft(row) {
 
 async function doReverse() {
   if (!operator.value.trim()) { notify('请填写操作人', 'warn'); return }
+  // ★ 防重入：双击/连点会发起两张红字凭证 ——
+  // 第二张多半会被「该凭证已被冲销」挡下，但万一窗口期穿过，
+  // 同一张凭证被冲销两次，净额就不再是零。
+  reversing.value = true
   const r = await api.reverseVoucher({ id: detail.value.id, by: operator.value.trim() })
+  reversing.value = false
   if (!r.ok) { notify(r.fault.message, 'error', r.fault.detail); return }
   notify(`已红字冲销，生成凭证 ${r.data.no}`, 'success')
   reverseOpen.value = false
@@ -246,7 +265,8 @@ const sourceIcon = (s) =>
                   </Button>
                   <Button
                     v-if="r.status === 'draft'"
-                    variant="ghost" size="sm" title="删除草稿" @click="removeDraft(r)"
+                    variant="ghost" size="sm" title="删除草稿"
+                    :disabled="removingIds.has(r.id)" @click="removeDraft(r)"
                   >
                     <Trash2 />
                   </Button>
@@ -371,7 +391,7 @@ const sourceIcon = (s) =>
       </div>
       <template #footer>
         <Button variant="ghost" @click="reverseOpen = false">取消</Button>
-        <Button variant="destructive" @click="doReverse"><Undo2 /> 确认冲销</Button>
+        <Button variant="destructive" :disabled="reversing" @click="doReverse"><Undo2 /> 确认冲销</Button>
       </template>
     </Modal>
   </div>
