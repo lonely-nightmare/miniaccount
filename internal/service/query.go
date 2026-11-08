@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -111,6 +112,35 @@ func (s *Service) lineStats(ctx context.Context, vs []*voucher.Voucher) (map[int
 		return nil, translate(err)
 	}
 	defer rows.Close()
+	return scanLineStats(rows)
+}
+
+// periodLineStats 汇总指定期间的凭证分录，供 GUI 凭证列表取金额和行数。
+// 按期间筛选，避免 GUI 整月列表对大量凭证 ID 构造 IN 参数。
+func (s *Service) periodLineStats(ctx context.Context, year, month int) (map[int64]lineStat, error) {
+	sqlText := `SELECT ve.voucher_id, COUNT(*), COALESCE(SUM(ve.debit),0)
+		FROM voucher_entry ve JOIN voucher v ON v.id = ve.voucher_id WHERE 1 = 1`
+	var args []any
+	if year > 0 {
+		sqlText += ` AND v.year = ?`
+		args = append(args, year)
+	}
+	if month > 0 {
+		sqlText += ` AND v.month = ?`
+		args = append(args, month)
+	}
+	sqlText += ` GROUP BY ve.voucher_id`
+
+	rows, err := s.db.SQL().QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+	return scanLineStats(rows)
+}
+
+func scanLineStats(rows *sql.Rows) (map[int64]lineStat, error) {
+	out := map[int64]lineStat{}
 	for rows.Next() {
 		var id, sum int64
 		var n int

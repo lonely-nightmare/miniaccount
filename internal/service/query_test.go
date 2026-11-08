@@ -1,8 +1,7 @@
 package service_test
 
-// 外部复查发现的查询缺陷回归：
-// VouchersPage 金额恒 0（分录未加载）、LedgerDetail 的
-// closingBalance 被 limit 截断。
+// 查询回归：凭证列表金额来自分录合计；LedgerDetail 的
+// closingBalance 不受 limit 截断。
 
 import (
 	"context"
@@ -35,10 +34,24 @@ func TestVouchersPageAmountFromLines(t *testing.T) {
 		t.Fatalf("应有 1 张凭证，实际 %d", len(page.Items))
 	}
 	if page.Items[0].Amount != money100(200) {
-		t.Fatalf("列表金额 = %s，期望 200.00（分录合计）", page.Items[0].Amount)
+		t.Fatalf("MCP 列表金额 = %s，期望 200.00（分录合计）", page.Items[0].Amount)
 	}
 	if page.Items[0].Lines != 2 {
-		t.Fatalf("分录行数 = %d，期望 2", page.Items[0].Lines)
+		t.Fatalf("MCP 分录行数 = %d，期望 2", page.Items[0].Lines)
+	}
+
+	guiRows, err := svc.Vouchers(ctx, service.VoucherQuery{Year: 2025, Month: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(guiRows) != 1 {
+		t.Fatalf("GUI 列表应有 1 张凭证，实际 %d", len(guiRows))
+	}
+	if guiRows[0].Amount != money100(200) {
+		t.Fatalf("GUI 列表金额 = %s，期望 200.00（分录合计）", guiRows[0].Amount)
+	}
+	if guiRows[0].Lines != 2 {
+		t.Fatalf("GUI 分录行数 = %d，期望 2", guiRows[0].Lines)
 	}
 }
 

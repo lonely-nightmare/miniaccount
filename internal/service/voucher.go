@@ -98,8 +98,8 @@ func (s *Service) Vouchers(ctx context.Context, q VoucherQuery) ([]VoucherSummar
 		return nil, err
 	}
 
-	// 分录行数一次性查出来，避免每张凭证单独查一次
-	counts, err := s.entryCounts(ctx, q.Year, q.Month)
+	// 凭证头查询不加载分录；列表金额和行数必须从分录聚合，不能调用 v.Amount()。
+	stats, err := s.periodLineStats(ctx, q.Year, q.Month)
 	if err != nil {
 		return nil, err
 	}
@@ -110,44 +110,13 @@ func (s *Service) Vouchers(ctx context.Context, q VoucherQuery) ([]VoucherSummar
 			ID: v.ID, No: v.No, Word: string(v.Word), Date: v.BizDate.String(),
 			Remark: v.Remark, Status: string(v.Status),
 			StatusLabel: v.Status.Label(), AttachCount: v.AttachCount,
-			Amount: v.Amount(), Source: string(v.Source),
+			Amount: stats[v.ID].sum, Source: string(v.Source),
 			SourceLabel: v.Source.Label(), CreatedByAI: v.CreatedByAI,
 			CreatedBy: v.CreatedBy, PostedBy: v.PostedBy,
-			Lines: counts[v.ID], UpdatedAt: v.UpdatedAtText,
+			Lines: stats[v.ID].count, UpdatedAt: v.UpdatedAtText,
 		})
 	}
 	return out, nil
-}
-
-func (s *Service) entryCounts(ctx context.Context, year, month int) (map[int64]int, error) {
-	sqlText := `SELECT ve.voucher_id, COUNT(*) FROM voucher_entry ve
-	              JOIN voucher v ON v.id = ve.voucher_id WHERE 1 = 1`
-	var args []any
-	if year > 0 {
-		sqlText += ` AND v.year = ?`
-		args = append(args, year)
-	}
-	if month > 0 {
-		sqlText += ` AND v.month = ?`
-		args = append(args, month)
-	}
-	sqlText += ` GROUP BY ve.voucher_id`
-
-	rows, err := s.db.SQL().QueryContext(ctx, sqlText, args...)
-	if err != nil {
-		return nil, translate(err)
-	}
-	defer rows.Close()
-	out := map[int64]int{}
-	for rows.Next() {
-		var id int64
-		var n int
-		if err := rows.Scan(&id, &n); err != nil {
-			return nil, err
-		}
-		out[id] = n
-	}
-	return out, rows.Err()
 }
 
 // VoucherDetail 是一张凭证的完整内容。
