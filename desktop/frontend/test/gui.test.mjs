@@ -1237,10 +1237,11 @@ test('★ 部门能新建、改名、停用（界面到后端整条路）', asyn
   assert.ok(!(final.data ?? []).some((d) => d.id === made.id), '删完还在列表里')
 })
 
-test('★ 辅助核算页四个维度都在，且各自读的是自己的档案', async () => {
+test('★ 辅助核算页六个维度都在，且各自读的是自己的档案', async () => {
   // 用户要的是「辅助核算设置，这里面需要有客户、供应商、
-  // 本公司的部门和员工（需要迁移过来）」—— 四个缺一个，
-  // 那个维度在录凭证时就是空下拉，分录会被「缺少必需的辅助核算」拒绝。
+  // 本公司的部门和员工（需要迁移过来）」—— 后来往来单位又
+  // 补了股东与其他往来两种身份，缺一个，那个维度在录凭证时
+  // 就是空下拉，分录会被「缺少必需的辅助核算」拒绝。
   //
   // ★ 这一条跑在「建账」测试之后，当前账套是刚建出来的**空**账套，
   // 所以断言取「表头 或 空态」，两者都说明这一页真的渲染出来了。
@@ -1251,6 +1252,8 @@ test('★ 辅助核算页四个维度都在，且各自读的是自己的档案'
   const wants = [
     { tab: '客户', btn: '新建客户', marks: ['名称', '还没有客户'] },
     { tab: '供应商', btn: '新建供应商', marks: ['税号', '还没有供应商'] },
+    { tab: '股东', btn: '新建股东', marks: ['名称', '还没有股东'] },
+    { tab: '其他往来', btn: '新建其他往来', marks: ['名称', '还没有其他往来'] },
     { tab: '部门', btn: '新建部门', marks: ['上级', '还没有部门'] },
     { tab: '员工', btn: '新增员工', marks: ['标准月工资', '还没有员工'] },
   ]
@@ -1268,6 +1271,8 @@ test('★ 辅助核算页四个维度都在，且各自读的是自己的档案'
   const bound = [
     ['客户', await bundle.api.api.contacts('customer')],
     ['供应商', await bundle.api.api.contacts('supplier')],
+    ['股东', await bundle.api.api.contacts('shareholder')],
+    ['其他往来', await bundle.api.api.contacts('other')],
     ['部门', await bundle.api.api.departments()],
     ['员工', await bundle.api.api.employees(false)],
   ]
@@ -2228,6 +2233,106 @@ test('回归：跨期和同一期重开弹窗都只显示当前的体检结果',
     await page.clickExact('取消')
   } finally {
     app.Health = health
+    await page.goto('/dashboard')
+  }
+})
+
+test('回归：股东草稿重开后原样保存不再丢辅助核算', async () => {
+  const a = bundle.api.api
+  // 建一个股东档案（等价用户在辅助核算里建股东）
+  const cid = (await a.saveContact({ kind: 'shareholder', name: '回归股东甲', enabled: true })).data
+  assert.ok(cid > 0, `建股东失败：${JSON.stringify(cid)}`)
+  const per = await a.periods()
+  const openOne = (per.data.periods ?? []).find((p) => p.status === 'open')
+  const day = `${openOne.year}-${String(openOne.month).padStart(2, '0')}-15`
+  // 等价用户首次保存：3001 贷方带上股东 contactId
+  const saved = await a.saveVoucher({
+    id: 0, word: '记', date: day, remark: '股东草稿回归', createdBy: '',
+    attachCount: 0,
+    lines: [
+      { accountCode: '1001', summary: '收股东投资款', debitYuan: '500.00', creditYuan: '' },
+      { accountCode: '3001', summary: '收股东投资款', debitYuan: '', creditYuan: '500.00', contactId: cid },
+    ],
+  })
+  assert.equal(saved.ok, true, saved.fault?.message)
+  const vid = saved.data.id
+  try {
+    // 后端确实把股东 id 落库了
+    const detail = await a.voucherDetail(vid)
+    const shareholderLine = detail.data.lines.find((l) => l.accountCode === '3001')
+    assert.equal(shareholderLine.contactId, cid,
+      `详情里 3001 行 contactId 丢了：${JSON.stringify(shareholderLine)}`)
+
+    // UI 路径：打开凭证列表 → 点这张草稿的「编辑」→ 什么都不动点「保存草稿」
+    await page.goto('/vouchers')
+    await settle(100)
+    const rows = [...win.document.querySelectorAll('tr')]
+    const row = rows.find((tr) => tr.textContent.includes('股东草稿回归'))
+    assert.ok(row, '草稿列表里找不到刚保存的凭证')
+    const editBtn = row.querySelector('button[title="编辑草稿"]')
+    assert.ok(editBtn, '草稿行里没有编辑按钮')
+    editBtn.click()
+    await settle(100)
+    await page.clickExact('保存草稿')
+    await settle(150)
+    assert.doesNotMatch(win.document.body.textContent, /缺少必需的辅助核算/,
+      '重开草稿原样保存仍报「缺少必需的辅助核算」—— contactId 在编辑器里丢了')
+  } finally {
+    await page.goto('/dashboard')
+  }
+})
+
+test('回归：股东和其他往来档案在辅助核算页可见可编辑', async () => {
+  const a = bundle.api.api
+  const sh = (await a.saveContact({ kind: 'shareholder', name: '回归股东乙', enabled: true })).data
+  const ot = (await a.saveContact({ kind: 'other', name: '回归其他丙', enabled: true })).data
+  assert.ok(sh > 0 && ot > 0)
+  try {
+    await page.goto('/auxiliary')
+    await settle(100)
+
+    // 股东标签页：建过的股东要列得出来，还要能再编辑
+    await page.clickExact('股东')
+    await settle(50)
+    let row = [...win.document.querySelectorAll('tr')]
+      .find((tr) => tr.textContent.includes('回归股东乙'))
+    assert.ok(row, '股东页列表里看不到刚建的股东 —— 建完就消失，再也编辑不了')
+    const editBtn = [...row.querySelectorAll('button')]
+      .find((b) => b.textContent.includes('编辑'))
+    assert.ok(editBtn, '股东行里没有编辑按钮')
+    editBtn.click()
+    await settle(100)
+    await page.type(page.input('input[placeholder="杭州云帆科技有限公司"]'), '回归股东乙改')
+    await page.clickExact('保存')
+    await settle(150)
+    const after = (await a.contactList()).data.find((c) => c.id === sh)
+    assert.equal(after.name, '回归股东乙改', '股东改名没存上')
+    assert.equal(after.kind, 'shareholder', '编辑把股东类型洗掉了')
+
+    // 其他往来标签页同样要能列出来
+    await page.clickExact('其他往来')
+    await settle(50)
+    row = [...win.document.querySelectorAll('tr')]
+      .find((tr) => tr.textContent.includes('回归其他丙'))
+    assert.ok(row, '其他往来页列表里看不到刚建的档案')
+
+    // 客户页不该混进股东/其他档案
+    await page.clickExact('客户')
+    await settle(50)
+    assert.doesNotMatch(win.document.body.textContent, /回归股东乙|回归其他丙/,
+      '股东/其他档案混进客户列表了')
+
+    // 在股东页点新建，类型要预置为 shareholder
+    await page.clickExact('股东')
+    await settle(50)
+    await page.clickExact('新建股东')
+    await settle(80)
+    const kindSel = [...win.document.body.querySelectorAll('select')]
+      .find((s) => [...s.options].some((o) => o.value === 'shareholder'))
+    assert.ok(kindSel, '新建弹窗里没有类型下拉')
+    assert.equal(kindSel.value, 'shareholder', '股东页新建预置的类型不是 shareholder')
+    await page.clickExact('取消')
+  } finally {
     await page.goto('/dashboard')
   }
 })

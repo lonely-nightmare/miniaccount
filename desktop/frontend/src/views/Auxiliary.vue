@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import {
   Users, Plus, Pencil, Save, Building2, UserRound, Truck, Store,
+  Landmark, Handshake,
 } from 'lucide-vue-next'
 import { api, notify } from '@/lib/api'
 import { bookkeeper, loadBookkeeper, rememberBookkeeper } from '@/lib/operator'
@@ -23,17 +24,17 @@ import EmptyState from '@/components/ui/EmptyState.vue'
 // 辅助核算设置
 // ---------------------------------------------------------------------------
 //
-// 凭证上的辅助核算有四个维度：**往来单位（客户 / 供应商）、部门、员工**。
+// 凭证上的辅助核算维度有：**往来单位（客户 / 供应商 / 股东 / 其他往来）、部门、员工**。
 // 科目那边只声明「这个科目需要哪几维」（见科目管理），
 // 而**每一维具体有哪些**是这里的事 —— 没有档案，录凭证时那个下拉是空的，
 // 分录会被「缺少必需的辅助核算」直接拒绝。
 //
-// 四张表原来散在两处：客户/供应商只能靠录发票时顺手带出来，
+// 这几张表原来散在两处：客户/供应商只能靠录发票时顺手带出来，
 // 部门/员工在工资页。这里把它们收到一起 —— 因为它们的**用途是同一个**：
 // 记费用、记往来时挑一个。工资页关心的是工资怎么算，
 // 部门与员工只是它的输入，不该把档案维护埋在里面。
 
-const tab = ref('customers') // customers | suppliers | depts | employees
+const tab = ref('customers') // customers | suppliers | shareholders | others | depts | employees
 const loading = ref(true)
 const busy = ref(false)
 // 记账人来自本机设置（见 lib/operator.js）：全程序一份，不再各页各存一份
@@ -46,6 +47,8 @@ const employees = ref([])
 const TABS = [
   { v: 'customers', n: '客户', icon: Store },
   { v: 'suppliers', n: '供应商', icon: Truck },
+  { v: 'shareholders', n: '股东', icon: Landmark },
+  { v: 'others', n: '其他往来', icon: Handshake },
   { v: 'depts', n: '部门', icon: Building2 },
   { v: 'employees', n: '员工', icon: Users },
 ]
@@ -68,13 +71,27 @@ onMounted(async () => {
   await Promise.all([load(), loadBookkeeper()])
 })
 
-/** 当前标签页对应的往来单位类型。 */
-const contactKind = computed(() => (tab.value === 'suppliers' ? 'supplier' : 'customer'))
-const contactsShown = computed(() => contacts.value.filter((c) => {
-  // 「客户与供应商」两边都要出现 —— 它确实是两种身份
-  if (tab.value === 'suppliers') return c.kind === 'supplier' || c.kind === 'both'
-  return c.kind === 'customer' || c.kind === 'both'
-}))
+/** 四个往来标签页各自展示哪些 kind —— 与后端 auxMatchesContact 的口径一致：
+ * 客户/供应商页把「客户与供应商（both）」这种双重身份也带上；
+ * 股东页只收 shareholder（凭证股东维度后端也只认它）。 */
+const CONTACT_TAB_KINDS = {
+  customers: ['customer', 'both'],
+  suppliers: ['supplier', 'both'],
+  shareholders: ['shareholder'],
+  others: ['other'],
+}
+const CONTACT_TAB_LABEL = {
+  customers: '客户', suppliers: '供应商', shareholders: '股东', others: '其他往来',
+}
+const isContactTab = computed(() => tab.value in CONTACT_TAB_KINDS)
+
+/** 当前标签页新建时预置的往来单位类型。 */
+const contactKind = computed(() => ({
+  customers: 'customer', suppliers: 'supplier',
+  shareholders: 'shareholder', others: 'other',
+})[tab.value] ?? 'customer')
+const contactsShown = computed(() => contacts.value.filter((c) =>
+  (CONTACT_TAB_KINDS[tab.value] ?? []).includes(c.kind)))
 
 // ---------------------------------------------------------------- 往来单位
 
@@ -88,6 +105,22 @@ function emptyContact() {
     address: '', enabled: true, remark: '',
   }
 }
+
+/** 类型下拉与弹窗标题里的中文名。 */
+const KIND_LABEL = {
+  customer: '客户', supplier: '供应商', both: '客户与供应商',
+  shareholder: '股东', other: '其他单位',
+}
+const contactTabDesc = computed(() => ({
+  customers: '应收挂客户。简称要填 —— 银行流水里出现的常常是简称，' +
+    '「上次同样的对手方怎么记的」是最有效的记账线索。',
+  suppliers: '应付挂供应商。简称要填 —— 银行流水里出现的常常是简称，' +
+    '「上次同样的对手方怎么记的」是最有效的记账线索。',
+  shareholders: '实收资本、资本公积这类科目要求挂股东 —— 没有股东档案，' +
+    '收到投资款的凭证会被「缺少必需的辅助核算」拒绝。',
+  others: '其他应收/应付款挂其他往来单位 —— 押金、代垫、借支都归这里。' +
+    '「其他」维度不挑类型，任何往来档案都能选。',
+})[tab.value] ?? '')
 
 function editContact(c) {
   contactForm.value = c
@@ -364,8 +397,8 @@ const enabledDepartments = computed(() => departments.value.filter((d) => d.enab
       <div class="ml-auto flex items-center gap-2">
         <Input v-model="operator"
                @change="rememberBookkeeper(operator)" class="h-8 w-32" placeholder="操作人" />
-        <Button v-if="tab === 'customers' || tab === 'suppliers'" size="sm" @click="editContact(null)">
-          <Plus /> 新建{{ tab === 'suppliers' ? '供应商' : '客户' }}
+        <Button v-if="isContactTab" size="sm" @click="editContact(null)">
+          <Plus /> 新建{{ CONTACT_TAB_LABEL[tab] }}
         </Button>
         <Button v-if="tab === 'depts'" size="sm" @click="editDept(null)">
           <Plus /> 新建部门
@@ -377,7 +410,7 @@ const enabledDepartments = computed(() => departments.value.filter((d) => d.enab
     </div>
 
     <p class="text-xs text-muted-foreground">
-      凭证上的辅助核算有四个维度：<b>往来单位（客户 / 供应商）、部门、员工</b>。
+      凭证上的辅助核算有<b>往来单位（客户 / 供应商 / 股东 / 其他往来）、部门、员工</b>这些维度。
       「科目管理」里声明每个科目需要哪几维，<b>这里维护每一维具体有哪些</b> ——
       没有档案，录凭证时那个下拉是空的，分录会被「缺少必需的辅助核算」直接拒绝。
       撤掉的对象请用<b>停用</b>而不是删除：停用之后新凭证选不到它，历史报表照旧。
@@ -385,20 +418,17 @@ const enabledDepartments = computed(() => departments.value.filter((d) => d.enab
 
     <Spinner v-if="loading" />
 
-    <!-- 客户 / 供应商 -->
-    <Card v-else-if="tab === 'customers' || tab === 'suppliers'">
+    <!-- 往来单位：客户 / 供应商 / 股东 / 其他往来 -->
+    <Card v-else-if="isContactTab">
       <CardHeader>
-        <CardTitle>{{ tab === 'suppliers' ? '供应商' : '客户' }}</CardTitle>
-        <CardDescription>
-          应收挂客户、应付挂供应商。简称要填 —— 银行流水里出现的常常是简称，
-          「上次同样的对手方怎么记的」是最有效的记账线索。
-        </CardDescription>
+        <CardTitle>{{ CONTACT_TAB_LABEL[tab] }}</CardTitle>
+        <CardDescription>{{ contactTabDesc }}</CardDescription>
       </CardHeader>
       <CardContent class="px-0">
         <EmptyState
           v-if="contactsShown.length === 0"
-          :title="tab === 'suppliers' ? '还没有供应商' : '还没有客户'"
-          description="录采购发票与付款时需要先有供应商档案；应收账款要按客户归集"
+          :title="`还没有${CONTACT_TAB_LABEL[tab]}`"
+          :description="contactTabDesc"
         >
           <Button size="sm" @click="editContact(null)"><Plus /> 新建</Button>
         </EmptyState>
@@ -573,8 +603,8 @@ const enabledDepartments = computed(() => departments.value.filter((d) => d.enab
     <!-- 往来单位编辑 -->
     <Modal
       v-model:open="contactOpen"
-      :title="contactForm.id ? '编辑' + (contactForm.kind === 'supplier' ? '供应商' : '客户') : '新建' + (contactForm.kind === 'supplier' ? '供应商' : '客户')"
-      description="客户与供应商都记在往来单位档案里，用「类型」区分。一个单位既是客户又是供应商时选「客户与供应商」。"
+      :title="(contactForm.id ? '编辑' : '新建') + (KIND_LABEL[contactForm.kind] ?? '往来单位')"
+      description="往来单位档案用「类型」区分身份：客户、供应商、股东、其他单位。一个单位既是客户又是供应商时选「客户与供应商」。"
       width="max-w-2xl"
     >
       <div class="grid grid-cols-2 gap-3">
