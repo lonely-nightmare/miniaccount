@@ -82,6 +82,9 @@ const usage = `miniaccount —— 面向中国小微企业的记账软件
   log        操作日志：查询、校验完整性、导出（会计监督用）
   bookkeeper 查看/设置本账套的记账人（录凭证、过账、结账时默认填它）
 
+对外接口：
+  mcp        以 MCP 协议对外暴露账套能力（stdio 传输，--readonly 只读）
+
 
 通用参数：
   --db <路径>   账套文件（默认 miniaccount.db）

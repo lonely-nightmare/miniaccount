@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -92,6 +93,10 @@ func (s *Server) registerWriteTools() {
 			return readonlyErr()
 		}
 		ctx, warn := s.callCtx(ctx)
+		if strings.TrimSpace(in.ExpectedUpdatedAt) == "" {
+			return toolError(&service.InvalidInput{
+				Msg: "expectedUpdatedAt 不能为空：先 get_voucher 取 updatedAt 再回传"})
+		}
 		d, err := s.svc.Voucher(ctx, in.ID)
 		if err != nil {
 			return toolError(err)
@@ -148,6 +153,10 @@ func (s *Server) registerWriteTools() {
 			return readonlyErr()
 		}
 		ctx, warn := s.callCtx(ctx)
+		if strings.TrimSpace(in.ExpectedUpdatedAt) == "" {
+			return toolError(&service.InvalidInput{
+				Msg: "expectedUpdatedAt 不能为空：先 get_voucher 取 updatedAt 再回传"})
+		}
 		d, err := s.svc.Voucher(ctx, in.ID)
 		if err != nil {
 			return toolError(err)
@@ -180,18 +189,22 @@ func (s *Server) registerWriteTools() {
 			id = int64(f)
 			delete(in, "id")
 		}
+		var pe patchErrs
 		p := service.ContactPatch{
-			Kind:          patchStr(in, "kind"),
-			Name:          patchStr(in, "name"),
-			ShortName:     patchStr(in, "shortName"),
-			TaxNo:         patchStr(in, "taxNo"),
-			BankName:      patchStr(in, "bankName"),
-			BankAccount:   patchStr(in, "bankAccount"),
-			ContactPerson: patchStr(in, "contactPerson"),
-			Phone:         patchStr(in, "phone"),
-			Address:       patchStr(in, "address"),
-			Enabled:       patchBool(in, "enabled"),
-			Remark:        patchStr(in, "remark"),
+			Kind:          pe.patchStr(in, "kind"),
+			Name:          pe.patchStr(in, "name"),
+			ShortName:     pe.patchStr(in, "shortName"),
+			TaxNo:         pe.patchStr(in, "taxNo"),
+			BankName:      pe.patchStr(in, "bankName"),
+			BankAccount:   pe.patchStr(in, "bankAccount"),
+			ContactPerson: pe.patchStr(in, "contactPerson"),
+			Phone:         pe.patchStr(in, "phone"),
+			Address:       pe.patchStr(in, "address"),
+			Enabled:       pe.patchBool(in, "enabled"),
+			Remark:        pe.patchStr(in, "remark"),
+		}
+		if err := pe.err(); err != nil {
+			return toolError(err)
 		}
 		out, err := s.svc.PatchContact(ctx, id, p)
 		if err != nil {
@@ -216,12 +229,16 @@ func (s *Server) registerWriteTools() {
 			id = int64(f)
 			delete(in, "id")
 		}
+		var pe patchErrs
 		p := service.DepartmentPatch{
-			Code:    patchStr(in, "code"),
-			Name:    patchStr(in, "name"),
-			Parent:  patchInt(in, "parentId"),
-			Enabled: patchBool(in, "enabled"),
-			Remark:  patchStr(in, "remark"),
+			Code:    pe.patchStr(in, "code"),
+			Name:    pe.patchStr(in, "name"),
+			Parent:  pe.patchInt(in, "parentId"),
+			Enabled: pe.patchBool(in, "enabled"),
+			Remark:  pe.patchStr(in, "remark"),
+		}
+		if err := pe.err(); err != nil {
+			return toolError(err)
 		}
 		out, err := s.svc.PatchDepartment(ctx, id, p)
 		if err != nil {
@@ -246,15 +263,19 @@ func (s *Server) registerWriteTools() {
 			return toolError(&service.InvalidInput{Msg: "update_employee 必须提供员工 id"})
 		}
 		f, _ := v.(float64)
+		var pe patchErrs
 		p := service.EmployeePatch{
-			Name:               patchStr(in, "name"),
-			Phone:              patchStr(in, "phone"),
-			IDCard:             patchStr(in, "idCard"),
-			BankName:           patchStr(in, "bankName"),
-			BankAccount:        patchStr(in, "bankAccount"),
-			ExpenseAccountCode: patchStr(in, "expenseAccountCode"),
-			CompanyAccountCode: patchStr(in, "companyAccountCode"),
-			Remark:             patchStr(in, "remark"),
+			Name:               pe.patchStr(in, "name"),
+			Phone:              pe.patchStr(in, "phone"),
+			IDCard:             pe.patchStr(in, "idCard"),
+			BankName:           pe.patchStr(in, "bankName"),
+			BankAccount:        pe.patchStr(in, "bankAccount"),
+			ExpenseAccountCode: pe.patchStr(in, "expenseAccountCode"),
+			CompanyAccountCode: pe.patchStr(in, "companyAccountCode"),
+			Remark:             pe.patchStr(in, "remark"),
+		}
+		if err := pe.err(); err != nil {
+			return toolError(err)
 		}
 		if err := s.svc.PatchEmployee(ctx, int64(f), p); err != nil {
 			return toolError(err)
@@ -369,8 +390,24 @@ func voucherResult(d *service.VoucherDetail, outcome *service.IdemOutcome,
 	return res
 }
 
+// patchErrs 收集补丁字段的类型错误。
+// 错误类型（如对 remark 发数字）以前会静默当零值清空字段 ——
+// 现在聚合成 invalid_params 返回，字段一个都不动。
+type patchErrs []string
+
+func (e *patchErrs) fail(key, want string, got any) {
+	*e = append(*e, fmt.Sprintf("%s 应为 %s 或 null，收到 %v", key, want, got))
+}
+
+func (e *patchErrs) err() error {
+	if len(*e) == 0 {
+		return nil
+	}
+	return &service.InvalidInput{Msg: "字段类型错误：" + strings.Join(*e, "；")}
+}
+
 // patchStr / patchBool / patchInt 把 map 输入解成三态 Field。
-func patchStr(in map[string]any, key string) service.Field[string] {
+func (e *patchErrs) patchStr(in map[string]any, key string) service.Field[string] {
 	v, ok := in[key]
 	if !ok {
 		return service.Field[string]{}
@@ -378,11 +415,15 @@ func patchStr(in map[string]any, key string) service.Field[string] {
 	if v == nil {
 		return service.Field[string]{Set: true, Null: true}
 	}
-	s, _ := v.(string)
+	s, ok := v.(string)
+	if !ok {
+		e.fail(key, "字符串", v)
+		return service.Field[string]{}
+	}
 	return service.Field[string]{Set: true, Value: s}
 }
 
-func patchBool(in map[string]any, key string) service.Field[bool] {
+func (e *patchErrs) patchBool(in map[string]any, key string) service.Field[bool] {
 	v, ok := in[key]
 	if !ok {
 		return service.Field[bool]{}
@@ -390,11 +431,15 @@ func patchBool(in map[string]any, key string) service.Field[bool] {
 	if v == nil {
 		return service.Field[bool]{Set: true, Null: true}
 	}
-	b, _ := v.(bool)
+	b, ok := v.(bool)
+	if !ok {
+		e.fail(key, "布尔", v)
+		return service.Field[bool]{}
+	}
 	return service.Field[bool]{Set: true, Value: b}
 }
 
-func patchInt(in map[string]any, key string) service.Field[int64] {
+func (e *patchErrs) patchInt(in map[string]any, key string) service.Field[int64] {
 	v, ok := in[key]
 	if !ok {
 		return service.Field[int64]{}
@@ -402,6 +447,10 @@ func patchInt(in map[string]any, key string) service.Field[int64] {
 	if v == nil {
 		return service.Field[int64]{Set: true, Null: true}
 	}
-	f, _ := v.(float64)
+	f, ok := v.(float64)
+	if !ok {
+		e.fail(key, "数字", v)
+		return service.Field[int64]{}
+	}
 	return service.Field[int64]{Set: true, Value: int64(f)}
 }

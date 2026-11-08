@@ -159,3 +159,101 @@ func TestReadonlyMode(t *testing.T) {
 		t.Fatalf("只读模式下读工具应可用: err=%v res=%v", err, res.IsError)
 	}
 }
+
+// 元字符串契约：分页凭证与报表输出的金额必须是 "12.34" 形态。
+func TestMoneyFieldsAreYuanStrings(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	if res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "create_draft_voucher",
+		Arguments: map[string]any{
+			"date": "2025-03-15", "remark": "金额契约",
+			"lines": []map[string]any{
+				{"accountCode": "1001", "debit": "12.34"},
+				{"accountCode": "1002", "credit": "12.34"},
+			},
+		},
+	}); res.IsError {
+		t.Fatalf("建凭证失败: %v", res.Content)
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "query_vouchers", Arguments: map[string]any{"limit": 5},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("查询失败: %v", res.Content)
+	}
+	sc, _ := res.StructuredContent.(map[string]any)
+	items, _ := sc["items"].([]any)
+	if len(items) == 0 {
+		t.Fatal("应有凭证")
+	}
+	item, _ := items[0].(map[string]any)
+	if _, isStr := item["amount"].(string); !isStr {
+		t.Fatalf("amount 应为元字符串，实际 %T(%v)", item["amount"], item["amount"])
+	}
+	if _, isNum := sc["total"].(float64); !isNum {
+		t.Fatalf("total 应保持数字（分页计数），实际 %T(%v)", sc["total"], sc["total"])
+	}
+}
+
+// 乐观锁：expectedUpdatedAt 缺失/空串必须报 invalid_params，不能静默放行。
+func TestExpectedUpdatedAtRequired(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	cr, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "create_draft_voucher",
+		Arguments: map[string]any{
+			"date": "2025-03-15", "remark": "锁测试",
+			"lines": []map[string]any{
+				{"accountCode": "1001", "debit": "1"},
+				{"accountCode": "1002", "credit": "1"},
+			},
+		},
+	})
+	v := cr.StructuredContent.(map[string]any)["voucher"].(map[string]any)
+	vid := v["id"].(float64)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "delete_draft_voucher",
+		Arguments: map[string]any{"id": vid, "expectedUpdatedAt": ""},
+	})
+	if !res.IsError {
+		t.Fatal("空 expectedUpdatedAt 应报错")
+	}
+	tc, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(tc), "invalid_params") {
+		t.Fatalf("应为 invalid_params: %s", tc)
+	}
+}
+
+// patch 类型混淆：数字发给 remark 必须报 invalid_params，字段不动。
+func TestPatchTypeMismatchRejected(t *testing.T) {
+	ctx := context.Background()
+	cs := newPair(t, false)
+
+	res, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "upsert_contact",
+		Arguments: map[string]any{
+			"kind": "customer", "name": "类型测试",
+			"remark": float64(123),
+		},
+	})
+	if !res.IsError {
+		t.Fatal("remark 发数字应报错")
+	}
+	tc, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(tc), "invalid_params") {
+		t.Fatalf("应为 invalid_params: %s", tc)
+	}
+	// 确认没有写入半个联系人
+	lst, _ := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "list_contacts", Arguments: map[string]any{},
+	})
+	sc := lst.StructuredContent.(map[string]any)
+	if sc["total"] != float64(0) {
+		t.Fatalf("类型错误的请求不应落库: %v", sc)
+	}
+}

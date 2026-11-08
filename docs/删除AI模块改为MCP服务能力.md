@@ -486,3 +486,25 @@ filelock、auditdb 交错追加。
 
 **待批 3**：HTTP 传输（token/Origin/Host 校验、会话世代、SSE）、
 GUI 设置页 MCP 卡、端到端 Wails 构建验证。
+
+### 批 2 自查修复（复审后追补）
+
+复审批 2 发现的问题与本批复修：
+
+1. **元字符串契约违约（严重）**：`mustJSON` 直接序列化 service 结构，
+   `money.Money` 无 MarshalJSON → 输出分整数。修法：`yuanize` 变换——
+   JSON 往返后递归遍历，**只改数字值**且仅当键名在金额白名单内
+   （白名单只含 6 个涉金额工具的真实输出键；`total`/`count`/`level`/
+   `taxrateppm`/`confidence` 等非金额数字键刻意不入集）。
+2. **乐观锁可空串绕过**：`update_draft_voucher`/`delete_draft_voucher`
+   的 `expectedUpdatedAt` 空串在 repo 层等于「不比对」。现工具层
+   强制非空。
+3. **patch 类型混淆静默清零**：`patchStr/patchBool/patchInt` 对错误
+   JSON 类型不再当零值处理，聚合后报 `invalid_params`。
+4. **list_* 缺分页封套**：统一 `{items,total,limit,offset,hasMore}`，
+   适配层对完整结果集切片（档案列表规模小，服务端本就全量物化）。
+5. **CLI 帮助补 `mcp`**。
+6. **已知遗留（未修，协议级）**：新建账套路径锁→身份锁的换锁间隙，
+   以及 Restore「stat 时不存在、取锁时已存在」的同类竞态——两个
+   不同锁身份无法互斥。需要把「路径锁持有期间就完成文件落位+换锁
+   为原子协议」才能根除，列入批 3 讨论项。

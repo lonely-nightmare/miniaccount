@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -156,4 +157,92 @@ func mustJSON(v any) any {
 		return map[string]any{"error": err.Error()}
 	}
 	return out
+}
+
+// moneyKeys 是所有工具输出里「数字其实是分的金额」的 JSON 键名
+// （小写比较；报表类型没有 json tag，序列化出来是 PascalCase，
+// 所以两侧都按小写比对）。
+//
+// ★ 集合刻意收窄到 6 个涉金额工具的真实输出键：
+// total/count/level/limit/offset/taxrateppm/confidence 这些
+// 非金额数字键绝不能进集 —— 分页总数被改成元字符串就是新事故。
+var moneyKeys = map[string]bool{
+	// 凭证/流水/明细账
+	"amount": true, "debit": true, "credit": true, "balance": true,
+	"openingbalance": true, "closingbalance": true,
+	// 试算平衡 BalanceRow（无 tag → PascalCase 序列化名）
+	"openingdebit": true, "openingcredit": true,
+	"perioddebit": true, "periodcredit": true,
+	"closingdebit": true, "closingcredit": true,
+	// 报表 Line.Value 与勾稽 CheckIssue
+	"value": true, "leftval": true, "rightval": true, "diff": true,
+	// 发票
+	"amountextax": true, "taxamount": true, "totalamount": true,
+	"deductible": true, "deductibletax": true, "costamount": true,
+	// 员工/工资
+	"basesalary": true, "sibase": true, "hfbbase": true,
+	"specialadditional": true,
+	"totalgross":        true, "totaliit": true, "totalsiself": true,
+	"totalsicompany": true, "totaldebit": true, "totalcredit": true,
+	"totalin": true, "totalout": true,
+}
+
+// yuanize 把 mustJSON 输出里所有「键名属金额、值是数字」的字段
+// 改写成元字符串 —— MCP 契约：金额一律元字符串出入，不暴露分。
+// 字符串/布尔等同名键不受影响（只有数字值才被改写）。
+func yuanize(v any) any {
+	return yuanWalk(mustJSON(v))
+}
+
+func yuanWalk(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if f, ok := val.(float64); ok && moneyKeys[strings.ToLower(k)] {
+				t[k] = yuanStr(money.Money(int64(f)))
+				continue
+			}
+			t[k] = yuanWalk(val)
+		}
+		return t
+	case []any:
+		for i, e := range t {
+			t[i] = yuanWalk(e)
+		}
+		return t
+	default:
+		return v
+	}
+}
+
+// pageIn 是列表工具的分页参数；适配层对完整结果集切片
+// （档案/流水规模小，服务端本就全量物化，无需另加 COUNT 查询）。
+type pageIn struct {
+	Limit  int `json:"limit,omitempty" jsonschema:"每页行数，上限 500，缺省 500"`
+	Offset int `json:"offset,omitempty" jsonschema:"跳过的行数"`
+}
+
+// pageOf 把完整列表包成 {items,total,limit,offset,hasMore}。
+func pageOf(v any, in pageIn) any {
+	arr, _ := mustJSON(v).([]any)
+	total := len(arr)
+	offset := in.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	limit := in.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return map[string]any{
+		"items": arr[offset:end], "total": total,
+		"limit": limit, "offset": offset, "hasMore": end < total,
+	}
 }

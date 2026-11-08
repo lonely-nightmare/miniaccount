@@ -14,7 +14,9 @@ type bookInfoIn struct{}
 
 type listAccountsIn struct{}
 
-type listPeriodsIn struct{}
+type listPeriodsIn struct {
+	pageIn
+}
 
 type queryVouchersIn struct {
 	Year          int    `json:"year,omitempty" jsonschema:"会计年度，0 表示不限"`
@@ -48,12 +50,16 @@ type balanceSheetIn struct {
 
 type listContactsIn struct {
 	Kind string `json:"kind,omitempty" jsonschema:"customer|supplier|both|shareholder|other，空表示全部"`
+	pageIn
 }
 
-type listDepartmentsIn struct{}
+type listDepartmentsIn struct {
+	pageIn
+}
 
 type listEmployeesIn struct {
 	OnlyEnabled bool `json:"onlyEnabled,omitempty" jsonschema:"为真只返回在职启用员工"`
+	pageIn
 }
 
 type listInvoicesIn struct {
@@ -61,13 +67,14 @@ type listInvoicesIn struct {
 	Status    string `json:"status,omitempty" jsonschema:"pending|verified|booked|voided，空表示全部"`
 	From      string `json:"from,omitempty" jsonschema:"开票日期起 YYYY-MM-DD"`
 	To        string `json:"to,omitempty" jsonschema:"开票日期止 YYYY-MM-DD"`
+	pageIn
 }
 
 type listBankFlowsIn struct {
 	Status string `json:"status,omitempty" jsonschema:"unmatched|matched|booked 等，空表示全部"`
 	From   string `json:"from,omitempty" jsonschema:"日期起 YYYY-MM-DD"`
 	To     string `json:"to,omitempty" jsonschema:"日期止 YYYY-MM-DD"`
-	Limit  int    `json:"limit,omitempty" jsonschema:"行数上限，默认 200"`
+	pageIn
 }
 
 // registerTools 注册 14 读 + 6 写。
@@ -97,12 +104,12 @@ func (s *Server) registerTools() {
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_periods",
 		Description: "会计期间列表及各期间状态（未启用/启用/已结账）",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ listPeriodsIn) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listPeriodsIn) (*mcp.CallToolResult, any, error) {
 		b, err := s.svc.Book(ctx)
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(b.Periods), nil
+		return nil, pageOf(b.Periods, in.pageIn), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
@@ -117,7 +124,7 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(p), nil
+		return nil, yuanize(p), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
@@ -141,7 +148,7 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(r), nil
+		return nil, yuanize(r), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
@@ -152,7 +159,7 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(r), nil
+		return nil, yuanize(r), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
@@ -163,7 +170,7 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(map[string]any{
+		return nil, yuanize(map[string]any{
 			"closing": closing, "opening": opening, "issues": issues,
 		}), nil
 	})
@@ -176,7 +183,7 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(map[string]any{
+		return nil, yuanize(map[string]any{
 			"current": cur, "ytd": ytd, "issues": issues,
 		}), nil
 	})
@@ -189,18 +196,18 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(v), nil
+		return nil, pageOf(v, in.pageIn), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
 		Name:        "list_departments",
 		Description: "部门列表",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ listDepartmentsIn) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listDepartmentsIn) (*mcp.CallToolResult, any, error) {
 		v, err := s.svc.Departments(ctx)
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(v), nil
+		return nil, pageOf(v, in.pageIn), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
@@ -211,7 +218,7 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(v), nil
+		return nil, pageOf(yuanize(v), in.pageIn), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
@@ -224,7 +231,7 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(v), nil
+		return nil, pageOf(yuanize(v), in.pageIn), nil
 	})
 
 	mcp.AddTool(s.core, &mcp.Tool{
@@ -232,12 +239,12 @@ func (s *Server) registerTools() {
 		Description: "银行流水列表（导入的逐笔流水及匹配状态）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listBankFlowsIn) (*mcp.CallToolResult, any, error) {
 		v, err := s.svc.BankFlows(ctx, service.BankFlowQuery{
-			Status: in.Status, From: in.From, To: in.To, Limit: in.Limit,
+			Status: in.Status, From: in.From, To: in.To,
 		})
 		if err != nil {
 			return toolError(err)
 		}
-		return nil, mustJSON(v), nil
+		return nil, pageOf(yuanize(v), in.pageIn), nil
 	})
 
 	s.registerWriteTools()
